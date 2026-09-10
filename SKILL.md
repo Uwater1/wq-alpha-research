@@ -1,59 +1,55 @@
 ---
 name: wq-alpha-research
-description: "Use for WorldQuant BRAIN alpha research: designing WQ Alpha expressions, selecting fields/operators, diagnosing simulation and IS check failures, tuning Sharpe/Fitness/Turnover, submitting alphas, and building low-correlation alpha portfolios. Also use for 中文 requests about WorldQuant、BRAIN、WQ Alpha、因子表达式、回测、提交、换手、Fitness、Sharpe."
+description: "Use for WorldQuant BRAIN alpha research: designing WQ Alpha expressions, selecting fields and operators, diagnosing simulation and IS check failures, tuning Sharpe, Fitness, and Turnover, submitting alphas, and building low-correlation alpha portfolios."
 ---
 
-# WQ Alpha 研究 Skill
+# WQ Alpha Research Skill
 
-> 结构化 playbook：字段 → 表达式 → 回测 → 检查 → 提交 → 组合。融合 WorldQuant BRAIN 文档知识与 USA TOP3000 实证经验。
+> A structured playbook: fields -> expressions -> backtests -> checks -> submissions -> portfolio construction. Built from WorldQuant BRAIN documentation knowledge and USA TOP3000 empirical experience.
 
----
-
-## 1. 快速决策树
+## 1. Quick Decision Tree
 
 ```
-开始
-  ├── 拉取所有 alpha 列表 ──→ 只看 ACTIVE；算 **日收益** 相关，>0.7 则修改或放弃
-  ├── 设计新因子
-  │    ├── 字段已验证？ ──否──→ 查第 2 节（本地字段文件搜索 / 模拟 rank(field)）
-  │    └── 是
-  │         ├── 基本面 ──→ group_rank + ts_rank, SUBINDUSTRY, decay=0
-  │         ├── 分析师 ──→ group_rank + ts_rank, INDUSTRY/SUBINDUSTRY, decay=0–4
-  │         ├── 技术 ────→ 高 decay(10–30) 或混合基本面降低换手
-  │         └── 情绪 ────→ nanHandling=ON, 小窗口谨慎
-  └── 提交后 ──→ 验证 status == ACTIVE，否则检查 SELF_CORRELATION
+Start
+  ├── Pull the full alpha list -> only inspect ACTIVE alphas; compute daily-return correlation; if > 0.7, modify or discard
+  ├── Design a new factor
+  │    ├── Field verified? -> No -> check Section 2 (local field search / simulate rank(field))
+  │    └── Yes
+  │         ├── Fundamental -> group_rank + ts_rank, SUBINDUSTRY, decay=0
+  │         ├── Analyst -> group_rank + ts_rank, INDUSTRY/SUBINDUSTRY, decay=0-4
+  │         ├── Technical -> high decay (10-30) or mix with fundamentals to reduce turnover
+  │         └── Sentiment -> nanHandling=ON, use short windows carefully
+  └── After submission -> verify status == ACTIVE; otherwise inspect SELF_CORRELATION
 ```
 
----
+## 2. Local Field Lookup
 
-## 2. 字段速查（本地数据集）
+This skill includes the full USA TOP3000 delay=1 field catalog (4,367 fields), so there is no need to fetch the list from the web or API every time:
 
-本 SKILL 已内置 USA TOP3000 delay=1 的完整字段列表（共 4367 个），无需每次从网页/ API 拉取：
+- `references/wq_usa_top3000_delay1_data_fields.json`: full field metadata array
+- `references/wq_usa_top3000_delay1_data_fields.csv`: CSV version for Excel or pandas
+- `references/wq_usa_top3000_delay1_data_fields_summary.json`: category counts and example fields
 
-- `references/wq_usa_top3000_delay1_data_fields.json`：完整字段元数据数组
-- `references/wq_usa_top3000_delay1_data_fields.csv`：CSV 版，方便 Excel/ pandas 查看
-- `references/wq_usa_top3000_delay1_data_fields_summary.json`：分类统计与示例字段
+Field distribution:
 
-字段分布：
+| Category | Count | Notes |
+|------|------:|------|
+| fundamental | 1652 | Financial statements and footnotes |
+| analyst | 1324 | Analyst expectations and consensus |
+| news | 996 | News and earnings events |
+| pv | 195 | Price/volume, ADV, VWAP, and related data |
+| option | 138 | Implied volatility, put/call, and related data |
+| model | 40 | Model factors |
+| socialmedia | 22 | Social sentiment |
+| univ1 | 6 | Universe-related fields |
 
-| 类别 | 数量 | 说明 |
-|------|------|------|
-| fundamental | 1652 | 财务报表、附注科目 |
-| analyst | 1324 | 分析师预期、一致预期 |
-| news | 996 | 新闻、财报事件 |
-| pv | 195 | 价量、ADV、VWAP 等 |
-| option | 138 | 期权隐含波动、Put/Call 等 |
-| model | 40 | 模型因子 |
-| socialmedia | 22 | 社交媒体情绪 |
-| univ1 | 6 | Universe 相关 |
-
-### 2.1 本地搜索字段
+### 2.1 Search Local Fields
 
 ```python
 import json
 from pathlib import Path
 
-# 假设在 skill 目录下运行；如在其他位置，改为实际路径
+# Assume you are running inside the skill directory; adjust the path if needed.
 skill_dir = Path(".")
 field_dir = skill_dir / "references"
 data = json.loads((field_dir / "wq_usa_top3000_delay1_data_fields.json").read_text(encoding="utf-8"))
@@ -66,22 +62,22 @@ matches = [
 ]
 
 for f in matches[:10]:
-    print(f"{f['id']} | {f.get('category',{}).get('name')} | {f.get('dataset',{}).get('name')} | coverage={f.get('coverage')} | alphaCount={f.get('alphaCount')}")
+    print(f"{f['id']} | {f.get('category', {}).get('name')} | {f.get('dataset', {}).get('name')} | coverage={f.get('coverage')} | alphaCount={f.get('alphaCount')}")
 ```
 
-### 2.2 按类别筛选
+### 2.2 Filter by Category
 
 ```python
-category = "pv"  # 或 fundamental / analyst / news / option / model / socialmedia
+category = "pv"  # or fundamental / analyst / news / option / model / socialmedia
 fields = [f for f in data if f.get("category", {}).get("id") == category]
 print(f"{category}: {len(fields)} fields")
 for f in sorted(fields, key=lambda x: x.get("alphaCount", 0), reverse=True)[:10]:
     print(f"  {f['id']} | alphaCount={f.get('alphaCount')} | coverage={f.get('coverage')}")
 ```
 
-### 2.3 字段验证
+### 2.3 Verify a Field
 
-拿到候选字段后，**先用简单表达式模拟验证**字段是否真的可用：
+Once you have a candidate field, **first test it with a simple expression** to confirm that it is actually usable:
 
 ```python
 payload = {
@@ -95,135 +91,123 @@ payload = {
     "regular": "rank(my_candidate_field)",
 }
 resp = session.post("https://api.worldquantbrain.com/simulations", json=payload)
-# 201 表示字段可用；非 201 通常表示字段不存在或参数不匹配
+# 201 usually means the field is usable; a non-201 response often means the field does not exist or the parameters are invalid.
 ```
 
-### 2.4 何时需要重新拉取
+### 2.4 When to Refresh the Field Snapshot
 
-本地字段集已覆盖 USA TOP3000 delay=1。以下情况才需要重新从 BRAIN 拉取：
+The local field catalog covers USA TOP3000 delay=1. Refresh it from BRAIN only when:
 
-- 换 Region（如 CHN、EUR）
-- 换 Universe（如 TOP500、TOP1000）
-- 换 Delay（如 0）
-- BRAIN 平台字段列表明显更新（可对比 `dateCreated` 与本地）
+- the region changes, for example CHN or EUR;
+- the universe changes, for example TOP500 or TOP1000;
+- the delay changes, for example 0;
+- the BRAIN field catalog clearly changes and should be compared against the local snapshot.
 
----
+## 3. Operator Reference
 
-## 3. 运算符速查表
-
-| 类型 | 算子 | 作用 |
+| Type | Operator | Purpose |
 |------|------|------|
-| 截面 | `rank(x)`, `zscore(x)`, `normalize(x)`, `scale(x)`, `winsorize(x, std=4)` | 每天对所有股票标准化 |
-| 时序 | `ts_mean`, `ts_std_dev`, `ts_delta`, `ts_rank`, `ts_corr`, `ts_decay_linear`, `ts_backfill`, `ts_zscore` | 单只股票历史窗口计算 |
-| 分组 | `group_rank(x, group)`, `group_neutralize(x, group)`, `group_zscore(x, group)`, `group_backfill(x, group, N)` | 组内中性化 |
-| 条件 | `if_else(cond, a, b)`, `trade_when(x, cond, delay)` | 条件暴露 |
-| 向量 | `vec_avg(a, b, c)`, `vec_sum(a, b, c)` | 多字段逐元素平均/求和 |
+| Cross-sectional | `rank(x)`, `zscore(x)`, `normalize(x)`, `scale(x)`, `winsorize(x, std=4)` | Normalize all stocks each day |
+| Time-series | `ts_mean`, `ts_std_dev`, `ts_delta`, `ts_rank`, `ts_corr`, `ts_decay_linear`, `ts_backfill`, `ts_zscore` | Compute historical windows per stock |
+| Group | `group_rank(x, group)`, `group_neutralize(x, group)`, `group_zscore(x, group)`, `group_backfill(x, group, N)` | Apply intra-group normalization |
+| Conditional | `if_else(cond, a, b)`, `trade_when(x, cond, delay)` | Conditional exposure |
+| Vector | `vec_avg(a, b, c)`, `vec_sum(a, b, c)` | Element-wise averaging and summation |
 
-**黄金组合**：`group_rank(ts_rank(signal, N), subindustry)`
+**Golden combination**: `group_rank(ts_rank(signal, N), subindustry)`
 
----
+## 4. Factor Template Library
 
-## 4. 因子模板库
-
-### 4.1 高胜率模板
+### 4.1 High-Probability Templates
 
 ```fastexpr
--- 模板 A：ROE 趋势（通过率最高）
+-- Template A: ROE trend (highest pass rate)
 group_rank(ts_rank(operating_income / equity, 126), subindustry)
 
--- 模板 B：EPS 收益率修正
+-- Template B: EPS yield adjustment
 group_rank(ts_rank(est_eps / close, 126), industry)
 
--- 模板 C：FCF 收益率
+-- Template C: FCF yield
 group_rank(ts_rank(free_cash_flow_reported_value / equity, 126), industry)
 
--- 模板 D：多因子混合（高 Fitness）
+-- Template D: Multi-factor blend (high Fitness)
 0.5 * group_rank(ts_rank(operating_income / equity, 126), subindustry)
 + 0.5 * group_rank(ts_rank(est_eps / close, 126), industry)
 
--- 模板 E：低相关技术+基本面混合
+-- Template E: Low-correlation technical + fundamental blend
 0.5 * rank(-(close / open - 1)) + 0.5 * rank(ts_rank(operating_income / equity, 126))
 
--- 模板 F：资产周转 × 利润率
+-- Template F: Asset turnover x margin
 rank(ts_rank(operating_income / sales * sales / assets, 126))
 ```
 
-### 4.2 推荐默认设置
+### 4.2 Recommended Defaults
 
-| 因子类型 | Decay | Neutralization | Truncation | nanHandling | 预期 TO |
-|----------|-------|----------------|------------|-------------|---------|
-| 基本面质量 | 0 | SUBINDUSTRY | 0.08 | ON | 2–8% |
-| 分析师预期 | 0–4 | INDUSTRY/SUBINDUSTRY | 0.08 | ON | 9–16% |
-| 技术反转 | 10–30 | INDUSTRY | 0.08 | OFF | 15–35% |
-| 混合因子 | 4–20 | INDUSTRY/SUBINDUSTRY | 0.08 | ON | 10–20% |
-| 情绪 | 4–10 | INDUSTRY | 0.05–0.08 | ON | 8–30% |
+| Factor type | Decay | Neutralization | Truncation | nanHandling | Expected TO |
+|----------|-------:|----------------|------------|-------------|------------:|
+| Fundamental quality | 0 | SUBINDUSTRY | 0.08 | ON | 2-8% |
+| Analyst expectations | 0-4 | INDUSTRY/SUBINDUSTRY | 0.08 | ON | 9-16% |
+| Technical reversal | 10-30 | INDUSTRY | 0.08 | OFF | 15-35% |
+| Mixed factors | 4-20 | INDUSTRY/SUBINDUSTRY | 0.08 | ON | 10-20% |
+| Sentiment | 4-10 | INDUSTRY | 0.05-0.08 | ON | 8-30% |
 
----
+## 5. Metrics and Checks
 
-## 5. 指标与检查
+### 5.1 Core Metrics
 
-### 5.1 核心指标
+| Metric | Formula / Meaning | Target |
+|------|-------------------|--------|
+| Sharpe | daily IR x sqrt(252) | >= 1.5, minimum 1.25 |
+| Fitness | Sharpe x sqrt(|Returns| / max(TO, 0.125)) | >= 1.1, minimum 1.0 |
+| Returns | annualized return / $10M | >= 7% |
+| Turnover | daily traded value / Book Size | 1%-20% |
+| Drawdown | maximum peak-to-trough drawdown | < 15% |
+| Margin | PnL / total traded value | Higher is better |
 
-| 指标 | 公式/含义 | 目标 |
-|------|-----------|------|
-| Sharpe | 日 IR × √252 | ≥ 1.5（最低 1.25） |
-| Fitness | Sharpe × √(|Returns| / max(TO, 0.125)) | ≥ 1.1（最低 1.0） |
-| Returns | 年化收益 / $10M | ≥ 7% |
-| Turnover | 日交易额 / Book Size | 1%–20% |
-| Drawdown | 峰值到谷值最大回撤 | < 15% |
-| Margin | PnL / 总交易额 | 越高越好 |
+### 5.2 IS Checklist
 
-### 5.2 IS 检查清单
+| Check | Threshold | Failure cause | Fix |
+|--------|-----------|---------------|-----|
+| LOW_SHARPE | >= 1.25 | Weak signal | Change field, window, or add `group_rank` |
+| LOW_FITNESS | >= 1.0 | Excess turnover | Increase decay or blend with stable signals |
+| LOW_TURNOVER | >= 1% | Signal too stable | Shorten the window or use a more active field |
+| HIGH_TURNOVER | <= 70% | Turnover explosion | Increase decay, use `trade_when`, or blend signals |
+| CONCENTRATED_WEIGHT | Single name < 10% and diversified | Weight concentration | Use `rank()`, reduce truncation, or add `ts_backfill` |
+| LOW_SUB_UNIVERSE_SHARPE | Still works in TOP1000 | Small-cap dependence | Use fundamentals, `SUBINDUSTRY`, and avoid market-cap bias |
+| SELF_CORRELATION | **daily-return** correlation < 0.7 | Too similar to an existing factor | Change the signal family, add filtering, or change the universe; do not only tune parameters |
+| MATCHES_COMPETITION | Informational | - | No action |
 
-| 检查项 | 阈值 | 失败原因 | 修复方法 |
-|--------|------|----------|----------|
-| LOW_SHARPE | ≥ 1.25 | 信号弱 | 换字段/窗口/加 group_rank |
-| LOW_FITNESS | ≥ 1.0 | 换手过高 | 增大 decay、混合稳定信号 |
-| LOW_TURNOVER | ≥ 1% | 信号太稳定 | 缩短窗口、换更活跃字段 |
-| HIGH_TURNOVER | ≤ 70% | 换手爆炸 | 增大 decay、trade_when、混合 |
-| CONCENTRATED_WEIGHT | 单股 < 10% 且分散 | 权重集中 | 用 rank()、降低 truncation、ts_backfill |
-| LOW_SUB_UNIVERSE_SHARPE | TOP1000 也有效 | 小票依赖 | 用基本面、SUBINDUSTRY、避免市值倾斜 |
-| SELF_CORRELATION | **日收益** 相关系数 < 0.7 | 与已有因子太像 | 换信号簇、加过滤、换 Universe；不要只调参数 |
-| MATCHES_COMPETITION | 信息性 | — | 无影响 |
+### 5.3 Failure Statistics
 
-### 5.3 失败统计
+| Failure reason | Share | Takeaway |
+|----------|------:|----------|
+| LOW_SHARPE | 90.7% | Signal quality is the main bottleneck |
+| LOW_FITNESS | 66.2% | Often a softer version of HIGH_TURNOVER |
+| LOW_SUB_UNIVERSE_SHARPE | 51.0% | Avoid small-cap and liquidity bias |
 
-| 失败原因 | 占比 | 结论 |
-|----------|------|------|
-| LOW_SHARPE | 90.7% | 信号质量是最大瓶颈 |
-| LOW_FITNESS | 66.2% | 通常是 HIGH_TURNOVER 的软性版本 |
-| LOW_SUB_UNIVERSE_SHARPE | 51.0% | 避免小票/流动性倾斜 |
+**Pass rate by data type**: fundamental 40% > mixed 12.7% > pure technical 5.3% > other 0%
 
-**按数据类型通过率**：基本面 40% > 混合 12.7% > 纯技术 5.3% > 其他 0%
+## 6. Diagnosis and Fixes
 
----
+| Symptom | Likely cause | Fix |
+|------|--------------|-----|
+| Fitness < 1.0 | Turnover > 30% | Increase decay, blend fundamentals, or use `ts_decay_linear` |
+| Sharpe < 1.25 | Weak signal | Extend the window, use `group_rank`, or change the field |
+| TO > 50% | Signal changes too fast | Use decay 10-30, `trade_when`, or blend |
+| DD > 15% | High volatility or leverage | Increase decay, lower truncation, and blend lower-volatility signals |
+| CONCENTRATED_WEIGHT FAIL | Sparse or extreme weights | Use `rank()`, truncation 0.05, or `ts_backfill` |
+| Sub-Universe FAIL | Small-cap dependence | Avoid `rank(-assets)`, use `group_rank`, and add liquidity filters |
+| simulation_error | Invalid field or wrong operator arguments | Verify the field first with `rank(field)` and check operator arity |
+| trade_when no trades | Condition too strict | Relax the condition or use `if_else` |
 
-## 6. 问题诊断与修复
+## 7. BRAIN API Automation
 
-| 症状 | 可能原因 | 修复 |
-|------|----------|------|
-| Fitness < 1.0 | 换手 > 30% | 增大 decay、混合基本面、ts_decay_linear |
-| Sharpe < 1.25 | 信号弱 | 拉长窗口、group_rank、换字段 |
-| TO > 50% | 信号变化太快 | decay 10–30、trade_when、混合 |
-| DD > 15% | 波动大/杠杆高 | 增大 decay、降 truncation、混合低波信号 |
-| CONCENTRATED_WEIGHT FAIL | 稀疏/极值 | rank()、truncation 0.05、ts_backfill |
-| Sub-Universe FAIL | 小票依赖 | 避免 `rank(-assets)`，用 group_rank、加流动性过滤 |
-| simulation_error | 字段不存在/算子参数错误 | 先 rank(field) 验证字段，检查算子参数个数 |
-| trade_when 零交易 | 条件过严 | 放宽条件或用 if_else |
+### 7.1 Authentication
 
----
-
-## 7. BRAIN API 自动化
-
-### 7.1 认证（请填写账号）
-
-**使用前必须准备凭据**。推荐使用环境变量；也可以在本地放置未跟踪的 `credential.txt`（已被 `.gitignore` 忽略），内容为 JSON 数组：
+**You must provide credentials before running this section.** Use environment variables if possible; alternatively place an untracked local `credential.txt` file in the skill directory with a JSON array containing the BRAIN username and password:
 
 ```json
 ["your_username", "your_password"]
 ```
-
-⚠️ **提醒**：不要把真实账号密码写入仓库。优先使用 `WQ_BRAIN_USERNAME` / `WQ_BRAIN_PASSWORD` 环境变量。
 
 ```python
 import json
@@ -232,7 +216,7 @@ from requests.auth import HTTPBasicAuth
 
 API_BASE = "https://api.worldquantbrain.com"
 
-# 1. 读取 credential.txt
+# 1. Load credentials.
 import os
 
 username = os.getenv("WQ_BRAIN_USERNAME")
@@ -241,7 +225,7 @@ if not (username and password):
     with open("credential.txt") as f:
         username, password = json.load(f)
 
-# 2. 创建会话并认证
+# 2. Create a session and authenticate.
 session = requests.Session()
 session.auth = HTTPBasicAuth(username, password)
 session.headers.update({
@@ -250,19 +234,19 @@ session.headers.update({
 })
 
 resp = session.post(f"{API_BASE}/authentication")
-assert resp.status_code == 201, f"认证失败: {resp.status_code} {resp.text}"
-print("认证成功")
+assert resp.status_code == 201, f"Authentication failed: {resp.status_code} {resp.text}"
+print("Authentication succeeded")
 ```
 
-### 7.2 获取已提交 Alpha 并计算相关性
+### 7.2 Fetch Submitted Alphas and Compute Correlation
 
-**目的**：在新因子提交前，避免与已有因子 PnL 高度相关（相关系数 ≥ 0.7）。
+**Purpose**: before submitting a new factor, avoid high correlation with existing factors. Correlation should be based on daily returns, not cumulative PnL.
 
 ```python
 import numpy as np
 
 def fetch_pnl(session, alpha_id):
-    """获取 Alpha 累计 PnL 序列；schema.properties 可能是 list 或 dict。"""
+    """Fetch an alpha's cumulative PnL series; schema.properties may be a list or dict."""
     r = session.get(f"{API_BASE}/alphas/{alpha_id}/recordsets/pnl")
     if r.status_code != 200 or not r.text.strip():
         return []
@@ -285,11 +269,11 @@ def fetch_pnl(session, alpha_id):
     return out
 
 def daily_returns(cum_pnl):
-    """累计 PnL 转日收益；相关性应基于日收益，而非累计曲线。"""
+    """Convert cumulative PnL to daily returns; correlation should use daily returns, not the cumulative curve."""
     return [cum_pnl[i+1] - cum_pnl[i] for i in range(len(cum_pnl) - 1)]
 
 def get_active_alphas(session, user_id="self", limit=100):
-    """获取所有 alpha（含 ACTIVE / UNSUBMITTED），分页。"""
+    """Fetch all alphas, including ACTIVE and UNSUBMITTED, with pagination."""
     all_alphas = []
     offset = 0
     while True:
@@ -303,7 +287,7 @@ def get_active_alphas(session, user_id="self", limit=100):
         offset += limit
     return all_alphas
 
-# 计算新因子与所有 ACTIVE alpha 的日收益相关性
+# Compute daily-return correlation between a new factor and all ACTIVE alphas.
 new_pnl = fetch_pnl(session, new_alpha_id)
 new_ret = daily_returns(new_pnl)
 existing = get_active_alphas(session)
@@ -317,27 +301,27 @@ for alpha in active:
         old_ret = daily_returns(old_pnl)
         if len(new_ret) == len(old_ret) and len(new_ret) > 20:
             corr = float(np.corrcoef(new_ret, old_ret)[0, 1])
-            print(f"与 {old_id} 日收益相关性: {corr:.3f}")
+            print(f"Daily-return correlation with {old_id}: {corr:.3f}")
             if abs(corr) >= 0.7:
                 high_corr.append((old_id, corr))
     except Exception:
         continue
 
 if high_corr:
-    print(f"⚠️ 发现 {len(high_corr)} 个高相关因子，建议修改或放弃")
+    print(f"Warning: found {len(high_corr)} highly correlated factors; modify or discard them")
 ```
 
-**判断规则（基于日收益，不是累计 PnL）**：
+**Decision rule, based on daily returns, not cumulative PnL**:
 
-| 相关系数 | 动作 |
+| Correlation | Action |
 |----------|------|
-| abs(corr) < 0.5 | ✅ 可提交 |
-| 0.5 ≤ abs(corr) < 0.7 | ⚠️ 谨慎，需提升 Sharpe 或修改信号 |
-| abs(corr) ≥ 0.7 | ❌ 放弃或重构（除非新因子 Sharpe ≥ 旧因子 × 1.1） |
+| abs(corr) < 0.5 | OK to submit |
+| 0.5 <= abs(corr) < 0.7 | Proceed carefully; improve Sharpe or adjust the signal |
+| abs(corr) >= 0.7 | Discard or rebuild, unless the new factor's Sharpe is at least 10% better than the old one |
 
-> ⚠️ **不要用累计 PnL 算相关**。累计曲线自带强趋势，会把不同信号的相关性严重夸大。
+> **Do not correlate cumulative PnL series.** Cumulative curves carry a strong trend and will overstate similarity between unrelated signals.
 
-### 7.3 回测
+### 7.3 Backtest
 
 ```python
 payload = {
@@ -363,14 +347,14 @@ while True:
 alpha = session.get(f"https://api.worldquantbrain.com/alphas/{alpha_id}").json()
 ```
 
-### 7.4 提交与监控
+### 7.4 Submit and Monitor
 
 ```python
-# 提交
+# Submit
 sub = session.post(f"https://api.worldquantbrain.com/alphas/{alpha_id}/submit")
-print(sub.status_code)  # 201 成功
+print(sub.status_code)  # 201 means the request was accepted
 
-# 监控 SELF_CORRELATION
+# Monitor SELF_CORRELATION
 for _ in range(30):
     alpha = session.get(f"https://api.worldquantbrain.com/alphas/{alpha_id}").json()
     sc = next((c for c in alpha.get("is", {}).get("checks", []) if c["name"] == "SELF_CORRELATION"), {})
@@ -379,15 +363,15 @@ for _ in range(30):
     time.sleep(60)
 ```
 
-### 7.5 自动提交模板
+### 7.5 Automated Submission Template
 
 ```python
 import numpy as np
 
 def simulate_and_submit(expression, settings, existing_pnls=None):
     """
-    existing_pnls: {alpha_id: [cum_pnl_values]}，已上线因子的累计 PnL 序列。
-    返回: {"alpha_id": ..., "decision": "submitted|skip|high_corr|verify_failed", ...}
+    existing_pnls: {alpha_id: [cum_pnl_values]}, cumulative PnL series for already-live factors.
+    Returns: {"alpha_id": ..., "decision": "submitted|skip|high_corr|verify_failed", ...}
     """
     payload = {"type": "REGULAR", "settings": settings, "regular": expression}
     resp = session.post("https://api.worldquantbrain.com/simulations", json=payload)
@@ -405,11 +389,11 @@ def simulate_and_submit(expression, settings, existing_pnls=None):
     alpha = session.get(f"https://api.worldquantbrain.com/alphas/{alpha_id}").json()
     is_ = alpha.get("is", {})
 
-    # 1. 基础指标过滤
+    # 1. Basic metric filter.
     if is_.get("fitness", 0) < 1.1 or is_.get("sharpe", 0) < 1.3 or is_.get("turnover", 1) > 0.20:
         return {"alpha_id": alpha_id, "decision": "skip", "reason": "metrics", "metrics": is_}
 
-    # 2. 相关性检查（基于日收益）
+    # 2. Correlation check (based on daily returns).
     def daily_rets(cum):
         return [cum[i+1] - cum[i] for i in range(len(cum) - 1)]
 
@@ -421,17 +405,17 @@ def simulate_and_submit(expression, settings, existing_pnls=None):
             if len(new_ret) == len(old_ret) and len(new_ret) > 20:
                 corr = abs(float(np.corrcoef(new_ret, old_ret)[0, 1]))
                 if corr >= 0.7:
-                    # 例外：新 Sharpe 高于旧 Sharpe 10% 以上可提交
-                    old_sharpe = None  # 需从外部传入或缓存
+                    # Exception: if the new Sharpe is more than 10% higher, submission can still be justified.
+                    old_sharpe = None  # provide from upstream cache or metadata
                     if old_sharpe is None or is_.get("sharpe", 0) < old_sharpe * 1.1:
                         return {"alpha_id": alpha_id, "decision": "high_corr", "corr_with": old_id, "corr": corr}
 
-    # 3. 提交
+    # 3. Submit.
     sub = session.post(f"https://api.worldquantbrain.com/alphas/{alpha_id}/submit")
     if sub.status_code not in (200, 201):
         return {"alpha_id": alpha_id, "decision": "submit_failed", "status": sub.status_code}
 
-    # 4. 验证是否真正上线（BRAIN 可能因 SELF_CORRELATION 保持 UNSUBMITTED）
+    # 4. Verify that it is actually live (BRAIN can keep an alpha UNSUBMITTED because of SELF_CORRELATION).
     for _ in range(20):
         time.sleep(10)
         alpha = session.get(f"https://api.worldquantbrain.com/alphas/{alpha_id}").json()
@@ -444,31 +428,31 @@ def simulate_and_submit(expression, settings, existing_pnls=None):
     return {"alpha_id": alpha_id, "decision": "verify_failed", "status": alpha.get("status")}
 ```
 
-### 7.6 限流
+### 7.6 Rate Limiting
 
-- 模拟/提交间 sleep 2–5 秒。
-- 遇 429 读取 `Retry-After`，指数退避。
-- 批量建议单线程或 ≤ 2 并发。
+- Sleep 2-5 seconds between simulations and submissions.
+- On 429 responses, read `Retry-After` and back off exponentially.
+- For batches, prefer a single thread or at most two concurrent workers.
 
-### 7.7 提交后验证（201 ≠ 已上线）
+### 7.7 Post-Submission Verification (`201` does not mean live)
 
-`POST /alphas/{id}/submit` 返回 201 只表示请求被接受，**不代表 alpha 已变为 ACTIVE**。实战中常见：
+`POST /alphas/{id}/submit` returning 201 only means the request was accepted, **not** that the alpha is now ACTIVE. Common outcomes in practice:
 
-- alpha 状态仍为 `UNSUBMITTED`（SELF_CORRELATION 未通过或审核中）。
-- 同一信号换参数生成的新 alpha被系统判定为重复，无法真正提交。
+- the alpha still remains `UNSUBMITTED` because SELF_CORRELATION failed or it is still under review;
+- a new alpha generated from the same signal with different parameters is treated as a duplicate and never becomes truly live.
 
-**必须二次确认**：
+**Always confirm twice**:
 
 ```python
 alpha = session.get(f"{API_BASE}/alphas/{alpha_id}").json()
-print(alpha.get("status"))  # ACTIVE 才算真正提交成功
+print(alpha.get("status"))  # ACTIVE is the only true success state
 
-# 如果 status == UNSUBMITTED，查看 checks 中 SELF_CORRELATION 结果
+# If status == UNSUBMITTED, inspect SELF_CORRELATION in the checks list.
 for c in alpha.get("is", {}).get("checks", []):
     print(c["name"], c.get("result"), c.get("value"))
 ```
 
-**获取全部 alpha 并统计 ACTIVE 数量**：
+**Fetch all alphas and count ACTIVE ones**:
 
 ```python
 def get_all_alphas(session, limit=100):
@@ -490,134 +474,124 @@ active = [a for a in all_alphas if a.get("status") == "ACTIVE"]
 print(f"total={len(all_alphas)}, ACTIVE={len(active)}")
 ```
 
----
+## 8. Portfolio Construction Rules
 
-## 8. 组合构建规则
+### 8.1 Diversified Portfolio Example
 
-### 8.1  diversified 组合示例
-
-| 簇 | 代表表达式 |
+| Cluster | Representative expression |
 |----|------------|
-| 盈利能力 | `group_rank(ts_rank(operating_income/equity, 126), subindustry)` |
-| 分析师 | `group_rank(ts_rank(est_eps/close, 252), subindustry)` |
+| Profitability | `group_rank(ts_rank(operating_income/equity, 126), subindustry)` |
+| Analyst | `group_rank(ts_rank(est_eps/close, 252), subindustry)` |
 | FCF | `group_rank(ts_rank(free_cash_flow_reported_value/equity, 126), industry)` |
-| 低相关混合 | `0.5*rank(-(close/open-1)) + 0.5*rank(ts_rank(operating_income/equity, 126))` |
-| 质量组合 | `0.5*group_rank(ts_rank(oi/equity,126),subindustry) + 0.5*group_rank(ts_rank(est_eps/close,126),industry)` |
+| Low-correlation blend | `0.5*rank(-(close/open-1)) + 0.5*rank(ts_rank(operating_income/equity, 126))` |
+| Quality basket | `0.5*group_rank(ts_rank(oi/equity,126),subindustry) + 0.5*group_rank(ts_rank(est_eps/close,126),industry)` |
 
-### 8.2 提交优先级
+### 8.2 Submission Priority
 
-1. 高 Fitness（≥ 1.5）且低 TO（< 15%）
-2. 来自不同信号簇
-3. 若 SELF_CORRELATION 冲突，保留高 Fitness 版本
+1. High Fitness (>= 1.5) and low TO (< 15%).
+2. Signals from different clusters.
+3. If SELF_CORRELATION conflicts, keep the higher-Fitness version.
 
-### 8.3 相关性的真相
+### 8.3 The Reality of Correlation
 
-对 ACTIVE alpha 的日收益做相关分析，发现：
+Daily-return correlation across ACTIVE alphas shows that:
 
-- **同一信号簇内相关性极高**：
-  - 两个 open-close 反转 + OI/Equity 混合（权重不同）日收益相关 **0.84**
-  - 两个分析师 EPS 相关 **0.74**
-  - 两个杠杆/质量因子（`-equity/assets` vs `liabilities/assets`）相关 **0.84**
-- **跨簇也不一定能分散**：基于 `scl12_buzz` 的情绪 alpha 与基于 `est_eps/close` 的分析师 alpha 相关仍达 **0.59–0.67**。
-- **累计 PnL 相关性严重失真**： alpha 的累计 PnL 两两相关普遍 **> 0.90**，容易让人误以为所有因子都一样。
+- **Within the same signal cluster, correlation is usually very high**:
+  - two open-close reversal plus OI/Equity blends with different weights had daily-return correlation of **0.84**;
+  - two analyst EPS signals had correlation of **0.74**;
+  - two leverage/quality factors (`-equity/assets` vs `liabilities/assets`) had correlation of **0.84**.
+- **Cross-cluster differences do not guarantee diversification**: a sentiment alpha based on `scl12_buzz` and an analyst alpha based on `est_eps/close` still reached **0.59-0.67**.
+- **Cumulative PnL correlation is heavily distorted**: pairwise cumulative-PnL correlations are often above **0.90**, which makes unrelated factors look identical.
 
-**结论**：
+**Conclusion**:
 
-- 换窗口、换权重、换 neutralization **不能创造真正的低相关**。
-- 真正的低相关来自 **完全不同的数据来源或经济逻辑**（如：宏观事件、期权流、跨境、另类数据）。
-- 在常规 USA TOP3000 基本面/价量/分析师池子里，"低相关" 往往是 **0.3–0.6 的日收益相关**，不要追求 0。
+- Changing windows, weights, or neutralization does **not** create true low correlation.
+- True low correlation comes from **different data sources or different economic logic** such as macro events, options flow, cross-border data, or alternative data.
+- In the standard USA TOP3000 fundamental / price-volume / analyst pool, "low correlation" usually means **0.3-0.6 daily-return correlation**; do not chase zero.
 
----
+## 9. Pre-Submission Checklist
 
-## 9. 提交前 Checklist
+- [ ] Have I pulled **all** alphas, including ACTIVE and UNSUBMITTED, not just the latest simulation?
+- [ ] Is the new factor's **daily-return** correlation with existing ACTIVE alphas below 0.7, or is the new Sharpe at least 10% better than the old one?
+- [ ] Is correlation computed from **daily returns**, not cumulative PnL?
+- [ ] Has the field been verified?
+- [ ] Did the simulation complete without errors?
+- [ ] Is Sharpe >= 1.3, ideally >= 1.5?
+- [ ] Is Fitness >= 1.1?
+- [ ] Is Turnover between 1% and 20%, with room to relax up to 35% if needed?
+- [ ] Is Drawdown below 15%?
+- [ ] Do all IS checks pass?
+- [ ] Are the long and short counts reasonable?
+- [ ] After submission, did I re-check that status == ACTIVE? A 201 response alone is not enough.
 
-- [ ] 已获取 **所有** alpha 列表（含 ACTIVE / UNSUBMITTED），不只是本次模拟
-- [ ] 新因子与已有 ACTIVE alpha **日收益** 相关性 < 0.7（或新 Sharpe ≥ 旧 Sharpe × 1.1）
-- [ ] 相关性基于 **日收益** 计算，不是累计 PnL
-- [ ] 字段已验证
-- [ ] 模拟无报错
-- [ ] Sharpe ≥ 1.3（理想 ≥ 1.5）
-- [ ] Fitness ≥ 1.1
-- [ ] Turnover 1%–20%（可放宽至 ≤ 35%）
-- [ ] Drawdown < 15%
-- [ ] 所有 IS 检查 PASS
-- [ ] 多空数量合理
-- [ ] 提交后 **再次确认 status == ACTIVE**，201 不代表上线
+## 10. Core Lessons
 
----
+1. Pull the full ACTIVE alpha PnL set before generating a new factor, or you will repeat high-correlation ideas.
+2. Correlation must be computed on daily returns; cumulative PnL makes almost everything look the same.
+3. A 201 response does not mean submission succeeded; always confirm `status == ACTIVE`.
+4. Fundamental > mixed > technical: `operating_income/equity`, `est_eps/close`, and `free_cash_flow_reported_value/equity` are the most reliable starting points.
+5. `group_rank + ts_rank` is the golden combination.
+6. `SUBINDUSTRY` neutralization has the highest pass rate.
+7. Decay is the main lever for controlling turnover: 0 for fundamentals, 10-30 for technical signals.
+8. A 50/50 orthogonal blend may reduce turnover, but it does not necessarily reduce correlation; correlation depends on signal source, not just weights.
+9. Verify fields first; invalid fields fail immediately.
+10. In USA TOP3000, true low correlation is hard to achieve; different expressions from the same data pool are often still highly correlated.
 
-## 10. 核心经验（一句话版）
+## 11. Self-Evolution Loop
 
-1. **先生成因子前先拉取所有 ACTIVE alpha 的 PnL**，避免高相关重复。
-2. **相关性必须算日收益**，累计 PnL 相关会把所有因子看成同一个。
-3. **201 响应 ≠ 提交成功**：提交后必须确认 `status == ACTIVE`。
-4. **基本面 > 混合 > 技术**：`operating_income/equity`、`est_eps/close`、`free_cash_flow_reported_value/equity` 是最稳起点。
-5. **group_rank + ts_rank 是黄金组合**。
-6. **SUBINDUSTRY 中性化通过率最高**。
-7. **Decay 是控制换手的主杠杆**：基本面 0，技术 10–30。
-8. **50/50 正交混合能降低换手，但未必能降低相关**；相关靠信号来源，不靠权重。
-9. **字段先验证**，无效字段秒级报错。
-10. **USA TOP3000 里真正的低相关很难做**；同一数据池的 "不同" 表达式往往高度相关。
+After each BRAIN interaction, such as a submission, query, or analysis, the AI should write the useful findings back into this skill so that it keeps improving with practice.
 
----
+### 11.1 Triggers
 
-## 11. 自进化机制
+Run `scripts/evolve_skill.py` after any of the following:
 
-每次与 BRAIN 交互（提交、查询、分析）后，AI 应把新发现写回本 SKILL，使其随实战经验持续进化。
+- one or more new alphas were submitted;
+- a batch of alphas was backtested;
+- alpha status changed, for example UNSUBMITTED -> ACTIVE or rejected;
+- a new field becomes usable or a known field starts failing.
 
-### 11.1 触发条件
+### 11.2 How to Run
 
-以下任一情况发生后，运行一次 `scripts/evolve_skill.py`：
-
-- 提交了一个或多个新 alpha
-- 批量回测了一批 alpha
-- 查询了 alpha 状态并发现变化（如 UNSUBMITTED → ACTIVE，或被拒绝）
-- 发现了新的字段可用性/失效模式
-
-### 11.2 运行方式
-
-**前提**：设置 `WQ_BRAIN_USERNAME` / `WQ_BRAIN_PASSWORD`，或在 skill 目录下放置未跟踪的 `credential.txt`，内容为 BRAIN 账号密码 JSON 数组：
+**Prerequisite**: set `WQ_BRAIN_USERNAME` and `WQ_BRAIN_PASSWORD`, or place an untracked `credential.txt` in the skill directory with the BRAIN credentials as a JSON array:
 
 ```json
 ["your_username", "your_password"]
 ```
 
 ```bash
-# 1. 预览：生成建议追加的 markdown 片段，不修改任何文件
+# 1. Preview: generate a Markdown snippet without changing any files.
 pyenv exec python scripts/evolve_skill.py
 
-# 2. 提交：追加到 SKILL.md 并更新 alpha_db.json
+# 2. Apply: append the snippet to SKILL.md and update alpha_db.json.
 pyenv exec python scripts/evolve_skill.py --apply
 ```
 
-> 注意：**不带 `--apply` 的预览模式不会修改 `alpha_db.json` 和 `SKILL.md`**，你可以先审查再提交。脚本仅依赖 `requests` 和 `numpy`，**不需要 `wq-bus` 项目代码**。数据文件已随 SKILL 分发。
+> Note: **preview mode without `--apply` does not modify `alpha_db.json` or `SKILL.md`**. Review the output first, then apply it if it is correct. The script only depends on `requests` and `numpy`; it does **not** require the `wq-bus` project code. The data files are shipped with the skill.
 
-脚本会：
+The script will:
 
-1. 拉取 `/users/self/alphas`（分页）获取全部 alpha。
-2. 与本地 `alpha_db.json` 对比，找出 **新增** 或 **状态/指标变化** 的 alpha。
-3. 对新 alpha 抓取 `recordsets/pnl`，计算与已有 ACTIVE alpha 的 **日收益相关性**。
-4. 自动生成经验条目（指标评价 + 相关评价 + 表达式摘要）。
-5. 第一次运行输出**批量快照**；后续运行输出**增量条目**。
-6. `--apply` 模式下把条目追加到 `## 12. 实证记录（自动更新）`，并保存本地 `alpha_db.json`。
+1. Fetch `/users/self/alphas` with pagination to obtain every alpha.
+2. Compare the results with the local `alpha_db.json` and find **new** or **changed** alphas.
+3. Fetch `recordsets/pnl` for new alphas and compute **daily-return correlation** against existing ACTIVE alphas.
+4. Generate a lesson entry automatically, including metric evaluation, correlation evaluation, and an expression summary.
+5. Emit a **bulk snapshot** on the first run, then **incremental entries** on later runs.
+6. In `--apply` mode, append the entry to `## 12. Empirical Record (Auto-Updated)` and save the local `alpha_db.json` file.
 
-### 11.3 AI 应如何整理经验
+### 11.3 How the AI Should Distill Lessons
 
-脚本输出后，AI 需要**人工判断**哪些条目值得永久写入 SKILL：
+After the script outputs a report, the AI should decide manually which entries deserve to be written permanently into the skill:
 
-- **保留**：高 Fitness 低换手的成功案例、新的低相关信号簇、意外的失败模式。
-- **精简**：大量重复的同一信号簇条目应合并为一句话规律。
-- **更新模板/阈值**：如果多次发现某个字段/模板失效，应回到第 4、5、6 节更新。
+- **Keep**: successful high-Fitness, low-turnover cases, new low-correlation signal clusters, and unexpected failure modes.
+- **Compress**: repeated entries from the same signal cluster should be merged into a single rule.
+- **Update templates and thresholds**: if a field or template repeatedly fails, revise Sections 4, 5, and 6.
 
-### 11.4 数据结构
+### 11.4 Data Structures
 
-- `alpha_db.json`：本地 alpha 快照库，包含状态、指标、表达式、PnL。该文件会包含个人研究记录，默认被 `.gitignore` 忽略，不应提交到公开仓库。
-- `SKILL.md`：最终人类可读 playbook，第 12 节只保留脱敏后的通用经验。
+- `alpha_db.json`: local alpha snapshot store containing status, metrics, expressions, and PnL. It contains personal research records and is ignored by default through `.gitignore`; it should not be published to a public repository.
+- `SKILL.md`: the final human-readable playbook. Section 12 keeps only sanitized, general lessons.
 
-## 12. 实证记录（自动更新）
+## 12. Empirical Record (Auto-Updated)
 
-> 本节仅保留机制说明。真实运行生成的 alpha ID、表达式、PnL、提交状态和相关性记录可能关联个人账号与研究资产，默认写入本地 `alpha_db.json`，不随仓库发布。
-> 若需要沉淀通用经验，请人工汇总成脱敏规则后再写回第 4、5、6、8、10 节。
-
-
-
+> This section only documents the mechanism. Real alpha IDs, expressions, PnL series, submission statuses, and correlation records generated during actual runs may be linked to a personal account and research assets. They are written to local `alpha_db.json` by default and are not published with the repository.
+>
+> If you want to preserve general lessons, summarize them into sanitized rules and write them back into Sections 4, 5, 6, 8, and 10.

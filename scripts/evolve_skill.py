@@ -240,24 +240,24 @@ def generate_lesson(fp: dict[str, Any], top_corr: list[dict[str, Any]]) -> str:
     family = classify_alpha(fp["expression"])
 
     if fp["fitness"] is None:
-        metric_note = "模拟失败或数据缺失"
+        metric_note = "simulation failed or data is missing"
     elif fp["fitness"] >= 1.5 and fp["turnover"] is not None and fp["turnover"] <= 0.15:
-        metric_note = "高 Fitness 低换手，优秀候选"
+        metric_note = "high Fitness and low turnover, a strong candidate"
     elif fp["fitness"] >= 1.1 and fp["turnover"] is not None and fp["turnover"] <= 0.20:
-        metric_note = "满足基础提交门槛"
+        metric_note = "meets the basic submission threshold"
     elif fp["turnover"] is not None and fp["turnover"] > 0.35:
-        metric_note = "换手偏高，需增大 decay 或混合稳定信号"
+        metric_note = "turnover is high; increase decay or blend in more stable signals"
     else:
-        metric_note = "指标一般，需继续优化"
+        metric_note = "metrics are average and need more work"
 
     if not top_corr:
-        corr_note = "暂无 ACTIVE alpha 可比相关"
+        corr_note = "no ACTIVE alpha available for comparison"
     elif abs(top_corr[0]["corr"]) >= 0.7:
-        corr_note = f"与 {top_corr[0]['alpha_id']} 高度相关 ({top_corr[0]['corr']:.2f})，需换信号簇"
+        corr_note = f"highly correlated with {top_corr[0]['alpha_id']} ({top_corr[0]['corr']:.2f}); switch signal clusters"
     elif abs(top_corr[0]["corr"]) >= 0.5:
-        corr_note = f"与 {top_corr[0]['alpha_id']} 中等相关 ({top_corr[0]['corr']:.2f})，谨慎提交"
+        corr_note = f"moderately correlated with {top_corr[0]['alpha_id']} ({top_corr[0]['corr']:.2f}); submit carefully"
     else:
-        corr_note = f"与现有 ACTIVE alpha 低相关 ({top_corr[0]['corr']:.2f})，分散价值较高"
+        corr_note = f"low correlation with existing ACTIVE alphas ({top_corr[0]['corr']:.2f}); good diversification value"
 
     return f"{metric_note}；{corr_note}"
 
@@ -286,11 +286,11 @@ def build_bulk_summary(alphas: list[dict], active_correlations: dict[str, list[d
     high_to = [a for a in alphas if a.get("is", {}).get("turnover") is not None and a.get("is", {}).get("turnover") > 0.50]
 
     lines = [
-        f"\n### {now} — 批量初始化快照\n",
-        f"- 总 alpha：{total} | ACTIVE：{len(active)} | 非 ACTIVE：{len(unsubmitted)}",
-        f"- 信号簇分布：{dict(families.most_common(8))}",
+        f"\n### {now} — Bulk Initialization Snapshot\n",
+        f"- Total alphas: {total} | ACTIVE: {len(active)} | non-ACTIVE: {len(unsubmitted)}",
+        f"- Signal-cluster distribution: {dict(families.most_common(8))}",
         "",
-        "**ACTIVE 高 Fitness Top 5**：",
+        "**Top 5 ACTIVE alphas by Fitness**:",
     ]
     for a in top_active:
         is_ = a.get("is", {})
@@ -311,21 +311,21 @@ def build_bulk_summary(alphas: list[dict], active_correlations: dict[str, list[d
                 if abs(corr) >= 0.7:
                     high_corr_pairs.append((a, b, corr))
         if high_corr_pairs:
-            lines.extend(["", "**ACTIVE 中日收益高相关对（≥ 0.7）**："])
+            lines.extend(["", "**High-correlation ACTIVE daily-return pairs (>= 0.7)**:"])
             for a, b, c in high_corr_pairs[:10]:
                 lines.append(f"- `{a}` vs `{b}`: {c:.3f}")
         else:
-            lines.extend(["", "**ACTIVE 中日收益高相关对**：无 ≥ 0.7 的对（或 PnL 不足）"])
+            lines.extend(["", "**High-correlation ACTIVE daily-return pairs**: none >= 0.7 (or insufficient PnL)"])
 
     if failures:
-        lines.extend(["", f"**明显失效信号（Fitness < 0.5，共 {len(failures)} 个）**："])
+        lines.extend(["", f"**Clear failures (Fitness < 0.5, {len(failures)} total)**:"])
         families_fail = Counter(classify_alpha(a.get("regular", {}).get("code", "")) for a in failures)
-        lines.append(f"- 簇分布：{dict(families_fail.most_common(5))}")
+        lines.append(f"- Cluster distribution: {dict(families_fail.most_common(5))}")
 
     if high_to:
-        lines.extend(["", f"**高换手（TO > 50%，共 {len(high_to)} 个）**："])
+        lines.extend(["", f"**High turnover (TO > 50%, {len(high_to)} total)**:"])
         families_to = Counter(classify_alpha(a.get("regular", {}).get("code", "")) for a in high_to)
-        lines.append(f"- 簇分布：{dict(families_to.most_common(5))}")
+        lines.append(f"- Cluster distribution: {dict(families_to.most_common(5))}")
 
     lines.append("\n---\n")
     return "\n".join(lines)
@@ -340,21 +340,21 @@ def build_incremental_report(entries: list[dict[str, Any]]) -> str:
     for e in entries:
         if e.get("event") == "status_or_metric_changed":
             lines.append(
-                f"- **{e['alpha_id']}** 状态变化：{e['old_status']} → {e['new_status']}；"
-                f"Sharpe={e['sharpe']}, Fitness={e['fitness']}, TO={e['turnover']}。{e['lesson']}"
+                f"- **{e['alpha_id']}** status changed: {e['old_status']} -> {e['new_status']}; "
+                f"Sharpe={e['sharpe']}, Fitness={e['fitness']}, TO={e['turnover']}. {e['lesson']}"
             )
         else:
             lines.append(
                 f"- **{e['alpha_id']}** ({e['status']}, {e['family']}): "
-                f"Sharpe={e['sharpe']}, Fitness={e['fitness']}, TO={e['turnover']}, DD={e['drawdown']}。"
+                f"Sharpe={e['sharpe']}, Fitness={e['fitness']}, TO={e['turnover']}, DD={e['drawdown']}. "
                 f"{e['lesson']}"
             )
             if e["top_corr"]:
                 corr_strs = [f"{c['alpha_id']}({c['corr']:+.2f})" for c in e["top_corr"]]
-                lines.append(f"  - 相关：{', '.join(corr_strs)}")
+                lines.append(f"  - Correlation: {', '.join(corr_strs)}")
             expr = truncate_expr(e["expression"])
             if expr:
-                lines.append(f"  - 表达式：`{expr}`")
+                lines.append(f"  - Expression: `{expr}`")
     lines.append("\n---\n")
     return "\n".join(lines)
 
@@ -364,7 +364,7 @@ def append_to_skill(snippet: str) -> None:
     if not SKILL_PATH.exists():
         raise FileNotFoundError(f"SKILL.md not found at {SKILL_PATH}")
     content = SKILL_PATH.read_text(encoding="utf-8")
-    marker = "## 12. 实证记录（自动更新）"
+    marker = "## 12. Empirical Record (Auto-Updated)"
     if marker not in content:
         content += f"\n\n{marker}\n\n{snippet}"
     else:
@@ -478,7 +478,7 @@ def main() -> int:
                     "sharpe": new["sharpe"],
                     "fitness": new["fitness"],
                     "turnover": new["turnover"],
-                    "lesson": f"状态从 {old.get('status')} 变为 {new['status']}",
+                    "lesson": f"status changed from {old.get('status')} to {new['status']}",
                 }
             )
             if args.apply:
