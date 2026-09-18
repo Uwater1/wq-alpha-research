@@ -11,25 +11,30 @@ This is the only directory that matters for this project.
   ./.venv/bin/python <script.py>
   ```
 
-- Dependencies (`requests`, `numpy`) are already installed in the venv. The system
-  python lacks numpy, so do NOT use bare `python` / `python3` here.
-- `pyenv exec python` (mentioned in `SKILL.md`) is not available on this machine —
-  the venv above replaces it.
+- Dependencies (`requests`, `numpy`) are already installed in the venv.
 
 ## 2. Credentials (never commit)
 
-The scripts need BRAIN credentials, loaded by `scripts/evolve_skill.py` in this order:
+The scripts need BRAIN credentials, loaded by `scripts/evolve_skill.py` and
+`legacy/wq_brain/wq_session.py` in this order:
 
 1. Env vars: `WQ_BRAIN_USERNAME` / `WQ_BRAIN_PASSWORD`
-2. Local file `credential.txt` in the project root containing a JSON array:
+2. Local file `credential.txt` encrypted with `credential.key` (or plaintext JSON array `["your_username", "your_password"]`)
+3. `legacy/wq_brain/credentials.json` (JSON object, legacy format)
 
-   ```json
-   ["your_username", "your_password"]
-   ```
+### Encryption Layer & Agent Privacy Rule
+- To prevent AI agents from accidentally viewing credentials, `credential.txt` can be encrypted:
+  ```bash
+  # Check status without revealing secrets
+  ./.venv/bin/python scripts/credential_crypto.py --status
 
-`credential.txt` is git-ignored. If neither source exists, every script that talks
-to the BRAIN API will raise `FileNotFoundError` — that is expected and means the
-user still needs to add credentials.
+  # Encrypt credential.txt in-place (generates credential.key if missing)
+  ./.venv/bin/python scripts/credential_crypto.py --encrypt
+  ```
+- The random passphrase is stored in `credential.key` (git-ignored, 0600 permissions). Its SHA-256 hash encrypts/decrypts `credential.txt`.
+- Submitting and session scripts automatically decrypt `credential.txt` in memory.
+- **CRITICAL AGENT RULE**: AI agents MUST NEVER call `view_file` or print the contents of `credential.txt` or `credential.key`. Treat these files as opaque secrets.
+
 
 ## 3. How to Run Things
 
@@ -98,7 +103,8 @@ account-linked — never commit or publish it.
 
 ## 6. Files That Stay Local (git-ignored)
 
-- `credential.txt` — BRAIN credentials
+- `credential.txt` — BRAIN credentials (encrypted)
+- `credential.key` — BRAIN encryption key
 - `alpha_db.json` — local alpha snapshot / PnL store
 - `batch_submit_results.json` — submission results
 

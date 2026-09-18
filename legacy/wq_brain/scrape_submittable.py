@@ -87,7 +87,8 @@ def fetch_checks(session, aid: str, attempts: int = 20) -> list | None:
             return None
         if resp.content:
             try:
-                return resp.json().get("is", {}).get("checks", [])
+                # `is` can be null while BRAIN is still computing the checks.
+                return (resp.json().get("is") or {}).get("checks", [])
             except ValueError:
                 pass  # body not ready yet
         time.sleep(2.5)
@@ -102,8 +103,8 @@ def scrape_one(session, alpha: dict) -> dict | None:
     if not checks or not all(c.get("result") == "PASS" for c in checks):
         return None
 
-    is_ = alpha.get("is", {}) or {}
-    settings = alpha.get("settings", {}) or {}
+    is_ = alpha.get("is") or {}
+    settings = alpha.get("settings") or {}
     self_corr = next((c.get("value") for c in checks if c.get("name") == "SELF_CORRELATION"), "")
     code = (alpha.get("regular") or {}).get("code", "")
     sharpe = is_.get("sharpe", 0)

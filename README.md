@@ -55,8 +55,13 @@ Recommended loop:
 wq-alpha-research/
 ├── SKILL.md
 ├── scripts/
-│   ├── evolve_skill.py
-│   └── submit_batch.py
+│   └── evolve_skill.py
+├── legacy/
+│   └── wq_brain/            # batch simulate / scrape / submit tooling
+│       ├── wq_session.py
+│       ├── batch_simulate.py
+│       ├── scrape_submittable.py
+│       └── submit_from_csv.py
 └── references/
     ├── wq_usa_top3000_delay1_data_fields.csv
     ├── wq_usa_top3000_delay1_data_fields.json
@@ -95,22 +100,36 @@ matches = [
 print(matches[:5])
 ```
 
-## BRAIN Credentials
+## BRAIN Credentials & Agent Security Setup
 
-Use environment variables:
+Before running research scripts or launching AI agents, configure your WorldQuant BRAIN credentials using either method below:
 
+### Option 1: Environment Variables
 ```bash
 export WQ_BRAIN_USERNAME="your_username"
 export WQ_BRAIN_PASSWORD="your_password"
 ```
 
-Or create a local `credential.txt` file:
+### Option 2: Encrypted Local File (Recommended for AI Agents)
+To prevent AI agents from accidentally viewing your plaintext password when inspecting files, use the zero-dependency encryption layer:
 
-```json
-["your_username", "your_password"]
-```
+1. Create `credential.txt` at the repo root:
+   ```json
+   ["your_username", "your_password"]
+   ```
 
-`credential.txt` is ignored by git. Do not commit real credentials, cookies, sessions, tokens, alpha databases, or submission results.
+2. Encrypt it before starting your agent session:
+   ```bash
+   ./.venv/bin/python scripts/credential_crypto.py --encrypt
+   ```
+   *This generates a git-ignored passphrase in `credential.key` (`0600` permissions) and converts `credential.txt` into encrypted ciphertext.*
+
+3. Verify status without revealing secrets:
+   ```bash
+   ./.venv/bin/python scripts/credential_crypto.py --status
+   ```
+
+All tooling scripts (`wq_session.py`, `evolve_skill.py`, etc.) automatically decrypt credentials in memory. Both `credential.txt` and `credential.key` are ignored by git.
 
 ## Scripts
 
@@ -126,19 +145,31 @@ Apply updates to local `SKILL.md` and `alpha_db.json` after reviewing the previe
 python scripts/evolve_skill.py --apply
 ```
 
-Run the batch submission example:
+The generated record is sanitized by default (pseudonymous alpha IDs plus an operator
+skeleton instead of the exact expression). `--raw` writes the real IDs and expressions
+and is only safe for a private local `SKILL.md`.
+
+Simulate, scrape, and submit a batch of expressions:
 
 ```bash
-python scripts/submit_batch.py
+# 1. Simulate every expression in a CSV (results stream to data/results_<ts>.csv)
+python legacy/wq_brain/batch_simulate.py legacy/wq_brain/data/input.csv --workers 3
+
+# 2. Keep the alphas that pass every IS check
+python legacy/wq_brain/scrape_submittable.py --min-sharpe 1.3
+
+# 3. Submit sharpe-first and confirm the alpha reaches ACTIVE
+python legacy/wq_brain/submit_from_csv.py legacy/wq_brain/data/scrape_<ts>.csv
 ```
 
-The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git.
+The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
 
 ## Safety Notes
 
 The following files are intentionally ignored:
 
-- `credential.txt`
+- `credential.txt` (encrypted ciphertext)
+- `credential.key` (random secret key)
 - `alpha_db.json`
 - `batch_submit_results.json`
 - `.env`

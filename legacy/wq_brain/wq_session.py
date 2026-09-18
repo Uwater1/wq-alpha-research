@@ -38,28 +38,25 @@ HEADERS = {
 
 
 def load_credentials() -> tuple[str, str]:
-    """Resolve BRAIN credentials from env vars, credential.txt, or credentials.json."""
+    """Resolve BRAIN credentials from env vars, credential.txt (encrypted or plaintext), or credentials.json."""
     env_user = os.getenv("WQ_BRAIN_USERNAME")
     env_pass = os.getenv("WQ_BRAIN_PASSWORD")
     if env_user and env_pass:
         return env_user, env_pass
 
-    if CREDENTIAL_TXT.exists():
-        username, password = json.loads(
-            CREDENTIAL_TXT.read_text(encoding="utf-8")
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+
+    try:
+        from scripts.credential_crypto import load_credentials_from_disk
+        return load_credentials_from_disk(REPO_ROOT)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "BRAIN credentials not found. Set WQ_BRAIN_USERNAME / WQ_BRAIN_PASSWORD, "
+            'create credential.txt at the repo root (secured with credential.key), or create '
+            'legacy/wq_brain/credentials.json as {"email": ..., "password": ...}. '
+            "All locations are git-ignored."
         )
-        return str(username), str(password)
-
-    if LEGACY_CREDENTIALS.exists():
-        creds = json.loads(LEGACY_CREDENTIALS.read_text(encoding="utf-8"))
-        return str(creds["email"]), str(creds["password"])
-
-    raise FileNotFoundError(
-        "BRAIN credentials not found. Set WQ_BRAIN_USERNAME / WQ_BRAIN_PASSWORD, "
-        'create credential.txt at the repo root as ["user", "pass"], or create '
-        'legacy/wq_brain/credentials.json as {"email": ..., "password": ...}. '
-        "All three locations are git-ignored."
-    )
 
 
 class RateLimitError(RuntimeError):
@@ -76,9 +73,12 @@ def create_session() -> requests.Session:
     session.auth = HTTPBasicAuth(username, password)
     session.headers.update(HEADERS)
 
-    resp = session.post(f"{API_BASE}/authentication")
+    try:
+        resp = session.post(f"{API_BASE}/authentication", timeout=(10, 60))
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        raise RuntimeError(f"BRAIN auth request failed: {exc}") from exc
     if resp.status_code != 201:
-        raise RuntimeError(f"BRAIN auth failed: {resp.status_code} {resp.text}")
+        raise RuntimeError(f"BRAIN auth failed: {resp.status_code} {resp.text[:300]}")
     return session
 
 

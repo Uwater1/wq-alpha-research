@@ -536,6 +536,9 @@ Daily-return correlation across ACTIVE alphas shows that:
 8. A 50/50 orthogonal blend may reduce turnover, but it does not necessarily reduce correlation; correlation depends on signal source, not just weights.
 9. Verify fields first; invalid fields fail immediately.
 10. In USA TOP3000, true low correlation is hard to achieve; different expressions from the same data pool are often still highly correlated.
+11. Below ~12.5% turnover, Fitness ignores turnover entirely (`returns / max(TO, 0.125)`): a very stable signal is scored purely on its return, so low-turnover Fitness failures mean the return is too small — raise returns instead of lowering turnover further.
+12. Correlation is a property of the *field family*, not of the transform: `ts_rank(ROE,126)` vs `ts_zscore(ROE,252)` measured +0.76, and ROE vs ROA +0.79. Changing window/transform/denominator inside a family does not create a new alpha; switching family (for example accrual profitability to realized cash flow, +0.21) does.
+13. Cash-flow fundamentals are the cheapest orthogonal block next to profitability within the same `fundamental` dataset: they clear the same Sharpe range while correlating only 0.2-0.3 with accrual-based quality alphas.
 
 ## 11. Self-Evolution Loop
 
@@ -601,8 +604,8 @@ After the script outputs a report, the AI should decide manually which entries d
 - Total alphas: 19 | ACTIVE: 1 | non-ACTIVE: 18
 - Signal-cluster distribution: {'other': 9, 'technical': 9, 'analyst': 1}
 
-**Top 5 ACTIVE alphas by Fitness**:
-- `mLmO6mY9` (analyst): Sharpe=1.85, Fitness=1.02, TO=0.238 — `group_rank(ts_rank(est_eps / close, 126), subindustry)`
+**Top ACTIVE alphas by Fitness** (IDs and expressions sanitized by `scripts/evolve_skill.py`; raw records stay in the local `alpha_db.json`):
+- `alpha-9a458f31` (analyst, `group_rank+ts_rank` on an EPS-yield field): Sharpe≈1.85, Fitness≈1.02, TO≈0.24 — passes the IS gate but sits above the 20% turnover comfort zone.
 
 **High-correlation ACTIVE daily-return pairs**: none >= 0.7 (or insufficient PnL)
 
@@ -611,6 +614,222 @@ After the script outputs a report, the AI should decide manually which entries d
 
 **High turnover (TO > 50%, 9 total)**:
 - Cluster distribution: {'technical': 7, 'other': 2}
+
+---
+
+
+### 2026-09-18 21:13 UTC — 15-Alpha Fundamental Batch (Compressed)
+
+15 expressions were simulated in one batch (USA TOP3000 delay=1, 3 concurrent, ~15 min wall clock).
+3 passed every IS check and became ACTIVE. Per-alpha rows were compressed into rules per §11.3.
+
+**Kept — the three ACTIVE survivors (all low-frequency fundamental quality / cash-flow signals):**
+
+| Cluster | Operator shape | Decay | Sharpe | Fitness | TO | Daily-return corr vs existing ACTIVE |
+|---|---|---:|---:|---:|---:|---:|
+| cash-flow estimate yield | `group_rank+ts_rank` | 4 | 1.85 | 1.45 | 10.8% | 0.66 pre-submit, 0.68 in pool |
+| profitability + investment blend | `group_rank+ts_rank+ts_delta` | 4 | 1.84 | 1.35 | 6.2% | 0.06 (near-orthogonal) |
+| profitability z-score | `group_rank+ts_zscore` | 2 | 1.79 | 1.25 | 4.7% | -0.01 (near-orthogonal) |
+
+**Rules distilled from this batch:**
+
+1. **Low-turnover signals fail on Fitness, not Sharpe.** Sharpe 1.2-1.65 at ~5-6% turnover repeatedly landed at
+   Fitness 0.5-1.0. The Fitness formula divides returns by `max(TO, 0.125)`, so turnover below 12.5% buys no
+   credit at all — the annualized return itself must clear roughly 6%. Fix the return profile, not the turnover.
+2. **A different transform/window on the same field is NOT a correlation escape hatch.** Directly measured
+   on the same pool: `ts_rank(ROE,126)` vs `ts_zscore(ROE,252)` = **+0.76**, and `ROE` vs `ROA` = **+0.79**.
+   Transform, window and denominator tweaks stay inside the same bet. Orthogonality has to come from the
+   *field family*: `cashflow_op/equity` vs `ROE` = +0.21, vs an accrual profitability z-score = +0.32, vs an
+   estimate-yield alpha = +0.22 — realized cash flow is a genuinely different bet from accrual profitability.
+3. **Blending two slow fundamentals raises Fitness without raising turnover.** The 50/50 quality + asset-growth
+   blend was the only single expression to reach Fitness 1.35 at 6% turnover; the blend's weights matter less
+   than the fact that two return streams are added.
+4. **Analyst *estimate* yields are one cluster regardless of field name.** An EBITDA-estimate-yield expression hit
+   0.73 daily-return correlation with the existing EPS-estimate-yield alpha and was rejected. Do not re-mine the
+   analyst estimate family by swapping one estimate field for another.
+5. **Alternative data at high decay was the worst cohort.** Social buzz and implied-volatility skew at decay 6
+   produced Sharpe <= 0.33 with 43-44% turnover (HIGH_TURNOVER *and* LOW_SHARPE). Their low correlation is real
+   but worthless without a return profile: control turnover before chasing correlation.
+6. **Correlation drifts upward as your own pool grows.** The same alpha measured 0.66 against a 1-alpha pool
+   and 0.68 against the 2-alpha pool after the first submission. Keep ~0.1 of headroom below the 0.7 limit
+   rather than submitting right at the boundary.
+7. **Operationally:** 15 expressions cost ~15 minutes (BRAIN runs 3 simulations concurrently, ~2 min each).
+   Use `--skip-done` for reruns so finished expressions are never re-simulated, and trust
+   `submit_from_csv.py`'s ACTIVE confirmation instead of re-simulating to double-check.
+
+---
+
+
+### 2026-09-18 22:07 UTC
+
+- **alpha-3af05a89** (UNSUBMITTED, cashflow): Sharpe=2.29, Fitness=1.86, TO=0.133, DD=0.033. high Fitness and low turnover, a strong candidate；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-97e0834e** (UNSUBMITTED, cashflow): Sharpe=1.59, Fitness=1.01, TO=0.059, DD=0.054. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-26701717** (UNSUBMITTED, cashflow): Sharpe=1.55, Fitness=0.88, TO=0.059, DD=0.042. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-9c2e18f2** (ACTIVE, profitability+cashflow): Sharpe=2.14, Fitness=1.59, TO=0.062, DD=0.046. high Fitness and low turnover, a strong candidate；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-3d5fec4c** (UNSUBMITTED, cashflow): Sharpe=1.84, Fitness=1.29, TO=0.062, DD=0.047. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-70ab4e69** (UNSUBMITTED, cashflow): Sharpe=1.60, Fitness=1.01, TO=0.058, DD=0.050. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-a7477118** (UNSUBMITTED, cashflow): Sharpe=1.82, Fitness=1.27, TO=0.061, DD=0.039. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-52d76672** (UNSUBMITTED, cashflow): Sharpe=1.68, Fitness=1.38, TO=0.097, DD=0.049. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_zscore`
+- **alpha-252d8f37** (UNSUBMITTED, other): Sharpe=1.30, Fitness=1.01, TO=0.081, DD=0.070. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_zscore`
+- **alpha-fd146b85** (UNSUBMITTED, cashflow): Sharpe=1.83, Fitness=1.34, TO=0.057, DD=0.051. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-6ff79ebe** (UNSUBMITTED, cashflow): Sharpe=1.69, Fitness=1.08, TO=0.059, DD=0.039. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-39ab409d** (UNSUBMITTED, cashflow): Sharpe=1.74, Fitness=1.19, TO=0.059, DD=0.050. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+winsorize+ts_backfill`
+- **alpha-6ab8e736** (UNSUBMITTED, other): Sharpe=1.01, Fitness=0.58, TO=0.154, DD=0.066. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-24b06044** (UNSUBMITTED, other): Sharpe=1.33, Fitness=1.04, TO=0.100, DD=0.070. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_zscore`
+- **alpha-99379724** (UNSUBMITTED, other): Sharpe=1.36, Fitness=0.69, TO=0.280, DD=0.059. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-a10bf5b5** (UNSUBMITTED, cashflow+technical): Sharpe=0.67, Fitness=0.30, TO=0.117, DD=0.062. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_std_dev`
+- **alpha-51e47611** (UNSUBMITTED, cashflow): Sharpe=0.72, Fitness=0.45, TO=0.125, DD=0.098. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+rank+ts_delta`
+- **alpha-98281a42** (UNSUBMITTED, cashflow): Sharpe=1.71, Fitness=1.37, TO=0.098, DD=0.039. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-0340a097** (UNSUBMITTED, cashflow): Sharpe=1.61, Fitness=1.29, TO=0.103, DD=0.049. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-3e6fa5eb** (ACTIVE, cashflow): Sharpe=1.63, Fitness=1.32, TO=0.126, DD=0.047. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-435395ea** (ACTIVE, cashflow): Sharpe=2.18, Fitness=1.79, TO=0.101, DD=0.033. high Fitness and low turnover, a strong candidate；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-798cec17** (UNSUBMITTED, cashflow): Sharpe=1.91, Fitness=1.32, TO=0.062, DD=0.037. meets the basic submission threshold；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-dee38b98** (UNSUBMITTED, cashflow): Sharpe=1.46, Fitness=0.96, TO=0.060, DD=0.052. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-b1098918** (ACTIVE, cashflow): Sharpe=1.58, Fitness=1.00, TO=0.056, DD=0.056. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-9a19b59e** (UNSUBMITTED, cashflow): Sharpe=1.40, Fitness=0.76, TO=0.057, DD=0.054. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-0073370b** (UNSUBMITTED, cashflow): Sharpe=1.24, Fitness=0.74, TO=0.044, DD=0.062. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+abs`
+- **alpha-e4ac8c0e** (UNSUBMITTED, other): Sharpe=1.31, Fitness=0.71, TO=0.055, DD=0.047. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-67e11734** (UNSUBMITTED, other): Sharpe=1.02, Fitness=0.49, TO=0.047, DD=0.049. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-0506bdfc** (UNSUBMITTED, other): Sharpe=0.32, Fitness=0.08, TO=0.054, DD=0.048. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-f36121ed** (UNSUBMITTED, cashflow): Sharpe=1.47, Fitness=0.83, TO=0.056, DD=0.041. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-c37561ab** (UNSUBMITTED, cashflow): Sharpe=0.82, Fitness=0.36, TO=0.054, DD=0.073. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-01510adc** (UNSUBMITTED, technical): Sharpe=1.36, Fitness=0.54, TO=0.282, DD=0.056. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `trade_when+ts_arg_max+group_rank+ts_rank`
+- **alpha-db7aa674** (UNSUBMITTED, technical): Sharpe=1.07, Fitness=0.50, TO=0.262, DD=0.042. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `trade_when+group_rank+ts_rank+ts_delta`
+- **alpha-6e701b22** (UNSUBMITTED, other): Sharpe=0.69, Fitness=0.32, TO=0.026, DD=0.079. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+winsorize+ts_backfill`
+- **alpha-655700cf** (UNSUBMITTED, other): Sharpe=0.84, Fitness=0.44, TO=0.027, DD=0.085. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+winsorize+ts_backfill`
+- **alpha-c55146bf** (UNSUBMITTED, other): Sharpe=0.99, Fitness=0.63, TO=0.034, DD=0.061. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+winsorize+ts_backfill`
+- **alpha-ed23df0f** (UNSUBMITTED, other): Sharpe=0.83, Fitness=0.40, TO=0.026, DD=0.069. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+winsorize+ts_backfill`
+- **alpha-93f620b8** (UNSUBMITTED, technical): Sharpe=0.02, Fitness=0.00, TO=0.216, DD=0.101. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-63f1b808** (UNSUBMITTED, other): Sharpe=0.39, Fitness=0.08, TO=0.341, DD=0.059. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-238972ca** (UNSUBMITTED, other): Sharpe=0.02, Fitness=0.00, TO=0.219, DD=0.066. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-eea9259a** (UNSUBMITTED, other): Sharpe=-0.05, Fitness=-0.00, TO=0.254, DD=0.117. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_zscore`
+- **alpha-907f7737** (UNSUBMITTED, other): Sharpe=1.04, Fitness=0.47, TO=0.172, DD=0.046. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-0a4b8569** (UNSUBMITTED, other): Sharpe=0.13, Fitness=0.03, TO=0.138, DD=0.129. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-8f4349ec** (UNSUBMITTED, other): Sharpe=1.00, Fitness=0.41, TO=0.227, DD=0.058. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_zscore`
+- **alpha-36fdec21** (UNSUBMITTED, other): Sharpe=0.28, Fitness=0.07, TO=0.092, DD=0.053. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-7c9c434f** (UNSUBMITTED, technical): Sharpe=0.10, Fitness=0.02, TO=0.084, DD=0.117. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_corr+rank`
+- **alpha-d648bc13** (UNSUBMITTED, other): Sharpe=1.24, Fitness=0.56, TO=0.245, DD=0.056. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-e3b0a4e0** (UNSUBMITTED, technical): Sharpe=0.23, Fitness=0.07, TO=0.117, DD=0.073. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_std_dev`
+- **alpha-d2fb738c** (UNSUBMITTED, technical): Sharpe=-0.07, Fitness=-0.01, TO=0.363, DD=0.102. turnover is high; increase decay or blend in more stable signals；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_zscore`
+- **alpha-3d7552bd** (UNSUBMITTED, other): Sharpe=1.04, Fitness=0.70, TO=0.159, DD=0.073. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-1ed8a1a2** (UNSUBMITTED, technical): Sharpe=0.40, Fitness=0.18, TO=0.107, DD=0.105. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+ts_std_dev`
+- **alpha-d80393f1** (UNSUBMITTED, technical): Sharpe=0.12, Fitness=0.02, TO=0.498, DD=0.160. turnover is high; increase decay or blend in more stable signals；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank+abs`
+- **alpha-8f72bccb** (UNSUBMITTED, technical): Sharpe=-0.06, Fitness=-0.01, TO=0.053, DD=0.104. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_zscore+ts_std_dev`
+- **alpha-f85b2daf** (UNSUBMITTED, other): Sharpe=0.35, Fitness=0.13, TO=0.149, DD=0.131. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-444fb842** (UNSUBMITTED, other): Sharpe=1.25, Fitness=0.95, TO=0.116, DD=0.069. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-ad6cbc19** (UNSUBMITTED, other): Sharpe=0.70, Fitness=0.36, TO=0.148, DD=0.074. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+- **alpha-448a8bbe** (UNSUBMITTED, other): Sharpe=0.05, Fitness=0.01, TO=0.090, DD=0.294. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank`
+- **alpha-412146d1** (UNSUBMITTED, other): Sharpe=-0.38, Fitness=-0.13, TO=0.145, DD=0.154. metrics are average and need more work；no ACTIVE alpha available for comparison
+  - Expression: `group_rank+ts_rank`
+
+---
+
+### 2026-09-18 (same day) — Cash-Flow Campaign, Compressed Rules
+
+> The 55 raw rows above are the mechanism's output. Per §11.3 they are compressed here into
+the rules that should drive the next run; read this section, not the rows.
+
+Three batches were run after the first three submissions: 28 alternative-data expressions, 19 cash-flow
+expressions, then 12 targeted fixes. Six alphas reached ACTIVE.
+
+**What worked — realized cash-flow fundamentals and cross-family blends:**
+
+| Cluster | Shape | Sharpe | Fitness | TO |
+|---|---|---:|---:|---:|
+| cash-flow yield + estimate yield (blend) | `group_rank+ts_rank` | 2.18 | 1.79 | 10.1% |
+| ROE + cash-flow yield (blend) | `group_rank+ts_rank` | 2.14 | 1.59 | 6.2% |
+| cash-flow yield + market-correlation (blend) | `group_rank+ts_rank` | 1.63 | 1.32 | 12.6% |
+| cash-flow yield, industry grouping | `group_rank+ts_rank` | 1.58 | 1.00 | 5.6% |
+| cash-flow yield + receivables (queued) | `group_rank+ts_rank` | 1.91 | 1.32 | 6.2% |
+
+**Rules distilled from this campaign:**
+
+1. **Cash flow is the productive orthogonal block.** `cashflow_op/equity` measured +0.21 daily-return
+   correlation against ROE, +0.22 against an estimate-yield alpha and +0.32 against an accrual
+   profitability z-score, while its own Sharpe sits in the same 1.5-1.9 band. When the profitability and
+   analyst-estimate space is exhausted, mine realized cash flow next — not another ratio or window.
+2. **Blending across orthogonal families is the reliable Fitness lever.** Single factors repeatedly landed at
+   Fitness 0.7-1.0 and died on LOW_FITNESS; the same factors blended 50/50 reached 1.3-1.8
+   (cash flow + estimate 1.79, ROE + cash flow 1.59, cash flow + market-correlation 1.32). A blend raises
+   returns without raising turnover — it is the cheapest fix for the Fitness gate.
+3. **Alternative data is a dead end in USA TOP3000 delay=1 on this account.** 28 expressions spanning
+   options (IV skew, term structure, put/call OI), news, social buzz, report footnotes, low-volatility,
+   illiquidity and systematic-risk metrics peaked at Sharpe 1.25 / Fitness 0.95; most sat at Sharpe 0.0-1.0.
+   Footnote fields preprocessed with `ts_backfill(120)+winsorize` were stable (TO 2.6-3.4%) but too weak
+   (Sharpe 0.83-0.99). Do not spend another batch here without a new reason.
+4. **`trade_when` gating trades Sharpe for turnover, not the other way round.** Gated reversal reached
+   Sharpe 1.36 at 28% turnover (Fitness 0.54): gating preserved signal quality but never fixed the gate.
+5. **Two checks cause nearly every near-miss, and both have mechanical fixes.** `LOW_SUB_UNIVERSE_SHARPE`:
+   widen the grouping (`industry` instead of `subindustry`) or preprocess sparse fields with
+   `ts_backfill(120)+winsorize`. `CONCENTRATED_WEIGHT`: lower truncation to 0.05. Read the failing check from
+   `/alphas/{id}/check` before changing anything else — it is far cheaper than guessing.
+6. **The scraper is stricter than the simulation response.** A simulation reports 7 checks, `/check` reports 8,
+   so `passed == 7` from a batch does NOT mean submission-ready. Always gate on
+   `scrape_submittable.py`, and re-run it a few minutes later: checks can still be `PENDING` right after a
+   simulation finishes, so an early scrape under-reports winners.
+7. **SELF_CORRELATION can PASS above its nominal 0.7 limit** (observed at 0.86) when the new alpha is
+   materially stronger than the correlated incumbent. The PASS is legitimate, but it means the alpha is
+   largely a duplicate — add it only when it brings better Sharpe or a genuinely new cluster.
+8. **Submission is asynchronous.** After `POST /submit`, SELF_CORRELATION can stay `PENDING` for minutes and
+   a repeat submit returns `403` — that is not a failure. Wait and re-check the status; do not discard or
+   re-submit the alpha.
 
 ---
 
