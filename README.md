@@ -55,7 +55,9 @@ Recommended loop:
 wq-alpha-research/
 ├── SKILL.md
 ├── scripts/
-│   └── evolve_skill.py
+│   ├── evolve_skill.py
+│   ├── credential_crypto.py
+│   └── fetch_operators.py
 ├── legacy/
 │   └── wq_brain/            # batch simulate / scrape / submit tooling
 │       ├── wq_session.py
@@ -65,12 +67,14 @@ wq-alpha-research/
 └── references/
     ├── wq_usa_top3000_delay1_data_fields.csv
     ├── wq_usa_top3000_delay1_data_fields.json
-    └── wq_usa_top3000_delay1_data_fields_summary.json
+    ├── wq_usa_top3000_delay1_data_fields_summary.json
+    └── wq_operators.json    # 66 BRAIN operators (GET /operators snapshot)
 ```
 
 ## What It Helps With
 
 - Search USA TOP3000 delay=1 BRAIN fields locally.
+- Look up exact operator signatures locally (`references/wq_operators.json`, 66 ops).
 - Build Alpha expressions from common WQ operator patterns.
 - Diagnose low Sharpe, low Fitness, high Turnover, concentrated weights, and sub-universe failures.
 - Compare candidate alphas against existing ACTIVE alphas using daily-return correlation.
@@ -136,30 +140,36 @@ All tooling scripts (`wq_session.py`, `evolve_skill.py`, etc.) automatically dec
 Preview skill evolution output without modifying files:
 
 ```bash
-python scripts/evolve_skill.py
+./.venv/bin/python scripts/evolve_skill.py
 ```
 
 Apply updates to local `SKILL.md` and `alpha_db.json` after reviewing the preview:
 
 ```bash
-python scripts/evolve_skill.py --apply
+./.venv/bin/python scripts/evolve_skill.py --apply
 ```
 
 The generated record is sanitized by default (pseudonymous alpha IDs plus an operator
 skeleton instead of the exact expression). `--raw` writes the real IDs and expressions
 and is only safe for a private local `SKILL.md`.
 
+Refresh the operator reference (rarely needed — operators barely change):
+
+```bash
+./.venv/bin/python scripts/fetch_operators.py
+```
+
 Simulate, scrape, and submit a batch of expressions:
 
 ```bash
 # 1. Simulate every expression in a CSV (results stream to data/results_<ts>.csv)
-python legacy/wq_brain/batch_simulate.py legacy/wq_brain/data/input.csv --workers 3
+./.venv/bin/python legacy/wq_brain/batch_simulate.py legacy/wq_brain/data/input.csv --workers 3
 
 # 2. Keep the alphas that pass every IS check
-python legacy/wq_brain/scrape_submittable.py --min-sharpe 1.3
+./.venv/bin/python legacy/wq_brain/scrape_submittable.py --min-sharpe 1.3
 
 # 3. Submit sharpe-first and confirm the alpha reaches ACTIVE
-python legacy/wq_brain/submit_from_csv.py legacy/wq_brain/data/scrape_<ts>.csv
+./.venv/bin/python legacy/wq_brain/submit_from_csv.py legacy/wq_brain/data/scrape_<ts>.csv
 ```
 
 The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
@@ -172,6 +182,8 @@ The following files are intentionally ignored:
 - `credential.key` (random secret key)
 - `alpha_db.json`
 - `batch_submit_results.json`
+- `legacy/wq_brain/credentials.json` (legacy credential format)
+- `legacy/wq_brain/data/` (account-linked CSV/log/JSON outputs)
 - `.env`
 - Python caches and virtual environments
 

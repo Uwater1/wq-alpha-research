@@ -15,25 +15,19 @@ This is the only directory that matters for this project.
 
 ## 2. Credentials (never commit)
 
-The scripts need BRAIN credentials, loaded by `scripts/evolve_skill.py` and
-`legacy/wq_brain/wq_session.py` in this order:
+Resolved by `scripts/evolve_skill.py` and `legacy/wq_brain/wq_session.py` in order:
 
 1. Env vars: `WQ_BRAIN_USERNAME` / `WQ_BRAIN_PASSWORD`
-2. Local file `credential.txt` encrypted with `credential.key` (or plaintext JSON array `["your_username", "your_password"]`)
+2. Root `credential.txt` encrypted with `credential.key` (or plaintext JSON array `["your_username", "your_password"]`)
 3. `legacy/wq_brain/credentials.json` (JSON object, legacy format)
 
-### Encryption Layer & Agent Privacy Rule
-- To prevent AI agents from accidentally viewing credentials, `credential.txt` can be encrypted:
-  ```bash
-  # Check status without revealing secrets
-  ./.venv/bin/python scripts/credential_crypto.py --status
+```bash
+./.venv/bin/python scripts/credential_crypto.py --status   # check, reveals nothing
+./.venv/bin/python scripts/credential_crypto.py --encrypt  # encrypt in-place, creates credential.key (0600) if missing
+```
 
-  # Encrypt credential.txt in-place (generates credential.key if missing)
-  ./.venv/bin/python scripts/credential_crypto.py --encrypt
-  ```
-- The random passphrase is stored in `credential.key` (git-ignored, 0600 permissions). Its SHA-256 hash encrypts/decrypts `credential.txt`.
-- Submitting and session scripts automatically decrypt `credential.txt` in memory.
-- **CRITICAL AGENT RULE**: AI agents MUST NEVER call `view_file` or print the contents of `credential.txt` or `credential.key`. Treat these files as opaque secrets.
+Session/submit scripts decrypt in memory. **Agents must never view or print
+`credential.txt` / `credential.key` — treat as opaque secrets.**
 
 
 ## 3. How to Run Things
@@ -57,6 +51,19 @@ The scripts need BRAIN credentials, loaded by `scripts/evolve_skill.py` and
   from pathlib import Path
   data = json.loads(Path("references/wq_usa_top3000_delay1_data_fields.json").read_text(encoding="utf-8"))
   # f["id"], f["category"]["id"], f["dataset"]["name"], f["coverage"], f["alphaCount"]
+  ```
+
+- Load the operator reference (66 ops, `GET /operators` snapshot):
+
+  ```python
+  ops = json.loads(Path("references/wq_operators.json").read_text(encoding="utf-8"))
+  # o["name"], o["category"], o["scope"], o["definition"], o["description"]
+  ```
+
+  Refresh it rarely (operators barely change):
+
+  ```bash
+  ./.venv/bin/python scripts/fetch_operators.py
   ```
 
 ## 4. Workflow (from SKILL.md — read it before doing alpha research)
