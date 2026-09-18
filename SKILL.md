@@ -595,3 +595,22 @@ After the script outputs a report, the AI should decide manually which entries d
 > This section only documents the mechanism. Real alpha IDs, expressions, PnL series, submission statuses, and correlation records generated during actual runs may be linked to a personal account and research assets. They are written to local `alpha_db.json` by default and are not published with the repository.
 >
 > If you want to preserve general lessons, summarize them into sanitized rules and write them back into Sections 4, 5, 6, 8, and 10.
+
+### 2026-09-18 15:36 UTC — Bulk Initialization Snapshot
+
+- Total alphas: 19 | ACTIVE: 1 | non-ACTIVE: 18
+- Signal-cluster distribution: {'other': 9, 'technical': 9, 'analyst': 1}
+
+**Top 5 ACTIVE alphas by Fitness**:
+- `mLmO6mY9` (analyst): Sharpe=1.85, Fitness=1.02, TO=0.238 — `group_rank(ts_rank(est_eps / close, 126), subindustry)`
+
+**High-correlation ACTIVE daily-return pairs**: none >= 0.7 (or insufficient PnL)
+
+**Clear failures (Fitness < 0.5, 10 total)**:
+- Cluster distribution: {'technical': 6, 'other': 4}
+
+**High turnover (TO > 50%, 9 total)**:
+- Cluster distribution: {'technical': 7, 'other': 2}
+
+---
+

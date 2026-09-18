@@ -1,9 +1,16 @@
 credential.txt
 alpha_db.json
 batch_submit_results.json
+credentials.json
 *.pyc
 __pycache__/
 .DS_Store
 .env
 .venv/
 venv/
+.freebuff
+
+# legacy/wq_brain local outputs (account-linked, never publish)
+legacy/wq_brain/data/*.csv
+legacy/wq_brain/data/*.log
+legacy/wq_brain/data/input.csv

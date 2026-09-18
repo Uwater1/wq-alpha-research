@@ -1,0 +1,6 @@
+# Local outputs — never commit
+__pycache__/
+credentials.json
+*.csv
+*.log
+input.csv
