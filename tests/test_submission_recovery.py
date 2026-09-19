@@ -230,6 +230,29 @@ def test_brain_client_distinguishes_uncertain_submit_failures(monkeypatch, statu
     assert client.submit_alpha("A1")["outcome"] == expected
 
 
+def test_submit_alpha_does_not_retry_a_lost_response_inside_http_layer():
+    """A timeout after POST may mean BRAIN accepted it; reconciliation must own retries."""
+
+    class LostResponseSession:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, method, url, **kwargs):
+            self.calls += 1
+            raise brain_api.requests.exceptions.Timeout("response lost after POST")
+
+        def close(self):
+            pass
+
+    session = LostResponseSession()
+    client = brain_api.BrainClient(session=session, retries=3)
+
+    outcome = client.submit_alpha("A1")
+
+    assert outcome["outcome"] == "uncertain"
+    assert session.calls == 1
+
+
 # ---------------------------------------------------------------------------
 # Retry policy: backoff, automatic retry, attempt budget
 # ---------------------------------------------------------------------------
