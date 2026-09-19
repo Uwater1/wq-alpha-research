@@ -1346,7 +1346,17 @@ class ResearchDB:
                 return
             self._set_status(conn, candidate, target, timestamp, reason=message)
             if status == "ACTIVE" and brain_alpha_id:
-                self.upsert_active_alpha(brain_alpha_id, conn=conn)
+                # Carry the candidate's identity and metrics into the live-book snapshot so
+                # correlation re-checks (P9) and duplicate detection see a complete row.
+                self.upsert_active_alpha(
+                    brain_alpha_id,
+                    expression=candidate["expression"],
+                    settings=settings_from_row(candidate),
+                    sharpe=candidate["sharpe"],
+                    fitness=candidate["fitness"],
+                    turnover=candidate["turnover"],
+                    conn=conn,
+                )
 
     # -- ACTIVE portfolio snapshot (TODO P9) -------------------------------
 

@@ -377,7 +377,7 @@ This lets the agent learn which modifications improved results.
 
 ---
 
-## P6 — Submission Queue
+## P6 — Submission Queue 
 
 > **Status: implemented** (`scripts/submission_worker.py` + the `submissions` table).
 > A candidate that clears the IS gate is filed READY automatically with the P6 gates
@@ -429,7 +429,7 @@ RETRY
 
 ---
 
-## P7 — Hourly GitHub Actions Submission Worker
+## P7 — Hourly GitHub Actions Submission Worker (too aggressive, need updates)
 
 Use GitHub Actions as a low-frequency queue drainer.
 

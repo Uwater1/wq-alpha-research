@@ -833,3 +833,186 @@ expressions, then 12 targeted fixes. Six alphas reached ACTIVE.
 
 ---
 
+
+### 2026-09-19 04:00 UTC
+
+- **alpha-53c8edb3** (UNSUBMITTED, cashflow): Sharpe=1.60, Fitness=1.19, TO=0.061, DD=0.037. meets the basic submission threshold；low correlation with existing ACTIVE alphas (0.43); good diversification value
+  - Correlation: alpha-e407fae1(+0.43), alpha-03473b8d(+0.39), alpha-02a6a859(+0.33)
+  - Expression: `group_rank+ts_rank`
+- **alpha-2135b862** (UNSUBMITTED, cashflow): Sharpe=1.35, Fitness=0.87, TO=0.053, DD=0.045. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.43); good diversification value
+  - Correlation: alpha-e407fae1(+0.43), alpha-03473b8d(+0.39), alpha-02a6a859(+0.31)
+  - Expression: `group_rank+ts_zscore`
+- **alpha-ea83ef40** (ACTIVE, other): Sharpe=1.49, Fitness=1.21, TO=0.131, DD=0.109. meets the basic submission threshold；low correlation with existing ACTIVE alphas (0.49); good diversification value
+  - Correlation: alpha-03473b8d(+0.49), alpha-e407fae1(+0.42), alpha-02a6a859(+0.32)
+  - Expression: `group_rank+ts_rank`
+- **alpha-a0d9bc14** (UNSUBMITTED, other): Sharpe=-0.30, Fitness=-0.14, TO=0.116, DD=0.298. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.62); submit carefully
+  - Correlation: alpha-e407fae1(+0.62), alpha-02a6a859(-0.43), alpha-9a458f31(-0.41)
+  - Expression: `group_rank+ts_rank`
+- **alpha-f476fa89** (UNSUBMITTED, other): Sharpe=1.51, Fitness=0.96, TO=0.158, DD=0.049. metrics are average and need more work；moderately correlated with alpha-9a458f31 (0.54); submit carefully
+  - Correlation: alpha-9a458f31(+0.54), alpha-02a6a859(+0.50), alpha-03473b8d(+0.37)
+  - Expression: `group_rank+ts_rank+ts_zscore`
+- **alpha-71425cda** (UNSUBMITTED, other): Sharpe=0.97, Fitness=0.84, TO=0.124, DD=0.119. metrics are average and need more work；moderately correlated with alpha-02a6a859 (0.60); submit carefully
+  - Correlation: alpha-02a6a859(+0.60), alpha-9a458f31(+0.53), alpha-e407fae1(-0.47)
+  - Expression: `group_rank+ts_rank`
+- **alpha-cd4919a0** (UNSUBMITTED, other): Sharpe=0.88, Fitness=0.60, TO=0.107, DD=0.082. metrics are average and need more work；moderately correlated with alpha-02a6a859 (0.59); submit carefully
+  - Correlation: alpha-02a6a859(+0.59), alpha-9a458f31(+0.49), alpha-e407fae1(-0.33)
+  - Expression: `group_rank+ts_rank`
+- **alpha-381a2dc2** (UNSUBMITTED, other): Sharpe=1.70, Fitness=1.67, TO=0.144, DD=0.086. high Fitness and low turnover, a strong candidate；moderately correlated with alpha-ea83ef40 (0.60); submit carefully
+  - Correlation: alpha-ea83ef40(+0.60), alpha-03473b8d(+0.57), alpha-02a6a859(+0.47)
+  - Expression: `group_rank+ts_rank`
+- **alpha-ed948656** (UNSUBMITTED, cashflow): Sharpe=1.94, Fitness=1.81, TO=0.116, DD=0.054. high Fitness and low turnover, a strong candidate；highly correlated with alpha-02a6a859 (0.74); switch signal clusters
+  - Correlation: alpha-02a6a859(+0.74), alpha-9a458f31(+0.72), alpha-ea83ef40(+0.34)
+  - Expression: `group_rank+ts_rank`
+- **alpha-fa359ddd** (UNSUBMITTED, other): Sharpe=1.84, Fitness=1.62, TO=0.115, DD=0.056. high Fitness and low turnover, a strong candidate；highly correlated with alpha-9a458f31 (0.86); switch signal clusters
+  - Correlation: alpha-9a458f31(+0.86), alpha-02a6a859(+0.81), alpha-ea83ef40(+0.29)
+  - Expression: `group_rank+ts_rank`
+- **alpha-6491a6fc** (ACTIVE, other): Sharpe=1.80, Fitness=1.52, TO=0.113, DD=0.043. high Fitness and low turnover, a strong candidate；moderately correlated with alpha-e407fae1 (0.56); submit carefully
+  - Correlation: alpha-e407fae1(+0.56), alpha-9a458f31(+0.52), alpha-03473b8d(+0.50)
+  - Expression: `group_rank+ts_rank`
+- **alpha-46564a19** (UNSUBMITTED, other): Sharpe=0.92, Fitness=0.75, TO=0.121, DD=0.107. metrics are average and need more work；moderately correlated with alpha-02a6a859 (0.62); submit carefully
+  - Correlation: alpha-02a6a859(+0.62), alpha-9a458f31(+0.52), alpha-e407fae1(-0.40)
+  - Expression: `group_rank+ts_rank`
+- **alpha-87326975** (UNSUBMITTED, other): Sharpe=1.37, Fitness=1.01, TO=0.105, DD=0.059. metrics are average and need more work；highly correlated with alpha-6491a6fc (0.74); switch signal clusters
+  - Correlation: alpha-6491a6fc(+0.74), alpha-9a458f31(+0.61), alpha-02a6a859(+0.52)
+  - Expression: `group_rank+ts_rank`
+- **alpha-b941a103** (UNSUBMITTED, other): Sharpe=1.56, Fitness=1.38, TO=0.120, DD=0.071. meets the basic submission threshold；highly correlated with alpha-6491a6fc (0.73); switch signal clusters
+  - Correlation: alpha-6491a6fc(+0.73), alpha-9a458f31(+0.70), alpha-02a6a859(+0.64)
+  - Expression: `group_rank+ts_rank`
+- **alpha-3385855f** (UNSUBMITTED, technical): Sharpe=0.78, Fitness=0.45, TO=0.176, DD=0.109. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.52); submit carefully
+  - Correlation: alpha-e407fae1(+0.52), alpha-ea83ef40(+0.26), alpha-6491a6fc(+0.24)
+  - Expression: `trade_when+ts_mean+group_neutralize+rank+ts_decay_linear+ts_delay+ts_delta+ts_sum+ts_std_dev`
+- **alpha-7eebf6e2** (UNSUBMITTED, profitability+cashflow): Sharpe=2.14, Fitness=1.59, TO=0.062, DD=0.046. high Fitness and low turnover, a strong candidate；highly correlated with alpha-e407fae1 (0.71); switch signal clusters
+  - Correlation: alpha-e407fae1(+0.71), alpha-03473b8d(+0.63), alpha-6491a6fc(+0.50)
+  - Expression: `group_rank+ts_rank`
+- **alpha-e5b3a734** (UNSUBMITTED, technical): Sharpe=0.78, Fitness=0.45, TO=0.176, DD=0.109. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.52); submit carefully
+  - Correlation: alpha-e407fae1(+0.52), alpha-ea83ef40(+0.26), alpha-6491a6fc(+0.24)
+  - Expression: `trade_when+ts_mean+group_neutralize+rank+ts_decay_linear+ts_delay+ts_delta+ts_sum+ts_std_dev`
+- **alpha-ce972823** (UNSUBMITTED, technical): Sharpe=0.73, Fitness=0.39, TO=0.207, DD=0.126. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.52); submit carefully
+  - Correlation: alpha-e407fae1(+0.52), alpha-6491a6fc(+0.21), alpha-02a6a859(-0.20)
+  - Expression: `trade_when+ts_mean+group_neutralize+rank+ts_decay_linear+ts_delay+ts_delta+ts_sum+ts_std_dev`
+- **alpha-716417eb** (UNSUBMITTED, cashflow): Sharpe=1.27, Fitness=0.76, TO=0.058, DD=0.096. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.56); submit carefully
+  - Correlation: alpha-e407fae1(+0.56), alpha-ea83ef40(+0.50), alpha-03473b8d(+0.50)
+  - Expression: `group_rank+ts_rank`
+- **alpha-2abf4962** (UNSUBMITTED, technical): Sharpe=1.25, Fitness=0.60, TO=0.384, DD=0.061. turnover is high; increase decay or blend in more stable signals；low correlation with existing ACTIVE alphas (0.35); good diversification value
+  - Correlation: alpha-e407fae1(+0.35), alpha-ea83ef40(+0.17), alpha-9a458f31(+0.16)
+  - Expression: `trade_when+ts_mean+group_neutralize+rank+ts_decay_linear+ts_delay+ts_delta+ts_sum+ts_std_dev`
+- **alpha-2e006223** (UNSUBMITTED, cashflow): Sharpe=1.17, Fitness=0.64, TO=0.056, DD=0.062. metrics are average and need more work；moderately correlated with alpha-03473b8d (0.55); submit carefully
+  - Correlation: alpha-03473b8d(+0.55), alpha-ea83ef40(+0.41), alpha-6491a6fc(+0.33)
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-e7f6273a** (UNSUBMITTED, other): Sharpe=-1.08, Fitness=-0.63, TO=0.022, DD=0.269. metrics are average and need more work；low correlation with existing ACTIVE alphas (-0.39); good diversification value
+  - Correlation: alpha-03473b8d(-0.39), alpha-02a6a859(-0.38), alpha-6491a6fc(-0.34)
+  - Expression: `ts_decay_linear+group_rank`
+- **alpha-6fbcd038** (UNSUBMITTED, quality/leverage): Sharpe=0.31, Fitness=0.08, TO=0.053, DD=0.067. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.41); good diversification value
+  - Correlation: alpha-03473b8d(+0.41), alpha-e407fae1(+0.41), alpha-ea83ef40(+0.32)
+  - Expression: `group_rank+ts_rank+ts_backfill`
+- **alpha-482d6420** (UNSUBMITTED, other): Sharpe=0.11, Fitness=0.02, TO=0.066, DD=0.058. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.41); good diversification value
+  - Correlation: alpha-03473b8d(+0.41), alpha-02a6a859(+0.23), alpha-ea83ef40(+0.21)
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-b4b53f1e** (UNSUBMITTED, other): Sharpe=1.13, Fitness=0.59, TO=0.052, DD=0.041. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.51); submit carefully
+  - Correlation: alpha-e407fae1(+0.51), alpha-6491a6fc(+0.44), alpha-03473b8d(+0.39)
+  - Expression: `group_rank+ts_rank`
+- **alpha-72bc56e8** (ACTIVE, cashflow): Sharpe=1.58, Fitness=1.16, TO=0.075, DD=0.035. meets the basic submission threshold；low correlation with existing ACTIVE alphas (0.48); good diversification value
+  - Correlation: alpha-6491a6fc(+0.48), alpha-ea83ef40(+0.42), alpha-03473b8d(+0.39)
+  - Expression: `group_rank+ts_rank`
+- **alpha-32b2a08f** (UNSUBMITTED, cashflow): Sharpe=0.83, Fitness=0.36, TO=0.051, DD=0.073. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.42); good diversification value
+  - Correlation: alpha-03473b8d(+0.42), alpha-ea83ef40(+0.32), alpha-02a6a859(+0.28)
+  - Expression: `group_rank+ts_rank`
+- **alpha-40a770d8** (UNSUBMITTED, other): Sharpe=1.58, Fitness=0.93, TO=0.057, DD=0.035. metrics are average and need more work；highly correlated with alpha-e407fae1 (0.80); switch signal clusters
+  - Correlation: alpha-e407fae1(+0.80), alpha-6491a6fc(+0.52), alpha-03473b8d(+0.49)
+  - Expression: `group_rank+ts_rank`
+- **alpha-3dd626a3** (UNSUBMITTED, quality/leverage): Sharpe=0.97, Fitness=0.50, TO=0.060, DD=0.083. metrics are average and need more work；highly correlated with alpha-e407fae1 (0.71); switch signal clusters
+  - Correlation: alpha-e407fae1(+0.71), alpha-03473b8d(+0.46), alpha-ea83ef40(+0.45)
+  - Expression: `group_rank+ts_rank`
+- **alpha-73420804** (UNSUBMITTED, cashflow): Sharpe=1.44, Fitness=1.00, TO=0.046, DD=0.070. metrics are average and need more work；highly correlated with alpha-72bc56e8 (0.90); switch signal clusters
+  - Correlation: alpha-72bc56e8(+0.90), alpha-ea83ef40(+0.41), alpha-03473b8d(+0.41)
+  - Expression: `group_rank+ts_rank`
+- **alpha-7fcff1f2** (UNSUBMITTED, technical): Sharpe=0.44, Fitness=0.21, TO=0.227, DD=0.216. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.64); submit carefully
+  - Correlation: alpha-e407fae1(+0.64), alpha-6491a6fc(+0.29), alpha-02a6a859(-0.28)
+  - Expression: `trade_when+ts_mean+group_neutralize+rank+ts_decay_linear+ts_delay+ts_delta+ts_sum`
+- **alpha-1650288e** (UNSUBMITTED, quality/leverage): Sharpe=0.39, Fitness=0.11, TO=0.054, DD=0.050. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.39); good diversification value
+  - Correlation: alpha-e407fae1(+0.39), alpha-03473b8d(+0.39), alpha-72bc56e8(+0.28)
+  - Expression: `group_rank+ts_rank`
+- **alpha-e5666cf8** (UNSUBMITTED, other): Sharpe=0.91, Fitness=0.35, TO=0.165, DD=0.037. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.23); good diversification value
+  - Correlation: alpha-72bc56e8(+0.23), alpha-03473b8d(+0.23), alpha-6491a6fc(+0.20)
+  - Expression: `group_rank+ts_zscore`
+- **alpha-11dd5743** (UNSUBMITTED, other): Sharpe=0.23, Fitness=0.04, TO=0.265, DD=0.057. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.10); good diversification value
+  - Correlation: alpha-72bc56e8(+0.10), alpha-03473b8d(+0.07), alpha-9a458f31(-0.07)
+  - Expression: `group_rank+ts_rank`
+- **alpha-69625315** (UNSUBMITTED, other): Sharpe=1.05, Fitness=0.58, TO=0.166, DD=0.067. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.30); good diversification value
+  - Correlation: alpha-ea83ef40(+0.30), alpha-03473b8d(+0.26), alpha-72bc56e8(+0.20)
+  - Expression: `group_rank+ts_rank`
+- **alpha-d97ee443** (UNSUBMITTED, sentiment): Sharpe=0.36, Fitness=0.05, TO=0.536, DD=0.047. turnover is high; increase decay or blend in more stable signals；low correlation with existing ACTIVE alphas (-0.18); good diversification value
+  - Correlation: alpha-02a6a859(-0.18), alpha-9a458f31(-0.14), alpha-ea83ef40(-0.09)
+  - Expression: `group_rank+ts_rank`
+- **alpha-61b4673a** (UNSUBMITTED, other): Sharpe=0.90, Fitness=0.49, TO=0.163, DD=0.072. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.31); good diversification value
+  - Correlation: alpha-ea83ef40(+0.31), alpha-03473b8d(+0.24), alpha-9a458f31(-0.22)
+  - Expression: `group_rank+ts_rank`
+- **alpha-4a9b8054** (UNSUBMITTED, other): Sharpe=0.78, Fitness=0.35, TO=0.050, DD=0.061. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.37); good diversification value
+  - Correlation: alpha-03473b8d(+0.37), alpha-ea83ef40(+0.33), alpha-6491a6fc(+0.29)
+  - Expression: `group_rank+ts_rank`
+- **alpha-e23e0540** (UNSUBMITTED, other): Sharpe=0.70, Fitness=0.25, TO=0.154, DD=0.057. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.25); good diversification value
+  - Correlation: alpha-02a6a859(+0.25), alpha-03473b8d(+0.23), alpha-ea83ef40(+0.13)
+  - Expression: `group_rank+ts_rank`
+- **alpha-e0243efc** (UNSUBMITTED, other): Sharpe=-0.13, Fitness=-0.02, TO=0.057, DD=0.059. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.43); good diversification value
+  - Correlation: alpha-03473b8d(+0.43), alpha-ea83ef40(+0.39), alpha-e407fae1(+0.31)
+  - Expression: `group_rank+ts_rank+ts_delta`
+- **alpha-0bdbc280** (UNSUBMITTED, other): Sharpe=1.15, Fitness=0.62, TO=0.056, DD=0.073. metrics are average and need more work；highly correlated with alpha-e407fae1 (0.70); switch signal clusters
+  - Correlation: alpha-e407fae1(+0.70), alpha-ea83ef40(+0.43), alpha-6491a6fc(+0.42)
+  - Expression: `group_rank+ts_rank`
+- **alpha-f8349d8b** (UNSUBMITTED, other): Sharpe=0.70, Fitness=0.28, TO=0.053, DD=0.076. metrics are average and need more work；low correlation with existing ACTIVE alphas (0.39); good diversification value
+  - Correlation: alpha-e407fae1(+0.39), alpha-6491a6fc(+0.33), alpha-03473b8d(+0.27)
+  - Expression: `group_rank+ts_rank`
+- **alpha-de9e63f7** (UNSUBMITTED, other): Sharpe=-1.36, Fitness=-0.77, TO=0.352, DD=0.562. turnover is high; increase decay or blend in more stable signals；low correlation with existing ACTIVE alphas (-0.49); good diversification value
+  - Correlation: alpha-9a458f31(-0.49), alpha-02a6a859(-0.38), alpha-e407fae1(+0.26)
+  - Expression: `rank+ts_delta`
+- **alpha-2f93735e** (UNSUBMITTED, other): Sharpe=0.07, Fitness=0.02, TO=0.016, DD=0.534. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.56); submit carefully
+  - Correlation: alpha-e407fae1(+0.56), alpha-72bc56e8(+0.51), alpha-ea83ef40(+0.41)
+  - Expression: `rank`
+- **alpha-eaaa053b** (UNSUBMITTED, other): Sharpe=1.00, Fitness=0.61, TO=0.048, DD=0.097. metrics are average and need more work；highly correlated with alpha-e407fae1 (0.80); switch signal clusters
+  - Correlation: alpha-e407fae1(+0.80), alpha-6491a6fc(+0.51), alpha-ea83ef40(+0.39)
+  - Expression: `ts_rank`
+- **alpha-134ade0c** (UNSUBMITTED, technical): Sharpe=0.06, Fitness=0.02, TO=0.034, DD=0.347. metrics are average and need more work；moderately correlated with alpha-e407fae1 (0.64); submit carefully
+  - Correlation: alpha-e407fae1(+0.64), alpha-02a6a859(-0.36), alpha-6491a6fc(+0.26)
+  - Expression: `trade_when+ts_mean+group_neutralize+ts_decay_linear+rank+ts_delay+ts_delta+ts_sum`
+
+---
+
+### 2026-09-19 — Yield-Denominator Campaign, Compressed Rules
+
+> 41 rows above are the mechanism's output; read this block instead.
+
+The campaign ran in three batches (13, 14, 14 expressions) and ended with three alphas ACTIVE.
+
+**What worked — market-priced denominators on profitability numerators:**
+
+| Cluster | Shape | Sharpe | Fitness | TO |
+|---|---|---:|---:|---:|
+| operating income / price, industry grouping | `group_rank+ts_rank` | 1.80 | 1.52 | 11.3% |
+| sales / enterprise value + low-beta blend | `group_rank+ts_rank` | 1.49 | 1.21 | 13.1% |
+| reported free cash flow / price, industry grouping | `group_rank+ts_rank` | 1.58 | 1.16 | 7.5% |
+| free cash flow / price, 250-day rank (queued) | `group_rank+ts_rank` | 1.60 | 1.19 | 6.1% |
+
+**Rules distilled from this campaign:**
+
+1. **The denominator decides the Fitness gate, not the numerator.** The same profitability numerators scored
+   Fitness 0.02-0.75 against balance-sheet denominators (`assets`, `sales`) and 1.16-1.81 against a
+   market-priced one (`close`, `enterprise_value`). When a fundamental ratio dies on LOW_FITNESS, change the
+   denominator to a price-like quantity before touching the signal, the window or the grouping.
+2. **`group_rank(ts_rank(numerator / price, 126), <group>)` remains the workhorse shape.** Five of the seven
+   IS-gate passes used it verbatim; the variants that deviated (63/252-day windows, `ts_zscore`) passed only
+   when the 126-day form also passed nearby.
+3. **Read the whole ACTIVE book before judging correlation.** The alpha-list endpoint is paginated and one
+   page returned only 5 of the 9 ACTIVE alphas; the four it hid were the closest cousins
+   (estimate-yield structures), which moved one candidate's max |corr| from 0.70 to 0.86. Page through the
+   book first — an incomplete book makes a crowded candidate look diversified.
+4. **Local daily-return correlation predicts the platform check closely.** Local predictions of 0.562 and
+   0.609 came back from BRAIN's own SELF_CORRELATION check as 0.592 and 0.617, both PASS. Treat the local
+   check as authoritative enough to refuse a submission, and expect the platform to confirm it.
+5. **Profitability-yield numerators are one family, not a menu.** EBIT, operating income, reported cash flow
+   and estimate-EBIT yields against price correlated 0.50-0.86 with each other and with an existing
+   cash-flow book, even though their standalone Fitness ranged 1.4-1.8. Build one or two per campaign from
+   this block, then leave the space; the grid is crowded, not unexplored.
+6. **Price-denominated, industry-neutral yield structures cut turnover too.** The winners landed at 6-13%
+   turnover against 15-53% for the balance-sheet and sentiment forms, so they cost less slippage on top of
+   the Fitness gain.
+

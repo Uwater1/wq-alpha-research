@@ -286,6 +286,23 @@ def aligned_daily_returns(
     return daily_returns(new_pnl), daily_returns(old_pnl)
 
 
+def fetch_pnl_for_new_alpha(session: requests.Session, alpha_id: str, tries: int = 3,
+                            delay: float = 5.0) -> tuple[list[str], list[float]]:
+    """Fetch a fresh alpha's PnL, waiting out the window where BRAIN still computes it.
+
+    A brand-new simulation returns an empty recordset for a while; without this retry the
+    correlation check silently degraded to "no ACTIVE alpha available for comparison".
+    """
+    for attempt in range(tries):
+        dates, pnl = fetch_pnl_series(session, alpha_id)
+        if pnl:
+            return dates, pnl
+        if attempt < tries - 1:
+            time.sleep(delay)
+    _warn(f"{alpha_id}: PnL still empty after {tries} attempts; correlation left unchecked")
+    return [], []
+
+
 def load_alpha_db() -> dict[str, Any]:
     if ALPHA_DB_PATH.exists():
         return json.loads(ALPHA_DB_PATH.read_text(encoding="utf-8"))
@@ -362,7 +379,9 @@ def correlation_with_existing(
     return results
 
 
-def generate_lesson(fp: dict[str, Any], top_corr: list[dict[str, Any]], sanitize: bool = True) -> str:
+def generate_lesson(
+    fp: dict[str, Any], top_corr: list[dict[str, Any]], sanitize: bool = True, pnl_available: bool = True
+) -> str:
     """Generate a one-line lesson from this alpha."""
     if fp["fitness"] is None:
         metric_note = "simulation failed or data is missing"
@@ -375,7 +394,11 @@ def generate_lesson(fp: dict[str, Any], top_corr: list[dict[str, Any]], sanitize
     else:
         metric_note = "metrics are average and need more work"
 
-    if not top_corr:
+    if not pnl_available:
+        # Do not blame the book when our own PnL fetch came back empty: the correlation
+        # was simply never computed, and a lesson must not claim otherwise.
+        corr_note = "PnL series unavailable, correlation not checked"
+    elif not top_corr:
         corr_note = "no ACTIVE alpha available for comparison"
     elif abs(top_corr[0]["corr"]) >= 0.7:
         other = display_id(top_corr[0]["alpha_id"], sanitize)
@@ -597,10 +620,10 @@ def main() -> int:
         for alpha in new_alphas:
             aid = alpha.get("id")
             fp = compute_alpha_fingerprint(alpha)
-            dates, pnl = fetch_pnl_series(session, aid)
+            dates, pnl = fetch_pnl_for_new_alpha(session, aid)
 
             top_corr = correlation_with_existing(dates, pnl, db)
-            lesson = generate_lesson(fp, top_corr, sanitize=sanitize)
+            lesson = generate_lesson(fp, top_corr, sanitize=sanitize, pnl_available=bool(pnl))
             entries.append(
                 {
                     "alpha_id": aid,

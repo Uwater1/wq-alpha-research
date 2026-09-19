@@ -339,6 +339,26 @@ def test_fetch_pnl_series_warns_instead_of_silently_returning_nothing(monkeypatc
     assert "WARNING" in capsys.readouterr().err
 
 
+def test_lesson_blames_the_missing_pnl_not_the_book():
+    fp = {"fitness": 1.5, "turnover": 0.1, "sharpe": 1.8, "expression": "rank(close)"}
+    assert "PnL series unavailable" in es.generate_lesson(fp, [], pnl_available=False)
+    assert "no ACTIVE alpha available" in es.generate_lesson(fp, [])
+
+
+def test_fresh_alpha_pnl_retries_until_brain_serves_it(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky(_session, _alpha_id):
+        calls["n"] += 1
+        return ([], []) if calls["n"] < 3 else (["2020-01-01"], [1.0])
+
+    monkeypatch.setattr(es, "fetch_pnl_series", flaky)
+    monkeypatch.setattr(es.time, "sleep", lambda _s: None)
+
+    assert es.fetch_pnl_for_new_alpha(object(), "A1") == (["2020-01-01"], [1.0])
+    assert calls["n"] == 3
+
+
 def test_fetch_pnl_series_parses_list_shaped_schema(monkeypatch):
     payload = {
         "schema": {"properties": [{"name": "date"}, {"name": "pnl"}]},

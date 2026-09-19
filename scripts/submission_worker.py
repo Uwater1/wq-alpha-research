@@ -27,7 +27,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -60,6 +60,7 @@ class SubmissionWorker:
         max_polls: int = MAX_CHECK_POLLS,
         require_correlation: bool = False,
         correlation_limit: float = 0.7,
+        thresholds: Mapping[str, float] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -73,6 +74,7 @@ class SubmissionWorker:
         self.max_polls = max_polls
         self.require_correlation = require_correlation
         self.correlation_limit = correlation_limit
+        self.thresholds = dict(thresholds or {})
         self._clock = clock
         self._sleep = sleep
         self.started_at = self._clock()
@@ -112,7 +114,30 @@ class SubmissionWorker:
             active_keys=self.db.active_keys(),
             require_correlation=self.require_correlation,
             correlation_limit=self.correlation_limit,
+            thresholds=self.thresholds or None,
         )
+
+    def enqueue(self, candidate_id: int, priority: float | None = None) -> int:
+        """Push a candidate the operator wants submitted; the worker re-checks the gates."""
+        return self.db.enqueue_submission(candidate_id, priority=priority)
+
+    def enqueue_first(self, candidate_ids: Iterable[int]) -> list[int]:
+        """Enqueue candidates so they are claimed in the given order, ahead of the queue.
+
+        An operator naming a candidate means "submit this next", so each one gets a
+        priority above everything currently READY (the first name wins ties).
+        """
+        requested = list(candidate_ids)
+        if not requested:
+            return []
+        top = max(
+            (float(row["priority"] or 0.0) for row in self.db.query(
+                "SELECT priority FROM submissions WHERE status='READY'")),
+            default=0.0,
+        )
+        for index, candidate_id in enumerate(requested):
+            self.enqueue(candidate_id, priority=top + len(requested) - index)
+        return requested
 
     # -- reconciliation ----------------------------------------------------
 
@@ -269,6 +294,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how long this worker owns a claimed submission")
     parser.add_argument("--require-correlation", action="store_true",
                         help="demand a fresh local self-correlation before submitting (TODO P9)")
+    parser.add_argument("--min-sharpe", type=float, default=research_db.IS_THRESHOLDS["sharpe"],
+                        help="submission floor for Sharpe")
+    parser.add_argument("--min-fitness", type=float, default=research_db.IS_THRESHOLDS["fitness"],
+                        help="submission floor for Fitness")
+    parser.add_argument("--min-turnover", type=float, default=research_db.IS_THRESHOLDS["turnover_min"],
+                        help="submission floor for turnover (fraction, 0.01 = 1%%)")
+    parser.add_argument("--max-turnover", type=float, default=research_db.IS_THRESHOLDS["turnover_max"],
+                        help="submission ceiling for turnover (fraction, 0.20 = 20%%)")
+    parser.add_argument("--submit-candidate", type=int, action="append", default=None,
+                        help="enqueue this candidate id before draining (repeatable)")
     parser.add_argument("--dry-run", action="store_true", help="print the queue order; never call BRAIN")
     parser.add_argument("--json", action="store_true", help="print the run summary as JSON")
     return parser
@@ -288,7 +323,16 @@ def main(argv: list[str] | None = None) -> int:
             max_runtime=None if not args.max_runtime else args.max_runtime * 60.0,
             lease_seconds=args.lease_seconds,
             require_correlation=args.require_correlation,
+            thresholds={
+                "sharpe": args.min_sharpe,
+                "fitness": args.min_fitness,
+                "turnover_min": args.min_turnover,
+                "turnover_max": args.max_turnover,
+            },
         )
+        for candidate_id in args.submit_candidate or []:
+            print(f"[submit] enqueued candidate {candidate_id} on request")
+        worker.enqueue_first(args.submit_candidate or [])
         try:
             code = worker.run()
         finally:

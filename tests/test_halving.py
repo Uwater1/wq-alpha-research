@@ -272,6 +272,10 @@ def test_worker_submits_a_ready_candidate_and_confirms_active(db):
     assert db.counts("submissions") == {"ACTIVE": 1}
     assert db.get_candidate(candidate["id"])["status"] == "ACTIVE"
     assert db.active_alpha_ids() == [candidate["brain_alpha_id"]]
+    # The live-book snapshot must be complete, not just an id: P9 re-checks correlation against it.
+    active = db.query("SELECT * FROM active_alphas WHERE brain_alpha_id=?", (candidate["brain_alpha_id"],))[0]
+    assert active["canonical_key"] == candidate["canonical_key"]
+    assert active["sharpe"] == 1.6 and active["fitness"] == 1.3
 
 
 def test_worker_records_a_platform_correlation_failure(db):
@@ -356,6 +360,18 @@ def test_two_workers_cannot_submit_the_same_candidate(db):
     assert db.counts("submissions") == {"ACTIVE": 1}  # the lease kept the second worker out
 
 
+def test_worker_thresholds_are_configurable(db):
+    candidate = _ready_candidate(db, sharpe=0.2)
+    db.enqueue_submission(candidate["id"], priority=5.0)
+    client = FakeSubmitBrain()
+
+    worker = _worker(db, client, max_submissions=1, thresholds={"sharpe": 0.1, "fitness": 0.1})
+    worker.run()
+
+    assert client.submitted_alpha_ids == [candidate["brain_alpha_id"]]  # the operator lowered the floor
+    assert db.counts("submissions") == {"ACTIVE": 1}
+
+
 def test_worker_dry_run_lists_the_queue_without_calling_brain(db, capsys):
     _ready_candidate(db)
 
@@ -369,3 +385,18 @@ def test_worker_dry_run_lists_the_queue_without_calling_brain(db, capsys):
 def test_worker_main_with_empty_queue_is_a_no_op(db, capsys):
     assert sw.main(["--db", str(db.path)]) == 0
     assert "submitted=0" in capsys.readouterr().out
+
+
+def test_named_candidates_are_submitted_before_the_queue(db):
+    """`--submit-candidate` means "this next", not "requeue somewhere in the middle"."""
+    low = _ready_candidate(db, expression="rank(close)", sharpe=1.9, fitness=1.8)
+    named = _ready_candidate(db, expression="rank(open)", sharpe=1.3, fitness=1.2)
+    db.enqueue_submission(low["id"], priority=9.0)  # the stronger candidate owns the queue head
+
+    worker = _worker(db, FakeSubmitBrain(), max_submissions=1)
+    worker.enqueue_first([named["id"]])
+    worker.run()
+
+    assert db.counts("submissions")["ACTIVE"] == 1
+    assert db.get_candidate(named["id"])["status"] == "ACTIVE"
+    assert db.get_candidate(low["id"])["status"] == "SUBMISSION_READY"

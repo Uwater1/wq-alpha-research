@@ -217,6 +217,30 @@ def test_scheduler_adopts_simulations_left_by_a_dead_process(db):
     assert candidate["brain_alpha_id"] == "ASIMORPHAN"
 
 
+def test_scheduler_resumes_its_own_unexpired_simulations_after_a_restart(db):
+    ids = _queue(db, 1)
+    claimed = db.claim_simulation("scheduler", lease_seconds=3600)
+    db.mark_simulation_started(claimed["id"], "SIMMINE", worker_id="scheduler", lease_seconds=3600)
+
+    client = FakeBrain(polls_to_finish=2)
+    scheduler, _clock = _make_scheduler(db, client, worker_id="scheduler")
+    scheduler.run()
+
+    assert scheduler.adopted == 1  # its own lease, resumed without re-submitting
+    assert scheduler.submitted == 0
+    assert db.get_candidate(ids[0])["brain_alpha_id"] == "ASIMMINE"  # FakeBrain names alphas A<sim id>
+
+
+def test_scheduler_leaves_a_live_other_worker_alone(db):
+    _queue(db, 1)
+    claimed = db.claim_simulation("worker-other", lease_seconds=3600)
+    db.mark_simulation_started(claimed["id"], "SIMOTHER", worker_id="worker-other", lease_seconds=3600)
+
+    scheduler, _clock = _make_scheduler(db, FakeBrain(), worker_id="scheduler")
+
+    assert scheduler.adopt_running() == 0
+
+
 def test_stuck_simulation_times_out_and_is_retryable(db):
     ids = _queue(db, 1)
     client = FakeBrain(never_finishes=True)

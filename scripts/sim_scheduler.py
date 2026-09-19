@@ -302,8 +302,12 @@ class SimulationScheduler:
         now = self._clock()
         for row in self.db.running_simulations():
             candidate_id = int(row["id"])
-            if row["worker_id"] == self.worker_id and row["lease_until"] and row["lease_until"] > research_db.now_iso():
-                continue  # another instance of this worker is still alive and owns it
+            same_worker = row["worker_id"] == self.worker_id
+            live_lease = bool(row["lease_until"]) and str(row["lease_until"]) > research_db.now_iso()
+            if not same_worker and live_lease:
+                # A different live worker owns this simulation; polling it too would only
+                # duplicate the result. A restart of *this* worker resumes its own work.
+                continue
             handle = brain_api.SimulationHandle(
                 candidate_id=candidate_id,
                 canonical_key=str(row["canonical_key"]),
