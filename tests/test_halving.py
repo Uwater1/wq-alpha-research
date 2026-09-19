@@ -194,7 +194,7 @@ def test_submission_gate_blocks_an_identical_active_alpha():
     assert rdb.submission_gate(candidate, active_keys={"A9"})[0] is True  # a different alpha is fine
 
 
-def test_correlation_gate_is_a_switch_until_p9_exists():
+def test_correlation_gate_is_opt_in_and_holds_unchecked_candidates():
     candidate = {"brain_alpha_id": "A1", "sharpe": 1.6, "fitness": 1.3, "turnover": 0.05}
 
     assert rdb.submission_gate(candidate)[0] is True

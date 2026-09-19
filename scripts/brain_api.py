@@ -349,3 +349,29 @@ class BrainClient:
             return str(self.alpha(alpha_id).get("status") or "")
         except BrainAPIError:
             return None
+
+    # -- ACTIVE portfolio (TODO P9) ---------------------------------------
+
+    def list_active_alphas(self, *, page_size: int = 100, max_pages: int = 200) -> list[dict[str, Any]]:
+        """Every ACTIVE alpha on the book, fully paginated.
+
+        Raises instead of returning a silently truncated book: correlating against a partial
+        portfolio would hide exactly the alpha a candidate duplicates.
+        """
+        alphas: list[dict[str, Any]] = []
+        offset = 0
+        for _page in range(max_pages):
+            payload = self.get(
+                f"{API_BASE}/users/self/alphas",
+                params={"limit": page_size, "offset": offset, "status": "ACTIVE"},
+            ).json()
+            batch = payload.get("results", payload.get("alphas", [])) if isinstance(payload, Mapping) else []
+            if not isinstance(batch, list):
+                raise BrainAPIError("BRAIN returned an unexpected alpha-list payload")
+            alphas.extend(alpha for alpha in batch if isinstance(alpha, Mapping))
+            if len(batch) < page_size:
+                return alphas
+            offset += page_size
+        raise BrainAPIError(
+            f"ACTIVE alpha pagination exceeded {max_pages} pages; refusing to proceed with a partial book"
+        )

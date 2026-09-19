@@ -27,7 +27,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import requests
 from requests.auth import HTTPBasicAuth
 
@@ -46,6 +45,20 @@ HEADERS = {
     "Accept": "application/json;version=2.0",
     "Content-Type": "application/json",
 }
+
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+# Shared pure PnL/correlation logic (TODO P9). The reusable pieces live in
+# scripts/correlation.py; this module keeps its session-based fetchers and re-exports
+# these names so the legacy reporting path and its tests keep working unchanged.
+from correlation import (  # noqa: E402
+    aligned_daily_returns,
+    daily_returns,
+    pnl_from_payload,
+    recordset_columns as _recordset_columns,
+    safe_corrcoef as _safe_corrcoef,
+)
 
 
 def _warn(message: str) -> None:
@@ -146,29 +159,6 @@ def get_with_retry(session: requests.Session, url: str, retries: int = 3, **kwar
     raise RuntimeError(f"GET {url} failed after {retries} retries")
 
 
-def _recordset_columns(props: Any) -> tuple[int, int]:
-    """Resolve (date_index, pnl_index) from a recordset schema, list- or dict-shaped."""
-    if isinstance(props, list):
-        entries = [_as_dict(p) for p in props]
-
-        def index_of(names: set[str], default: int) -> int:
-            for i, p in enumerate(entries):
-                if str(p.get("name", "")).lower() in names:
-                    return i
-            return default
-    else:
-        mapping = _as_dict(props)
-
-        def index_of(names: set[str], default: int) -> int:
-            for key, value in mapping.items():
-                if str(key).lower() in names:
-                    idx = _as_dict(value).get("index")
-                    return int(idx) if isinstance(idx, int) else default
-            return default
-
-    return index_of({"date"}, 0), index_of({"pnl", "cum_pnl", "returns", "ret"}, 1)
-
-
 def fetch_pnl_series(session: requests.Session, alpha_id: str) -> tuple[list[str], list[float]]:
     """Fetch a cumulative PnL recordset as (dates, values), oldest record first.
 
@@ -177,7 +167,7 @@ def fetch_pnl_series(session: requests.Session, alpha_id: str) -> tuple[list[str
 
     Returns ([], []) when the recordset is genuinely empty, but otherwise says *why*
     on stderr: a silent empty return here used to disable the correlation check with
-    nothing to show for it.
+    nothing to show for it. Parsing is shared with scripts/correlation.py (TODO P9).
     """
     try:
         resp = get_with_retry(
@@ -197,24 +187,7 @@ def fetch_pnl_series(session: requests.Session, alpha_id: str) -> tuple[list[str
     except ValueError as exc:
         _warn(f"{alpha_id}: PnL recordset was not JSON ({exc})")
         return [], []
-
-    date_idx, pnl_idx = _recordset_columns(_as_dict(data.get("schema")).get("properties", []))
-    records = data.get("records") or []
-    try:
-        records = sorted(records, key=lambda r: r[date_idx])
-    except Exception:
-        pass
-
-    dates: list[str] = []
-    values: list[float] = []
-    for row in records:
-        rec = row[0] if isinstance(row, list) and len(row) == 1 and isinstance(row[0], list) else row
-        try:
-            values.append(float(rec[pnl_idx]))
-            dates.append(str(rec[date_idx]))
-        except Exception:
-            continue
-    return dates, values
+    return pnl_from_payload(data)
 
 
 def fetch_pnl(session: requests.Session, alpha_id: str) -> list[float]:
@@ -244,46 +217,6 @@ def fetch_user_alphas(session: requests.Session, limit: int = 100) -> list[dict]
         offset += limit
         time.sleep(0.2)
     return all_alphas
-
-
-def daily_returns(cum_pnl: list[float]) -> list[float]:
-    return [cum_pnl[i + 1] - cum_pnl[i] for i in range(len(cum_pnl) - 1)]
-
-
-def _safe_corrcoef(a: Any, b: Any) -> float | None:
-    """Pearson correlation, or None when a side is constant, mis-sized, or non-finite."""
-    x = np.asarray(a, dtype=float)
-    y = np.asarray(b, dtype=float)
-    if len(x) != len(y) or len(x) < 2:
-        return None
-    if not (np.isfinite(x).all() and np.isfinite(y).all()):
-        return None
-    if x.std() == 0 or y.std() == 0:
-        return None
-    return float(np.corrcoef(x, y)[0, 1])
-
-
-def aligned_daily_returns(
-    new_dates: list[str],
-    new_pnl: list[float],
-    old_dates: list[str],
-    old_pnl: list[float],
-) -> tuple[list[float], list[float]]:
-    """Daily changes of two PnL series, paired on their common dates.
-
-    Falls back to length alignment only when a side carries no date stamps (rows
-    written to alpha_db.json by an older version have values only).
-    """
-    if new_dates and old_dates and len(new_dates) == len(new_pnl) and len(old_dates) == len(old_pnl):
-        new_map = dict(zip(new_dates, new_pnl))
-        old_map = dict(zip(old_dates, old_pnl))
-        common = [d for d in new_dates if d in old_map]
-        if len(common) < 2:
-            return [], []
-        return daily_returns([new_map[d] for d in common]), daily_returns([old_map[d] for d in common])
-    if len(new_pnl) != len(old_pnl):
-        return [], []
-    return daily_returns(new_pnl), daily_returns(old_pnl)
 
 
 def fetch_pnl_for_new_alpha(session: requests.Session, alpha_id: str, tries: int = 3,

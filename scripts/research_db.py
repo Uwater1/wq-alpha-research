@@ -62,7 +62,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -71,6 +71,9 @@ import canonical  # noqa: E402  (scripts/ is on sys.path above)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = REPO_ROOT / "research.db"
 DB_ENV_VAR = "WQ_RESEARCH_DB"
+
+#: meta key holding the monotonic version of the local ACTIVE snapshot (TODO P9).
+META_ACTIVE_SET_VERSION = "active_set_version"
 
 SCHEMA_VERSION = 3
 
@@ -303,6 +306,14 @@ SCHEMA: tuple[str, ...] = (
         pnl_ref         TEXT,
         first_seen_at   TEXT NOT NULL,
         last_seen_at    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS active_pnl (
+        brain_alpha_id TEXT PRIMARY KEY,
+        dates_json     TEXT NOT NULL,
+        values_json    TEXT NOT NULL,
+        updated_at     TEXT NOT NULL
     )
     """,
     """
@@ -1563,7 +1574,7 @@ class ResearchDB:
         if owned:
             self._conn.execute("BEGIN IMMEDIATE")
         try:
-            self._upsert_active_alpha_row(
+            added = self._upsert_active_alpha_row(
                 conn,
                 brain_alpha_id,
                 canonical_key=canonical_key,
@@ -1575,6 +1586,8 @@ class ResearchDB:
                 pnl_ref=pnl_ref,
                 timestamp=timestamp,
             )
+            if added:  # a membership change invalidates cached correlation checks (P9)
+                self.bump_active_set_version(conn)
             if owned:
                 conn.execute("COMMIT")
         except BaseException:
@@ -1595,7 +1608,11 @@ class ResearchDB:
         turnover: float | None,
         pnl_ref: str | None,
         timestamp: str,
-    ) -> None:
+    ) -> bool:
+        """Insert/update one ACTIVE row; returns True when the id was not tracked before."""
+        existed = conn.execute(
+            "SELECT 1 FROM active_alphas WHERE brain_alpha_id=?", (brain_alpha_id,)
+        ).fetchone() is not None
         conn.execute(
             """
             INSERT INTO active_alphas(brain_alpha_id, canonical_key, expression_hash, settings_hash, sharpe,
@@ -1614,13 +1631,14 @@ class ResearchDB:
                 sharpe, fitness, turnover, pnl_ref, timestamp, timestamp,
             ),
         )
+        return not existed
 
     def _upsert_active_from_candidate(
         self, conn: sqlite3.Connection, brain_alpha_id: str, candidate: Mapping[str, Any]
     ) -> None:
         """Copy a candidate's stored identity and metrics into the live-book snapshot."""
         candidate = dict(candidate)  # sqlite3.Row is not a Mapping but converts cleanly
-        self._upsert_active_alpha_row(
+        added = self._upsert_active_alpha_row(
             conn,
             brain_alpha_id,
             canonical_key=str(candidate["canonical_key"]) if candidate.get("canonical_key") else None,
@@ -1632,21 +1650,138 @@ class ResearchDB:
             pnl_ref=None,
             timestamp=now_iso(),
         )
+        if added:
+            self.bump_active_set_version(conn)
 
     def active_alpha_ids(self) -> list[str]:
         return [row["brain_alpha_id"] for row in self._conn.execute(
             "SELECT brain_alpha_id FROM active_alphas ORDER BY brain_alpha_id"
         )]
 
-    def record_correlation_check(self, candidate_id: int, max_corr: float, max_corr_alpha_id: str | None) -> None:
-        """Store the local self-correlation result for a candidate (TODO P9)."""
+    def active_set_version(self) -> int:
+        """Monotonic version of the ACTIVE book; cached correlation checks pin this (P9)."""
+        try:
+            return int(self.get_meta(META_ACTIVE_SET_VERSION) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def bump_active_set_version(self, conn: sqlite3.Connection | None = None) -> int:
+        """Increment the ACTIVE version after a membership change (TODO P9)."""
+        version = self.active_set_version() + 1
+        sql = "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        params = (META_ACTIVE_SET_VERSION, str(version))
+        if conn is not None:
+            conn.execute(sql, params)
+            self.log_event("portfolio", "active_set", "version_bumped", payload={"version": version}, conn=conn)
+        else:
+            with self._tx() as owned:
+                owned.execute(sql, params)
+                self.log_event("portfolio", "active_set", "version_bumped", payload={"version": version}, conn=owned)
+        return version
+
+    def sync_active_set(self, alpha_ids: Iterable[str]) -> dict[str, int]:
+        """Reconcile the local snapshot with the platform ACTIVE book (TODO P9).
+
+        New ids are recorded and any membership change bumps the version, which is what
+        makes every previously cached correlation check stale. Ids that disappeared from
+        the platform are kept: their PnL is still a useful correlation reference.
+        """
+        remote = {str(alpha_id) for alpha_id in alpha_ids if alpha_id}
+        timestamp = now_iso()
+        with self._tx() as conn:
+            local = {str(row["brain_alpha_id"]) for row in conn.execute("SELECT brain_alpha_id FROM active_alphas")}
+            added = remote - local
+            removed = local - remote
+            for alpha_id in sorted(added):
+                self._upsert_active_alpha_row(
+                    conn, alpha_id, canonical_key=None, expression_hash=None, settings_hash=None,
+                    sharpe=None, fitness=None, turnover=None, pnl_ref=None, timestamp=timestamp,
+                )
+            version = self.bump_active_set_version(conn) if (added or removed) else self.active_set_version()
+        return {"added": len(added), "removed": len(removed), "version": version, "total": len(remote)}
+
+    def cache_active_pnl(self, brain_alpha_id: str, dates: Sequence[str], values: Sequence[float]) -> None:
+        """Cache an ACTIVE alpha's daily PnL series locally (TODO P9)."""
         timestamp = now_iso()
         with self._tx() as conn:
             conn.execute(
-                "UPDATE candidates SET self_corr=?, updated_at=? WHERE id=?", (max_corr, timestamp, candidate_id)
+                "INSERT INTO active_pnl(brain_alpha_id, dates_json, values_json, updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(brain_alpha_id) DO UPDATE SET dates_json=excluded.dates_json, "
+                "values_json=excluded.values_json, updated_at=excluded.updated_at",
+                (brain_alpha_id, json.dumps(list(dates)), json.dumps(list(values)), timestamp),
             )
-            self.log_event("candidate", candidate_id, "correlation_checked",
-                           payload={"max_corr": max_corr, "max_corr_alpha_id": max_corr_alpha_id}, conn=conn)
+            conn.execute("UPDATE active_alphas SET pnl_ref=? WHERE brain_alpha_id=?",
+                         (f"active_pnl:{brain_alpha_id}", brain_alpha_id))
+
+    def active_pnl(self) -> dict[str, tuple[list[str], list[float]]]:
+        """Every locally cached ACTIVE PnL series, keyed by alpha id."""
+        cached: dict[str, tuple[list[str], list[float]]] = {}
+        for row in self._conn.execute("SELECT * FROM active_pnl"):
+            try:
+                dates = json.loads(row["dates_json"])
+                values = json.loads(row["values_json"])
+            except ValueError:
+                continue
+            cached[str(row["brain_alpha_id"])] = ([str(d) for d in dates], [float(v) for v in values])
+        return cached
+
+    def active_pnl_ids(self) -> list[str]:
+        return [str(row["brain_alpha_id"]) for row in self._conn.execute(
+            "SELECT brain_alpha_id FROM active_pnl ORDER BY brain_alpha_id"
+        )]
+
+    def record_correlation_check(
+        self,
+        candidate_id: int,
+        max_corr: float | None,
+        max_corr_alpha_id: str | None = None,
+        *,
+        active_set_version: int | None = None,
+        status: str = "ok",
+        checked_at: str | None = None,
+    ) -> None:
+        """Store the local self-correlation result for a candidate (TODO P9).
+
+        ``status`` records *why* a check is unusable (unavailable PnL, too little overlap,
+        a flat series, an incomplete book) so the gate can hold the candidate explicitly
+        instead of reading a missing number as "low correlation".
+        """
+        timestamp = checked_at or now_iso()
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE candidates SET self_corr=?, max_corr_alpha_id=?, corr_checked_at=?, active_set_version=?, "
+                "corr_status=?, updated_at=? WHERE id=?",
+                (max_corr, max_corr_alpha_id, timestamp, active_set_version, status, timestamp, candidate_id),
+            )
+            self.log_event(
+                "candidate", candidate_id, "correlation_checked",
+                payload={"max_corr": max_corr, "max_corr_alpha_id": max_corr_alpha_id,
+                         "status": status, "active_set_version": active_set_version}, conn=conn,
+            )
+
+    def mark_stale_correlations(self) -> int:
+        """Flag cached checks whose ACTIVE version is no longer current (TODO P9)."""
+        version = self.active_set_version()
+        timestamp = now_iso()
+        with self._tx() as conn:
+            cursor = conn.execute(
+                "UPDATE candidates SET corr_status='stale', updated_at=? "
+                "WHERE corr_status IS NOT NULL AND corr_status <> 'stale' AND COALESCE(active_set_version, -1) <> ?",
+                (timestamp, version),
+            )
+            return int(cursor.rowcount or 0)
+
+    def correlation_status(self) -> dict[str, Any]:
+        """Observability for the local correlation pipeline (TODO P9/P13)."""
+        counts = {str(row["value"]): int(row["n"]) for row in self._conn.execute(
+            "SELECT COALESCE(corr_status,'unchecked') AS value, COUNT(*) AS n FROM candidates GROUP BY corr_status"
+        )}
+        return {
+            "active_set_version": self.active_set_version(),
+            "active_alphas": len(self.active_alpha_ids()),
+            "cached_pnl_series": len(self.active_pnl_ids()),
+            "candidate_checks": counts,
+        }
 
     # -- meta (capabilities, schema facts) ---------------------------------
 
@@ -1700,6 +1835,40 @@ class ResearchDB:
         return report
 
 
+def correlation_reasons(
+    candidate: Mapping[str, Any],
+    *,
+    limit: float = 0.7,
+    active_set_version: int | None = None,
+) -> list[str]:
+    """Why a candidate's local self-correlation does not clear the gate (TODO P9).
+
+    A missing number is never treated as "low correlation": every unusable state names
+    itself (unavailable, insufficient, degenerate, incomplete, stale) so the candidate is
+    held explicitly and re-checked at submission time.
+    """
+    status = str(candidate.get("corr_status") or "")
+    version = candidate.get("active_set_version")
+    self_corr = candidate.get("self_corr")
+    if active_set_version is not None and version is not None and version != active_set_version:
+        return ["local self-correlation is stale (the ACTIVE book changed since the check)"]
+    if status == "empty_book":
+        # Nothing on the book to correlate against; BRAIN's own SELF_CORRELATION stays final.
+        return []
+    if status != "ok" or not isinstance(self_corr, (int, float)):
+        detail = {
+            "unavailable": "candidate PnL was unavailable",
+            "insufficient": "too little overlapping daily history",
+            "degenerate": "a PnL series was flat or non-finite",
+            "incomplete": "the ACTIVE book could not be fully cached",
+            "stale": "the ACTIVE book changed since the check",
+        }.get(status, "it has not been checked yet")
+        return [f"local self-correlation is missing or unusable ({detail})"]
+    if abs(self_corr) >= limit:
+        return [f"self-correlation {self_corr:.2f} >= {limit}"]
+    return []
+
+
 def submission_gate(
     candidate: Mapping[str, Any],
     *,
@@ -1707,11 +1876,9 @@ def submission_gate(
     thresholds: Mapping[str, float] | None = None,
     require_correlation: bool = False,
     correlation_limit: float = 0.7,
+    active_set_version: int | None = None,
 ) -> tuple[bool, list[str]]:
-    """Submission gates (TODO P6): metrics floors, no duplicate ACTIVE alpha, optional local corr.
-
-    Correlation belongs to TODO P9; ``require_correlation`` is the hook it will switch on.
-    """
+    """Submission gates (TODO P6/P9): metrics floors, no duplicate ACTIVE alpha, local corr."""
     limits = {**IS_THRESHOLDS, **(thresholds or {})}
     reasons: list[str] = []
     sharpe = candidate.get("sharpe")
@@ -1731,11 +1898,9 @@ def submission_gate(
         elif str(candidate.get("brain_alpha_id")) in active_keys:
             reasons.append("this alpha is already ACTIVE")
     if require_correlation:
-        self_corr = candidate.get("self_corr")
-        if not isinstance(self_corr, (int, float)):
-            reasons.append("local self-correlation has not been checked (TODO P9)")
-        elif abs(self_corr) >= correlation_limit:
-            reasons.append(f"self-correlation {self_corr:.2f} >= {correlation_limit}")
+        reasons.extend(
+            correlation_reasons(candidate, limit=correlation_limit, active_set_version=active_set_version)
+        )
     return (not reasons), reasons
 
 

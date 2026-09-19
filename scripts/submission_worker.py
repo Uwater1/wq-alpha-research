@@ -41,6 +41,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import brain_api  # noqa: E402
+import correlation  # noqa: E402
 import ranking  # noqa: E402
 import research_db  # noqa: E402
 
@@ -90,6 +91,7 @@ class SubmissionWorker:
         self.thresholds = dict(thresholds or {})
         self._clock = clock
         self._sleep = sleep
+        self._correlation: correlation.CorrelationService | None = None
         self.started_at = self._clock()
         self.submitted = 0
         self.active = 0
@@ -97,6 +99,7 @@ class SubmissionWorker:
         self.retried = 0
         self.reconciled = 0
         self.skipped = 0
+        self.correlations = 0
 
     # -- entry point -------------------------------------------------------
 
@@ -109,6 +112,8 @@ class SubmissionWorker:
         retired = self.db.expire_exhausted_submissions(self.max_submission_attempts)
         if retired:
             print(f"[submit] retired {retired} submission(s) past their attempt budget")
+        if self.require_correlation:
+            self._sync_active_book()
         self.reconcile_pending()
         while self.submitted < self.max_submissions and not self._runtime_exceeded():
             submission = self._claim()
@@ -129,6 +134,43 @@ class SubmissionWorker:
             return None
         return submission
 
+    # -- correlation (TODO P9) ---------------------------------------------
+
+    def correlation_service(self) -> correlation.CorrelationService:
+        """Lazily build the local correlation pipeline for this worker."""
+        if self._correlation is None:
+            self._correlation = correlation.CorrelationService(
+                self.db, self.client, sleep=self._sleep, log=print
+            )
+        return self._correlation
+
+    def _sync_active_book(self) -> None:
+        """Refresh the ACTIVE book once per run so cached checks are current (TODO P9)."""
+        sync = self.correlation_service().sync_active_book()
+        if sync.error:
+            print(f"[submit] ACTIVE book sync failed: {sync.error}")
+            return
+        print(
+            f"[submit] ACTIVE book v{sync.version}: {sync.fetched} alpha(s) "
+            f"(+{sync.added}/-{sync.removed}), {sync.pnl_cached} PnL cache fill(s), "
+            f"{sync.stale_checks} stale check(s)"
+        )
+
+    def _ensure_correlation(self, candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Re-check a stale/missing local correlation immediately before submitting (P9)."""
+        if not self.require_correlation:
+            return candidate
+        result = self.correlation_service().check_candidate(candidate)
+        self.correlations += 1
+        if result.from_cache:
+            return candidate
+        print(
+            f"[submit] correlation for candidate {candidate['id']}: {result.status} "
+            f"max={result.max_corr if result.max_corr is None else round(result.max_corr, 3)} "
+            f"({result.compared} compared{'; ' + result.reason if result.reason else ''})"
+        )
+        return self.db.get_candidate(int(candidate["id"])) or candidate
+
     # -- gate check --------------------------------------------------------
 
     def gate(self, candidate: Mapping[str, Any]) -> tuple[bool, list[str]]:
@@ -137,6 +179,7 @@ class SubmissionWorker:
             active_keys=self.db.active_keys(),
             require_correlation=self.require_correlation,
             correlation_limit=self.correlation_limit,
+            active_set_version=self.db.active_set_version() if self.require_correlation else None,
             thresholds=self.thresholds or None,
         )
 
@@ -229,6 +272,8 @@ class SubmissionWorker:
             self.rejected += 1
             return
 
+        # Local correlation is re-checked here, not trusted from an earlier run (TODO P9).
+        candidate = self._ensure_correlation(candidate)
         allowed, reasons = self.gate(candidate)
         if not allowed:
             self.skipped += 1
@@ -308,6 +353,8 @@ class SubmissionWorker:
             "retried": self.retried,
             "skipped_by_gate": self.skipped,
             "reconciled": self.reconciled,
+            "correlations": self.correlations,
+            "active_set_version": self.db.active_set_version(),
             "queue_remaining": self.db.counts("submissions").get("READY", 0),
             "runtime_seconds": round(self._clock() - self.started_at, 1),
         }
@@ -376,6 +423,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="retries a submission may spend before it is marked EXHAUSTED (TODO P8)")
     parser.add_argument("--require-correlation", action="store_true",
                         help="demand a fresh local self-correlation before submitting (TODO P9)")
+    parser.add_argument("--correlation-limit", type=float, default=0.7,
+                        help="reject a candidate whose |daily-return correlation| is at least this")
     parser.add_argument("--min-sharpe", type=float, default=research_db.IS_THRESHOLDS["sharpe"],
                         help="submission floor for Sharpe")
     parser.add_argument("--min-fitness", type=float, default=research_db.IS_THRESHOLDS["fitness"],
@@ -406,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             lease_seconds=args.lease_seconds,
             max_submission_attempts=args.max_submission_attempts,
             require_correlation=args.require_correlation,
+            correlation_limit=args.correlation_limit,
             thresholds={
                 "sharpe": args.min_sharpe,
                 "fitness": args.min_fitness,
