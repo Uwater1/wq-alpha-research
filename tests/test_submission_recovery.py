@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+import brain_api
 import research_db as rdb
 import submission_worker as sw
 from test_scheduler import FakeClock
@@ -196,6 +197,37 @@ def test_timed_out_run_leaves_a_reconcilable_row_not_a_lost_one(db):
     _worker(db, client, max_submissions=1).run()
     assert client.posts == [candidate["brain_alpha_id"]]  # only the original POST
     assert db.counts("submissions") == {"ACTIVE": 1}
+
+
+def test_uncertain_submit_response_is_reconciled_before_any_retry(db):
+    candidate = _ready_candidate(db)
+    # The fake records that the POST reached BRAIN, but gives the worker no response.
+    client = FakeSubmitClient(status="ACTIVE", submit_outcome="uncertain")
+
+    _worker(db, client, max_submissions=1).run()
+
+    assert client.posts == [candidate["brain_alpha_id"]]
+    assert db.counts("submissions") == {"CHECK_PENDING": 1}
+
+    _worker(db, client, max_submissions=1).run()
+
+    assert client.posts == [candidate["brain_alpha_id"]]
+    assert db.counts("submissions") == {"ACTIVE": 1}
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [(None, "uncertain"), (408, "uncertain"), (429, "uncertain"), (500, "uncertain"), (400, "error")],
+)
+def test_brain_client_distinguishes_uncertain_submit_failures(monkeypatch, status, expected):
+    client = brain_api.BrainClient()
+
+    def lost_post(*_args, **_kwargs):
+        raise brain_api.BrainAPIError("submit failed", status=status)
+
+    monkeypatch.setattr(client, "post", lost_post)
+
+    assert client.submit_alpha("A1")["outcome"] == expected
 
 
 # ---------------------------------------------------------------------------

@@ -44,7 +44,7 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   ./.venv/bin/python scripts/evolve_skill.py --apply
   ```
 
-- Local research state store (`research.db`, git-ignored — TODO P0/P1):
+- Local research state store (`research.db`, git-ignored):
 
   ```bash
   ./.venv/bin/python scripts/research_db.py init                     # create/upgrade schema
@@ -58,7 +58,7 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   an identical request is never sent to BRAIN twice; `batch_simulate.py` uses the
   store by default (`--no-db` for the legacy CSV-only behavior).
 
-- Persistent 3-slot simulation dispatcher (TODO P2). Queue work first, then run it:
+- Persistent 3-slot simulation dispatcher. Queue work first, then run it:
 
   ```bash
   ./.venv/bin/python scripts/sim_scheduler.py --dry-run         # rank the queue, no BRAIN calls
@@ -71,9 +71,9 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   orphaned by a killed process, and persists every transition. Priority comes from
   `scripts/ranking.py` (quality/novelty/diversity/risk, components stored per
   candidate). Multi-simulation is **not** available on this platform — check with
-  `./.venv/bin/python scripts/multi_sim.py --status` (TODO P3).
+  `./.venv/bin/python scripts/multi_sim.py --status`.
 
-- Pre-screening, variant gate, submission queue (TODO P4/P5/P6):
+- Pre-screening, variant gate, submission queue:
 
   ```bash
   ./.venv/bin/python scripts/research_db.py queue data/input.csv   # validates + dedups first
@@ -93,7 +93,7 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   land in the submission queue automatically; the worker leases one, re-checks the gates,
   submits, polls and continues.
 
-- Local self-correlation + submission recovery (TODO P8/P9):
+- Local self-correlation + submission recovery:
 
   ```bash
   ./.venv/bin/python scripts/correlation.py sync    # paginated ACTIVE book + cached daily PnL
@@ -108,8 +108,11 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   correlations; a book change invalidates every cached check. Submission rows recover
   themselves: an expired lease returns to `READY` only when the POST never left the
   process, otherwise it becomes `CHECK_PENDING` and is reconciled against BRAIN before any
-  retry; transient failures back off and retire as `EXHAUSTED` after
-  `--max-submission-attempts`. BRAIN's own SELF_CORRELATION check remains the confirmation.
+  retry. Ambiguous transport/server submit outcomes also become `CHECK_PENDING`; only
+  definite pre-submit errors use `RETRY`. A failed ACTIVE-book refresh holds the whole
+  correlation-enabled run rather than trusting an old cached check. Transient failures
+  back off and retire as `EXHAUSTED` after `--max-submission-attempts`. BRAIN's own
+  SELF_CORRELATION check remains the confirmation.
 
 - Load the local field catalog (4,367 USA TOP3000 delay=1 fields):
 

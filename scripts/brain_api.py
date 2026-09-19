@@ -317,7 +317,9 @@ class BrainClient:
 
         Mirrors the legacy tool's reading of the platform: 404 means it was already
         submitted, 403/409 means a previous request is still being evaluated (the
-        server-side correlation check can stay pending for minutes).
+        server-side correlation check can stay pending for minutes). A transport or
+        server failure is ``uncertain`` because the POST may have reached BRAIN even
+        when its response did not reach us; callers must reconcile before retrying.
         """
         try:
             self.post(f"{API_BASE}/alphas/{alpha_id}/submit", retries=1)
@@ -326,6 +328,8 @@ class BrainClient:
                 return {"outcome": "already_submitted", "detail": "HTTP 404"}
             if exc.status in (403, 409):
                 return {"outcome": "in_progress", "detail": f"HTTP {exc.status}"}
+            if exc.status is None or exc.status in (408, 429) or exc.status >= 500:
+                return {"outcome": "uncertain", "detail": str(exc)[:200]}
             return {"outcome": "error", "detail": str(exc)[:200]}
         return {"outcome": "submitted", "detail": ""}
 

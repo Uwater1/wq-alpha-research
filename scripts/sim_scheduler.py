@@ -198,7 +198,7 @@ class SimulationScheduler:
         )
 
     def staged_search_enabled(self) -> bool:
-        return self.staged is not None
+        return bool(self.staged)
 
     def _work_remaining(self) -> bool:
         if self.inflight:

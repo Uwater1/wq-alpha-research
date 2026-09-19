@@ -389,7 +389,15 @@ class CorrelationService:
                 max_corr_alpha_id=candidate.get("max_corr_alpha_id"), from_cache=True,
             )
 
-        self.sync_active_book()
+        sync = self.sync_active_book()
+        if sync.error:
+            # Never reuse an old book after a failed refresh: the missing ACTIVE alpha
+            # could be the candidate's closest match (P9).
+            return self._record(
+                candidate_id,
+                self.db.active_set_version(),
+                CorrelationResult(STATUS_INCOMPLETE, reason=f"ACTIVE book sync failed: {sync.error}"),
+            )
         # Version *after* the sync: the check must be pinned to the book it actually saw.
         version = self.db.active_set_version()
         alpha_id = candidate.get("brain_alpha_id")

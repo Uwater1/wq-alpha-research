@@ -232,6 +232,20 @@ def test_sync_refuses_to_proceed_on_a_failed_book(db):
     assert db.active_set_version() == 0
 
 
+def test_check_candidate_records_a_hold_when_book_refresh_fails(db):
+    dates, values = _series(_wave())
+    client = FakeCorrelationBrain(active_ids=["OLD"], pnl={"OLD": (dates, values)})
+    candidate = _ready_candidate(db)
+    service = _service(db, client)
+    service.sync_active_book()
+    client.book_error = "temporary ACTIVE-book outage"
+
+    result = service.check_candidate(candidate, force=True)
+
+    assert result.status == corr.STATUS_INCOMPLETE
+    assert db.get_candidate(candidate["id"])["corr_status"] == corr.STATUS_INCOMPLETE
+
+
 # ---------------------------------------------------------------------------
 # Candidate checks + gate
 # ---------------------------------------------------------------------------
@@ -371,6 +385,23 @@ def test_worker_refreshes_a_stale_check_immediately_before_submitting(db):
     assert refreshed["max_corr_alpha_id"] == "OLD"
     assert db.active_set_version() == 2
     assert client.posts == [candidate["brain_alpha_id"]]
+
+
+def test_worker_holds_submissions_when_active_book_refresh_fails(db):
+    dates, values = _series(_wave())
+    client = FakeCorrelationBrain(active_ids=["OLD"], pnl={"OLD": (dates, values)})
+    candidate = _ready_candidate(db)
+    client.pnl[candidate["brain_alpha_id"]] = _series([0.0] * 40 + [1.0] * 40)
+    service = _service(db, client)
+    service.sync_active_book()
+    service.check_candidate(candidate, force=True)
+
+    # The cached check is valid only for the last successfully synchronized book.
+    client.book_error = "temporary ACTIVE-book outage"
+    _worker(db, client, max_submissions=1).run()
+
+    assert client.posts == []
+    assert db.counts("submissions") == {"READY": 1}
 
 
 def test_gate_is_a_no_op_without_require_correlation(db):

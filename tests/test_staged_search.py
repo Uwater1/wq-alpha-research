@@ -175,7 +175,8 @@ def test_scheduler_spends_a_fresh_grid_one_slot_at_a_time(db):
 def test_scheduler_can_disable_the_staged_funnel(db):
     _grid(db, range(20))
     client = FakeBrain(polls_to_finish=1)
-    scheduler, _clock = _make_scheduler(db, client, slots=3, staged_search=False)
+    scheduler, _clock = _make_scheduler(db, client, slots=3, staged_search=False,
+                                        staged_volume_threshold=5)
 
     scheduler.run(once=True)
 

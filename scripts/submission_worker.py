@@ -113,7 +113,10 @@ class SubmissionWorker:
         if retired:
             print(f"[submit] retired {retired} submission(s) past their attempt budget")
         if self.require_correlation:
-            self._sync_active_book()
+            # A cached correlation is only fresh relative to a successfully refreshed
+            # ACTIVE book. Hold the whole run when that refresh fails (P9).
+            if not self._sync_active_book():
+                return 0
         self.reconcile_pending()
         while self.submitted < self.max_submissions and not self._runtime_exceeded():
             submission = self._claim()
@@ -144,17 +147,18 @@ class SubmissionWorker:
             )
         return self._correlation
 
-    def _sync_active_book(self) -> None:
+    def _sync_active_book(self) -> bool:
         """Refresh the ACTIVE book once per run so cached checks are current (TODO P9)."""
         sync = self.correlation_service().sync_active_book()
         if sync.error:
             print(f"[submit] ACTIVE book sync failed: {sync.error}")
-            return
+            return False
         print(
             f"[submit] ACTIVE book v{sync.version}: {sync.fetched} alpha(s) "
             f"(+{sync.added}/-{sync.removed}), {sync.pnl_cached} PnL cache fill(s), "
             f"{sync.stale_checks} stale check(s)"
         )
+        return True
 
     def _ensure_correlation(self, candidate: Mapping[str, Any]) -> Mapping[str, Any]:
         """Re-check a stale/missing local correlation immediately before submitting (P9)."""
@@ -291,6 +295,12 @@ class SubmissionWorker:
         self.db.mark_submission_posted(submission_id)
         outcome = self.client.submit_alpha(alpha_id)
         print(f"[submit] alpha {_mask(alpha_id)}: {outcome['outcome']}")
+        if outcome["outcome"] == "uncertain":
+            # The POST may have reached BRAIN even though its response was lost. Do not
+            # turn that ambiguity into a retry; reconciliation must decide first (P8).
+            self.db.finish_submission(submission_id, "CHECK_PENDING", message=outcome["detail"],
+                                      brain_alpha_id=alpha_id)
+            return
         if outcome["outcome"] == "error":
             self.retried += 1
             self.db.finish_submission(submission_id, "RETRY", message=outcome["detail"], brain_alpha_id=alpha_id,
