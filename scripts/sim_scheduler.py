@@ -11,6 +11,9 @@ Replaces the one-shot `ThreadPoolExecutor` batch loop with a dispatcher that:
     * re-authenticates once when BRAIN rejects the session;
     * adopts simulations left running by a killed process (their BRAIN ids are in
       research.db), so a restart resumes work instead of losing it;
+    * budgets each structure's variant search once the queue is large enough, so a
+      parameter grid cannot monopolize all three slots before its base signal proves
+      useful (TODO P5);
     * writes every state transition to research.db — a crash never loses queue state.
 
 Priority is not FIFO: candidates are scored by `scripts/ranking.py`
@@ -41,6 +44,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import brain_api  # noqa: E402
 import ranking  # noqa: E402
 import research_db  # noqa: E402
+import staged_search  # noqa: E402
 import successive_halving  # noqa: E402
 
 MAX_SIMULATION_SLOTS = 3
@@ -78,6 +82,10 @@ class SimulationScheduler:
         halving: bool = True,
         early_attempts: int = successive_halving.DEFAULT_EARLY_ATTEMPTS,
         variant_horizon_minutes: float = successive_halving.DEFAULT_HORIZON_MINUTES,
+        staged_search: bool = True,
+        staged_volume_threshold: int = staged_search.DEFAULT_VOLUME_THRESHOLD,
+        staged_max_variants: int = staged_search.DEFAULT_MAX_VARIANTS,
+        staged_min_pass_ratio: float = staged_search.DEFAULT_MIN_PASS_RATIO,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -97,6 +105,10 @@ class SimulationScheduler:
         self.halving = halving
         self.early_attempts = early_attempts
         self.variant_horizon_minutes = variant_horizon_minutes
+        self.staged = staged_search
+        self.staged_volume_threshold = staged_volume_threshold
+        self.staged_max_variants = staged_max_variants
+        self.staged_min_pass_ratio = staged_min_pass_ratio
         self._clock = clock
         self._sleep = sleep
 
@@ -131,6 +143,11 @@ class SimulationScheduler:
         if counters["promoted_total"] or counters["deferred"]:
             print(f"[scheduler] successive halving: promoted {counters['promoted_total']}, "
                   f"deferred {counters['deferred']} variant(s) of unproven structures")
+        staged = self.review_staged()
+        if staged["engaged"] and (staged["deferred"] or staged["promoted"] or staged["stopped"]):
+            print(f"[scheduler] staged search: {staged['structures']} structure(s), "
+                  f"deferred {staged['deferred']}, promoted {staged['promoted']}, "
+                  f"stopped {staged['stopped']} (queue={staged['queued']})")
         try:
             while True:
                 self.fill_slots()
@@ -166,6 +183,22 @@ class SimulationScheduler:
         return successive_halving.review(
             self.db, early_attempts=self.early_attempts, horizon_minutes=self.variant_horizon_minutes
         )
+
+    def review_staged(self) -> dict[str, Any]:
+        """Apply the volume-gated staged-search funnel (TODO P5); no-op below the threshold."""
+        if not self.staged_search_enabled():
+            return {"engaged": False, "queued": 0, "structures": 0, "deferred": 0, "promoted": 0,
+                    "stopped": 0, "budget_rows": 0}
+        return staged_search.review(
+            self.db,
+            volume_threshold=self.staged_volume_threshold,
+            max_variants=self.staged_max_variants,
+            min_pass_ratio=self.staged_min_pass_ratio,
+            horizon_minutes=self.variant_horizon_minutes * 2,
+        )
+
+    def staged_search_enabled(self) -> bool:
+        return self.staged is not None
 
     def _work_remaining(self) -> bool:
         if self.inflight:
@@ -424,6 +457,7 @@ class SimulationScheduler:
         # A verdict just landed: the structure is either proven (siblings promote now) or
         # unproven (siblings keep waiting), which is exactly what the P5 gate tracks.
         self.review_halving()
+        self.review_staged()
         status = (candidate or {}).get("status", "?")
         print(
             f"[scheduler] done in {latency:.0f}s: {status} "
@@ -484,6 +518,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="simulations a structure may spend before its variants wait")
     parser.add_argument("--variant-horizon", type=float, default=successive_halving.DEFAULT_HORIZON_MINUTES,
                         help="minutes a deferred variant waits before automatic release")
+    parser.add_argument("--no-staged", action="store_true",
+                        help="disable the volume-gated staged-search funnel (TODO P5)")
+    parser.add_argument("--staged-threshold", type=int, default=staged_search.DEFAULT_VOLUME_THRESHOLD,
+                        help="queued candidates required before staged expansion engages")
+    parser.add_argument("--staged-max-variants", type=int, default=staged_search.DEFAULT_MAX_VARIANTS,
+                        help="variants a proven structure may run")
     parser.add_argument("--dry-run", action="store_true", help="rank the queue and print it; never call BRAIN")
     parser.add_argument("--json", action="store_true", help="print the run summary as JSON")
     return parser
@@ -507,6 +547,9 @@ def main(argv: list[str] | None = None) -> int:
             halving=not args.no_halving,
             early_attempts=args.early_attempts,
             variant_horizon_minutes=args.variant_horizon,
+            staged_search=not args.no_staged,
+            staged_volume_threshold=args.staged_threshold,
+            staged_max_variants=args.staged_max_variants,
         )
         try:
             code = scheduler.run(once=args.once)

@@ -316,6 +316,19 @@ SCHEMA: tuple[str, ...] = (
         updated_at     TEXT NOT NULL
     )
     """,
+    # TODO P5: per-structure search budget + lineage evidence for the staged funnel.
+    """
+    CREATE TABLE IF NOT EXISTS structure_budget (
+        skeleton_hash TEXT PRIMARY KEY,
+        family        TEXT,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        passes        INTEGER NOT NULL DEFAULT 0,
+        variants      INTEGER NOT NULL DEFAULT 0,
+        budget        INTEGER NOT NULL DEFAULT 0,
+        status        TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS events (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1084,6 +1097,45 @@ class ResearchDB:
                     self.log_event("candidate", candidate_id, "promoted", to_status="QUEUED",
                                    payload={"reason": reason}, conn=conn)
         return promoted
+
+    def record_structure_budget(self, entries: Iterable[Mapping[str, Any]]) -> int:
+        """Persist per-structure search budget and lineage evidence (TODO P5).
+
+        This is the funnel's memory: how many simulations a structure spent, how many
+        passed, how many variants it was allowed, and whether it is expanding or stopped.
+        """
+        timestamp = now_iso()
+        rows = list(entries)
+        with self._tx() as conn:
+            for entry in rows:
+                conn.execute(
+                    """
+                    INSERT INTO structure_budget(skeleton_hash, family, attempts, passes, variants, budget,
+                           status, updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(skeleton_hash) DO UPDATE SET
+                        family=excluded.family, attempts=excluded.attempts, passes=excluded.passes,
+                        variants=excluded.variants, budget=excluded.budget, status=excluded.status,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        str(entry.get("skeleton") or ""),
+                        entry.get("family"),
+                        int(entry.get("attempts") or 0),
+                        int(entry.get("passes") or 0),
+                        int(entry.get("variants") or 0),
+                        int(entry.get("budget") or 0),
+                        str(entry.get("status") or "unproven"),
+                        timestamp,
+                    ),
+                )
+        return len(rows)
+
+    def structure_budgets(self) -> list[dict[str, Any]]:
+        """Stored per-structure budget/lineage rows, most-attempted first (TODO P5)."""
+        return [dict(row) for row in self._conn.execute(
+            "SELECT * FROM structure_budget ORDER BY attempts DESC, skeleton_hash"
+        )]
 
     def skeleton_outcomes(self) -> dict[str, dict[str, int]]:
         """Per-skeleton evidence: attempted simulations and passing members (TODO P5)."""
