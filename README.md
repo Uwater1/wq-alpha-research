@@ -59,7 +59,11 @@ wq-alpha-research/
 │   ├── credential_crypto.py
 │   ├── fetch_operators.py
 │   ├── canonical.py         # expression/settings normalization + cache keys
-│   └── research_db.py       # local research.db: queue, dedup, simulation cache
+│   ├── research_db.py       # local research.db: queue, dedup, simulation cache
+│   ├── brain_api.py         # BRAIN HTTP client (Retry-After, session refresh)
+│   ├── ranking.py           # candidate priority components
+│   ├── sim_scheduler.py     # persistent 3-slot simulation dispatcher
+│   └── multi_sim.py         # multi-simulation capability check
 ├── legacy/
 │   └── wq_brain/            # batch simulate / scrape / submit tooling
 │       ├── wq_session.py
@@ -189,6 +193,20 @@ by git, and holds only research state: candidates, simulation cache, submissions
 ACTIVE-alpha bookkeeping and an event log. `batch_simulate.py` uses it by default, so
 re-running a batch reuses completed results instead of re-simulating them; pass
 `--no-db` for the legacy CSV-only behavior.
+
+Drain a queue with the persistent dispatcher instead of a one-shot batch:
+
+```bash
+./.venv/bin/python scripts/sim_scheduler.py --dry-run         # see the priority order
+./.venv/bin/python scripts/sim_scheduler.py --max-runtime 30  # keep 3 slots busy for 30 minutes
+```
+
+The scheduler refills a freed slot immediately, polls running simulations without
+blocking submissions, honours `Retry-After`, re-authenticates when the session
+ expires, adopts simulations a killed process left behind, and writes every state
+transition to `research.db`. Multi-simulation is not offered by the BRAIN API today
+(`scripts/multi_sim.py --status`); the scheduler therefore runs REGULAR simulations
+with three concurrent slots, which is the platform limit.
 
 The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
 

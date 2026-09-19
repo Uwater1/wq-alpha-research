@@ -384,9 +384,14 @@ def structural_features(expression: Any) -> dict[str, Any]:
     return {
         "fields": list(fields_of(text)),
         "operators": list(operators_of(text)),
-        "depth": _expression_depth(text),
+        "depth": expression_depth(text),
         "literals": [m.group(0) for m in _BARE_NUMBER_RE.finditer(text)],
     }
+
+
+def expression_depth(text: str) -> int:
+    """Maximum call nesting depth of an expression."""
+    return _expression_depth(text)
 
 
 def _expression_depth(text: str) -> int:

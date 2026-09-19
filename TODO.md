@@ -140,6 +140,12 @@ Acceptance:
 
 ## P2 — Persistent BRAIN Simulation Scheduler
 
+> **Status: implemented** (`scripts/sim_scheduler.py`, `scripts/brain_api.py`,
+> `scripts/ranking.py`), verified against live BRAIN: two slots filled at once,
+> progress polled, results committed and IS-gated. `Retry-After`, exponential
+> backoff, re-authentication, orphan adoption, lease recovery and priority ordering
+> are covered by tests, and the score components are stored on every candidate.
+
 Replace simple `ThreadPoolExecutor` batch execution with a persistent dispatcher.
 
 Default maximum:
@@ -184,6 +190,15 @@ Acceptance:
 ---
 
 ## P3 — Multi-Simulation Support
+
+> **Status: checked — the platform does not offer it.** A live probe on this account
+> returns HTTP 400 `{"type": ["Object with name=MULTI does not exist."],
+> "regular": ["Not a valid string."]}`: the only simulation type is REGULAR with a
+> single expression string, so there is nothing to pack. `scripts/multi_sim.py`
+> records the verdict in `research.db.meta` (`--probe` / `--status`) and the pipeline
+> never assumes support, so the 3-slot REGULAR scheduler is the implemented path.
+> Packing is deliberately not built for an endpoint that rejects it — re-run
+> `--probe` after an account/platform change and this section becomes actionable.
 
 Detect whether the account/API supports BRAIN multi-simulation.
 
@@ -899,7 +914,8 @@ The pipeline is complete when:
 - research can generate candidates faster than BRAIN can consume them without losing state;
 - duplicate simulations are eliminated;
 - three simulation slots stay efficiently utilized;
-- multi-simulation is used automatically when available;
+- multi-simulation is used automatically when a probe proves the platform supports
+  it (it does not today — see P3), with the REGULAR scheduler as the fallback;
 - parameter brute force is replaced by staged search;
 - simulation and submission operate independently;
 - submission-ready alphas remain queued until processed;

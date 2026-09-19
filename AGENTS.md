@@ -58,6 +58,21 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   an identical request is never sent to BRAIN twice; `batch_simulate.py` uses the
   store by default (`--no-db` for the legacy CSV-only behavior).
 
+- Persistent 3-slot simulation dispatcher (TODO P2). Queue work first, then run it:
+
+  ```bash
+  ./.venv/bin/python scripts/sim_scheduler.py --dry-run         # rank the queue, no BRAIN calls
+  ./.venv/bin/python scripts/sim_scheduler.py --max-runtime 30  # bounded run in minutes
+  ./.venv/bin/python scripts/sim_scheduler.py --once            # one fill+poll pass (cron style)
+  ```
+
+  It keeps 3 simulations in flight, polls separately from submitting, honours
+  `Retry-After`, backs off, re-authenticates on session expiry, adopts simulations
+  orphaned by a killed process, and persists every transition. Priority comes from
+  `scripts/ranking.py` (quality/novelty/diversity/risk, components stored per
+  candidate). Multi-simulation is **not** available on this platform — check with
+  `./.venv/bin/python scripts/multi_sim.py --status` (TODO P3).
+
 - Load the local field catalog (4,367 USA TOP3000 delay=1 fields):
 
   ```python

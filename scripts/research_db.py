@@ -91,7 +91,8 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "GENERATED": frozenset({"VALIDATED", "REJECTED"}),
     "VALIDATED": frozenset({"QUEUED", "REJECTED"}),
     "QUEUED": frozenset({"SIMULATING", "SIMULATED", "RETRY", "REJECTED"}),
-    "SIMULATING": frozenset({"SIMULATED", "RETRY", "REJECTED"}),
+    # SIMULATING -> QUEUED covers a lease that was taken but never submitted (429/timeout).
+    "SIMULATING": frozenset({"SIMULATED", "RETRY", "REJECTED", "QUEUED"}),
     "SIMULATED": frozenset({"IS_PASS", "REJECTED"}),
     "IS_PASS": frozenset({"CORR_PASS", "REJECTED"}),
     "CORR_PASS": frozenset({"SUBMISSION_READY", "REJECTED"}),
@@ -739,18 +740,28 @@ class ResearchDB:
             (key, candidate_id, expression, normalized_expression, settings_json, status, timestamp, timestamp),
         )
 
-    def claim_simulation(self, worker_id: str, lease_seconds: float = 1800.0) -> dict[str, Any] | None:
-        """Atomically lease the highest-priority QUEUED candidate for this worker."""
+    def claim_simulation(
+        self, worker_id: str, lease_seconds: float = 1800.0, candidate_id: int | None = None
+    ) -> dict[str, Any] | None:
+        """Atomically lease a QUEUED candidate (a specific one, else highest priority)."""
         timestamp = now_iso()
         with self._tx() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM candidates
-                WHERE status='QUEUED' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY priority DESC, id ASC LIMIT 1
-                """,
-                (timestamp,),
-            ).fetchone()
+            if candidate_id is None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM candidates
+                    WHERE status='QUEUED' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                    ORDER BY priority DESC, id ASC LIMIT 1
+                    """,
+                    (timestamp,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+                if row is not None and (
+                    row["status"] != "QUEUED"
+                    or (row["next_attempt_at"] is not None and row["next_attempt_at"] > timestamp)
+                ):
+                    row = None
             if row is None:
                 return None
             attempt = int(row["attempt_count"]) + 1
@@ -773,6 +784,133 @@ class ResearchDB:
                 payload={"worker_id": worker_id, "attempt": attempt}, conn=conn,
             )
             return self.get_candidate(int(row["id"]))
+
+    def mark_simulation_started(
+        self,
+        candidate_id: int,
+        simulation_id: str,
+        *,
+        worker_id: str | None = None,
+        lease_seconds: float | None = None,
+    ) -> None:
+        """Remember the BRAIN simulation id so a restarted worker can keep polling it."""
+        timestamp = now_iso()
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"candidate {candidate_id} not found")
+            updates = ["simulation_id=?", "updated_at=?"]
+            params: list[Any] = [simulation_id, timestamp]
+            if worker_id is not None:
+                updates.append("worker_id=?")
+                params.append(worker_id)
+            if lease_seconds is not None:
+                updates.append("lease_until=?")
+                params.append(plus_seconds_iso(lease_seconds))
+            params.append(candidate_id)
+            conn.execute(f"UPDATE candidates SET {', '.join(updates)} WHERE id=?", params)
+            conn.execute(
+                "UPDATE simulations SET simulation_id=?, status='RUNNING', worker_id=COALESCE(?, worker_id), updated_at=? "
+                "WHERE canonical_key=?",
+                (simulation_id, worker_id, timestamp, row["canonical_key"]),
+            )
+            self.log_event("candidate", candidate_id, "simulation_started", to_status="SIMULATING",
+                           payload={"simulation_id": simulation_id}, conn=conn)
+
+    def release_claim(self, candidate_id: int, reason: str = "released") -> None:
+        """Give a claimed-but-not-submitted candidate back to the queue (429, interrupt)."""
+        timestamp = now_iso()
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            if row is None or row["status"] != "SIMULATING":
+                return
+            conn.execute(
+                "UPDATE candidates SET worker_id=NULL, lease_until=NULL, updated_at=? WHERE id=?",
+                (timestamp, candidate_id),
+            )
+            self._set_status(conn, row, "QUEUED", timestamp)
+            conn.execute(
+                "UPDATE simulations SET status='QUEUED', worker_id=NULL, updated_at=? WHERE canonical_key=?",
+                (timestamp, row["canonical_key"]),
+            )
+            self.log_event("candidate", candidate_id, "claim_released", from_status="SIMULATING",
+                           to_status="QUEUED", payload={"reason": reason}, conn=conn)
+
+    def requeue_due_retries(self, max_attempts: int = 3) -> list[int]:
+        """Move RETRY candidates whose backoff window elapsed back to QUEUED.
+
+        Turns a transient BRAIN failure into work the scheduler picks up again, while
+        a candidate that keeps failing stops consuming slots (TODO P2 retry policy).
+        """
+        timestamp = now_iso()
+        requeued: list[int] = []
+        with self._tx() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.* FROM candidates c JOIN simulations s ON s.canonical_key = c.canonical_key
+                WHERE c.status='RETRY' AND (c.next_attempt_at IS NULL OR c.next_attempt_at <= ?)
+                      AND s.status <> 'DONE' AND c.attempt_count < ?
+                ORDER BY c.id
+                """,
+                (timestamp, max_attempts),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE candidates SET worker_id=NULL, lease_until=NULL, updated_at=? WHERE id=?",
+                    (timestamp, row["id"]),
+                )
+                self._set_status(conn, row, "QUEUED", timestamp)
+                conn.execute(
+                    "UPDATE simulations SET status='QUEUED', updated_at=? WHERE canonical_key=?",
+                    (timestamp, row["canonical_key"]),
+                )
+                requeued.append(int(row["id"]))
+        return requeued
+
+    def list_queued(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Candidates waiting for a simulation slot, priority-first."""
+        sql = "SELECT * FROM candidates WHERE status='QUEUED' ORDER BY priority DESC, id ASC"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return [dict(row) for row in self._conn.execute(sql)]
+
+    def running_simulations(self) -> list[dict[str, Any]]:
+        """Leased simulations, with the BRAIN handle needed to resume polling them."""
+        rows = self._conn.execute(
+            """
+            SELECT c.id, c.canonical_key, c.expression, c.normalized_expression, c.simulation_id,
+                   c.worker_id, c.lease_until, c.attempt_count, c.settings_json, c.priority
+            FROM candidates c JOIN simulations s ON s.canonical_key = c.canonical_key
+            WHERE c.status='SIMULATING' AND s.simulation_id IS NOT NULL
+            ORDER BY c.id
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def record_ranking(
+        self,
+        candidate_id: int,
+        components: Mapping[str, float],
+        priority: float,
+        reasons: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Persist the ranking components (TODO P10), not only the final score."""
+        timestamp = now_iso()
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE candidates SET priority=?, expected_quality=?, novelty_score=?, failure_risk=?, updated_at=? "
+                "WHERE id=?",
+                (
+                    priority,
+                    components.get("expected_quality"),
+                    components.get("novelty"),
+                    components.get("failure_risk"),
+                    timestamp,
+                    candidate_id,
+                ),
+            )
+            self.log_event("candidate", candidate_id, "ranked", payload={**components, "priority": priority,
+                                                                          "reasons": reasons or {}}, conn=conn)
 
     def record_simulation_result(
         self,
@@ -1080,6 +1218,25 @@ class ResearchDB:
             )
             self.log_event("candidate", candidate_id, "correlation_checked",
                            payload={"max_corr": max_corr, "max_corr_alpha_id": max_corr_alpha_id}, conn=conn)
+
+    # -- meta (capabilities, schema facts) ---------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)),
+            )
+
+    # -- generic read access -----------------------------------------------
+
+    def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
+        """Read-only helper for aggregations (ranking, observability)."""
+        return [dict(row) for row in self._conn.execute(sql, tuple(params))]
 
     # -- observability -----------------------------------------------------
 
