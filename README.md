@@ -57,7 +57,9 @@ wq-alpha-research/
 ├── scripts/
 │   ├── evolve_skill.py
 │   ├── credential_crypto.py
-│   └── fetch_operators.py
+│   ├── fetch_operators.py
+│   ├── canonical.py         # expression/settings normalization + cache keys
+│   └── research_db.py       # local research.db: queue, dedup, simulation cache
 ├── legacy/
 │   └── wq_brain/            # batch simulate / scrape / submit tooling
 │       ├── wq_session.py
@@ -172,6 +174,22 @@ Simulate, scrape, and submit a batch of expressions:
 ./.venv/bin/python legacy/wq_brain/submit_from_csv.py legacy/wq_brain/data/scrape_<ts>.csv
 ```
 
+Track candidate state locally so an identical simulation is never paid for twice:
+
+```bash
+# Normalize + dedup + cache-check candidates from a CSV (no BRAIN calls yet)
+./.venv/bin/python scripts/research_db.py queue legacy/wq_brain/data/input.csv
+
+# Queue, cache-hit and submission counters as JSON
+./.venv/bin/python scripts/research_db.py status
+```
+
+`research.db` is created at the repo root (override with `WQ_RESEARCH_DB`), is ignored
+by git, and holds only research state: candidates, simulation cache, submissions,
+ACTIVE-alpha bookkeeping and an event log. `batch_simulate.py` uses it by default, so
+re-running a batch reuses completed results instead of re-simulating them; pass
+`--no-db` for the legacy CSV-only behavior.
+
 The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
 
 ## Safety Notes
@@ -182,6 +200,7 @@ The following files are intentionally ignored:
 - `credential.key` (random secret key)
 - `alpha_db.json`
 - `batch_submit_results.json`
+- `research.db` (+ `-wal`/`-shm`) — local candidate queue and simulation cache
 - `legacy/wq_brain/credentials.json` (legacy credential format)
 - `legacy/wq_brain/data/` (account-linked CSV/log/JSON outputs)
 - `.env`

@@ -5,6 +5,11 @@ credential.key
 alpha_db.json
 batch_submit_results.json
 credentials.json
+
+# local research state store (TODO P0/P1) — account-linked, never publish
+research.db
+research.db-wal
+research.db-shm
 *.pyc
 __pycache__/
 .DS_Store

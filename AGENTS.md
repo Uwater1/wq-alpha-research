@@ -44,6 +44,20 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   ./.venv/bin/python scripts/evolve_skill.py --apply
   ```
 
+- Local research state store (`research.db`, git-ignored — TODO P0/P1):
+
+  ```bash
+  ./.venv/bin/python scripts/research_db.py init                     # create/upgrade schema
+  ./.venv/bin/python scripts/research_db.py status                   # queue + cache counters as JSON
+  ./.venv/bin/python scripts/research_db.py queue legacy/wq_brain/data/input.csv
+  ./.venv/bin/python scripts/research_db.py cache "rank(close)" --decay 6
+  ```
+
+  `WQ_RESEARCH_DB` overrides the default `<repo root>/research.db`. Candidates are
+  keyed by `SHA256(normalized_expression + settings)` (see `scripts/canonical.py`), so
+  an identical request is never sent to BRAIN twice; `batch_simulate.py` uses the
+  store by default (`--no-db` for the legacy CSV-only behavior).
+
 - Load the local field catalog (4,367 USA TOP3000 delay=1 fields):
 
   ```python
@@ -114,6 +128,7 @@ account-linked — never commit or publish it.
 - `credential.key` — BRAIN encryption key
 - `alpha_db.json` — local alpha snapshot / PnL store
 - `batch_submit_results.json` — submission results
+- `research.db` (+ `-wal`/`-shm`) — candidate queue, simulation cache, submissions
 
 Never commit these. Never publish raw alpha IDs, PnL series, or account-linked
 records; only sanitized general rules go into `SKILL.md`.

@@ -11,11 +11,17 @@ Run:
     ./.venv/bin/python legacy/wq_brain/batch_simulate.py [input.csv] [--workers N]
                                                [--max-wait SECONDS] [--skip-done]
                                                [--retries N] [--retry-delay SECONDS]
+                                               [--db PATH] [--no-db]
 
 Behavior:
     - One thread per worker (default 3 = BRAIN's concurrent simulation limit).
     - Every completed simulation is appended to data/results_<timestamp>.csv
       immediately, so a Ctrl-C never loses finished work.
+    - With the local store (default: <repo root>/research.db, TODO P0/P1) each row is
+      normalized and keyed before submission: an exact completed request is served
+      from cache and never re-sent to BRAIN, a request another process is already
+      running is skipped, and each result is committed to SQLite the moment it lands.
+      Use --no-db for the legacy CSV-only behavior.
     - Rows that fail to start or hold an invalid settings cell are logged (with
       the reason) and skipped.
     - Each simulation has a hard wall-clock deadline (--max-wait, default 1800s),
@@ -48,13 +54,22 @@ import argparse
 import csv
 import json
 import logging
+import sqlite3
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from wq_session import (
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import canonical  # noqa: E402
+import research_db  # noqa: E402
+from wq_session import (  # noqa: E402
     API_BASE,
     RateLimitError,
     SessionExpiredError,
@@ -63,9 +78,9 @@ from wq_session import (
     get_session,
 )
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / "data"
 DEFAULT_INPUT = DATA_DIR / "input.csv"
+DEFAULT_LEASE_SECONDS = 1800.0
 
 RESULT_COLUMNS = [
     "passed", "sharpe", "fitness", "turnover", "weight", "subsharpe",
@@ -83,6 +98,10 @@ DEFAULT_RETRY_DELAY = 30.0
 # signature has already been simulated, so --skip-done can skip it.
 DONE_KEY_FIELDS = ("code", "neutralization", "decay", "truncation", "delay", "universe", "region")
 SIM_FIELDS = DONE_KEY_FIELDS + ("nanHandling",)
+SIM_SETTINGS_COLUMNS = (
+    "instrumentType", "region", "universe", "delay", "decay", "neutralization",
+    "truncation", "pasteurization", "unitHandling", "nanHandling", "language",
+)
 
 
 def sim_signature(sim: dict, fields: tuple[str, ...] = SIM_FIELDS) -> str:
@@ -115,36 +134,14 @@ def setup_logging(csv_path: Path) -> None:
     )
 
 
-def _coerce(value, cast, default, field: str):
-    """Coerce one CSV cell; a blank cell means 'use the default'.
-
-    An empty degree/truncation column used to raise ValueError straight out of the
-    worker and kill the whole batch, so a bad cell now becomes a clear per-row error.
-    """
-    if value is None or str(value).strip() == "":
-        return default
-    try:
-        return cast(str(value).strip())
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field}={value!r} is not a valid {cast.__name__}") from exc
-
-
 def build_settings(sim: dict) -> dict:
-    """Build a BRAIN settings payload from one CSV row."""
-    return {
-        "instrumentType": "EQUITY",
-        "region": str(sim.get("region") or "USA").strip().upper(),
-        "universe": str(sim.get("universe") or "TOP3000").strip().upper(),
-        "delay": _coerce(sim.get("delay"), int, 1, "delay"),
-        "decay": _coerce(sim.get("decay"), int, 6, "decay"),
-        "neutralization": str(sim.get("neutralization") or "SUBINDUSTRY").strip().upper(),
-        "truncation": _coerce(sim.get("truncation"), float, 0.1, "truncation"),
-        "pasteurization": "ON",
-        "unitHandling": "VERIFY",
-        "nanHandling": str(sim.get("nanHandling") or "OFF").strip().upper(),
-        "language": "FASTEXPR",
-        "visualization": False,
-    }
+    """Build a BRAIN settings payload from one CSV row.
+
+    Defaults, coercion and canonicalization live in scripts/canonical.py so the
+    simulation cache key and the request sent to BRAIN can never drift apart.
+    """
+    settings = canonical.normalize_settings({field: sim.get(field) for field in SIM_SETTINGS_COLUMNS})
+    return {**settings, "visualization": False}
 
 
 def run_simulation(session, sim: dict, max_wait: float = DEFAULT_MAX_WAIT_SECONDS) -> dict:
@@ -213,11 +210,88 @@ def run_simulation(session, sim: dict, max_wait: float = DEFAULT_MAX_WAIT_SECOND
         "sharpe": is_.get("sharpe", ""),
         "fitness": is_.get("fitness", ""),
         "turnover": round(100 * is_.get("turnover", 0), 2) if isinstance(is_.get("turnover"), (int, float)) else "",
+        "turnover_fraction": is_.get("turnover") if isinstance(is_.get("turnover"), (int, float)) else "",
+        "drawdown": is_.get("drawdown", ""),
         "weight": weight,
         "subsharpe": subsharpe,
         "correlation": corr,
         "link": f"https://platform.worldquantbrain.com/alpha/{alpha_id}",
+        "alpha_id": alpha_id,
+        "simulation_id": sim_url.rsplit("/", 1)[-1] or sim_url,
+        # Kept out of the results CSV by extrasaction="ignore"; used by research.db.
+        "checks": [
+            {k: c.get(k) for k in ("name", "result", "value", "limit") if k in c}
+            for c in checks
+            if isinstance(c, dict)
+        ],
     }
+
+
+def open_store(path: str | None) -> research_db.ResearchDB | None:
+    """Open research.db, degrading to CSV-only mode if the store cannot be used."""
+    try:
+        return research_db.ResearchDB.open(path)
+    except (sqlite3.Error, OSError) as exc:
+        logging.warning(f"research.db unavailable ({exc}) — continuing without the local store")
+        return None
+
+
+def _number(value) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def cached_result_row(sim: dict, cached: dict) -> dict:
+    """Turn a cached research.db result back into a results-CSV row (no BRAIN call)."""
+    checks = [c for c in (cached.get("checks") or []) if isinstance(c, dict)]
+    turnover = _number(cached.get("turnover"))
+    alpha_id = cached.get("brain_alpha_id")
+    return {
+        **{field: sim.get(field, "") or "" for field in DONE_KEY_FIELDS},
+        "passed": sum(1 for c in checks if c.get("result") == "PASS"),
+        "sharpe": cached.get("sharpe") if cached.get("sharpe") is not None else "",
+        "fitness": cached.get("fitness") if cached.get("fitness") is not None else "",
+        "turnover": round(100 * turnover, 2) if turnover is not None else "",
+        "weight": next((c.get("result", "") for c in checks if c.get("name") == "CONCENTRATED_WEIGHT"), ""),
+        "subsharpe": next((c.get("value", "") for c in checks if c.get("name") == "LOW_SUB_UNIVERSE_SHARPE"), ""),
+        "correlation": next((c.get("value", "") for c in checks if c.get("name") == "SELF_CORRELATION"), ""),
+        "link": f"https://platform.worldquantbrain.com/alpha/{alpha_id}" if alpha_id else "",
+    }
+
+
+def record_result_in_store(
+    store: research_db.ResearchDB, result: dict, candidate_ids: dict[str, int], retry_delay_seconds: float | None = None
+) -> None:
+    """Persist one outcome the moment it lands; a store problem must never lose the CSV row."""
+    code = str(result.get("code", "")).strip()
+    if not code:
+        return
+    try:
+        settings = build_settings(result)
+    except ValueError as exc:
+        logging.warning(f"not persisting {code[:60]!r}: {exc}")
+        return
+    key = canonical.canonical_key(code, settings)
+    try:
+        if "error" in result:
+            store.record_simulation_result(
+                candidate_id=candidate_ids.get(key), canonical_key=key, status="ERROR",
+                error=str(result["error"]), retry_delay_seconds=retry_delay_seconds,
+            )
+        else:
+            store.record_simulation_result(
+                candidate_id=candidate_ids.get(key), canonical_key=key, status="DONE",
+                metrics={
+                    "sharpe": _number(result.get("sharpe")),
+                    "fitness": _number(result.get("fitness")),
+                    "turnover": _number(result.get("turnover_fraction")),
+                    "drawdown": _number(result.get("drawdown")),
+                },
+                checks=result.get("checks") or [],
+                brain_alpha_id=result.get("alpha_id"),
+                simulation_id=result.get("simulation_id"),
+            )
+    except (sqlite3.Error, ValueError, KeyError) as exc:
+        logging.warning(f"could not persist {code[:60]!r} into research.db: {exc}")
 
 
 def main() -> int:
@@ -247,6 +321,21 @@ def main() -> int:
         default=DEFAULT_RETRY_DELAY,
         help=f"seconds to wait before retrying rate-limited rows (default {int(DEFAULT_RETRY_DELAY)})",
     )
+    parser.add_argument(
+        "--db",
+        help=f"local state store (default: ${research_db.DB_ENV_VAR} or <repo root>/research.db)",
+    )
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="disable the local store/cache and keep the legacy CSV-only behavior",
+    )
+    parser.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=DEFAULT_LEASE_SECONDS,
+        help=f"how long a claimed candidate stays leased to this process (default {int(DEFAULT_LEASE_SECONDS)})",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -265,15 +354,78 @@ def main() -> int:
     setup_logging(results_path)
     session = get_session()
 
-    pending = list(sims)
+    store = None if args.no_db else open_store(args.db)
+    if store is not None:
+        try:
+            recovered = store.recover_expired_leases(args.lease_seconds)
+        except sqlite3.Error as exc:
+            logging.warning(f"could not recover leases ({exc})")
+        else:
+            if recovered["simulations"] or recovered["submissions"]:
+                logging.info(f"recovered expired leases: {recovered}")
+
+    # ---- P1: normalize + dedup + cache check before spending BRAIN capacity ----
+    invalid: list[str] = []
+    pending: list[dict] = []
+    candidate_ids: dict[str, int] = {}
+    reused: list[tuple[dict, dict]] = []
+    skipped = {"in_flight": 0, "skipped_final": 0}
+
+    if store is None:
+        pending = list(sims)
+    else:
+        for sim in sims:
+            code = str(sim.get("code", "")).strip()
+            try:
+                settings = build_settings(sim)
+            except ValueError as exc:
+                invalid.append(f"{code[:60]!r}: {exc}")
+                continue
+            try:
+                outcome = store.queue_candidate(code, settings, source=input_path.name)
+            except (sqlite3.Error, ValueError, KeyError) as exc:
+                invalid.append(f"{code[:60]!r}: store rejected the candidate ({exc})")
+                continue
+            if outcome.action == "cache_hit":
+                reused.append((sim, outcome.cached or {}))
+            elif outcome.needs_simulation:
+                pending.append(sim)
+                if outcome.candidate_id is not None:
+                    candidate_ids[outcome.canonical_key] = outcome.candidate_id
+            else:
+                skipped[outcome.action] = skipped.get(outcome.action, 0) + 1
+
+        if reused:
+            print(f"Reusing {len(reused)} cached result(s) from {store.path.name} — no BRAIN call")
+        if skipped["in_flight"]:
+            print(f"Skipping {skipped['in_flight']} candidate(s) already queued/running elsewhere")
+        if skipped["skipped_final"]:
+            print(f"Skipping {skipped['skipped_final']} candidate(s) that already reached a final state")
+    for problem in invalid:
+        print(f"SKIPPED {problem}", file=sys.stderr)
+
     if args.skip_done:
         done = load_done_signatures()
         if done:
             before = len(pending)
             pending = [s for s in pending if sim_signature(s, DONE_KEY_FIELDS) not in done]
             print(f"Skipping {before - len(pending)} expression(s) already simulated in a previous results CSV")
+
     if not pending:
+        if reused:
+            with results_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
+                writer.writeheader()
+                for sim, cached in reused:
+                    writer.writerow(cached_result_row(sim, cached))
+                f.flush()
+            print(f"Nothing to simulate — {len(reused)} cached result(s) -> {results_path}")
+            if store is not None:
+                store.close()
+            return 0
         print("Nothing to do — every expression in this input already has a result.")
+        if store is not None:
+            store.close()
         return 0
 
     processed: list[dict] = []
@@ -283,10 +435,16 @@ def main() -> int:
     with results_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
         writer.writeheader()
+        for sim, cached in reused:
+            writer.writerow(cached_result_row(sim, cached))
         f.flush()
 
         def persist(result: dict) -> None:
             key = sim_signature(result)
+            if store is not None:
+                # Commit to SQLite first: an interrupt anywhere after this point can no
+                # longer lose the result or force BRAIN to redo it (TODO P0/P1).
+                record_result_in_store(store, result, candidate_ids, args.retry_delay)
             if "error" in result:
                 failed[key] = result  # last attempt for this row wins
                 logging.warning(f"SKIPPED {result['code'][:60]!r}: {result['error']}")
@@ -343,10 +501,31 @@ def main() -> int:
                 )
                 # Re-queue only the input fields: a failed result dict also carries the
                 # previous attempt's `error` key, which would mark the retry as failed too.
-                pending = [{field: row.get(field, "") for field in SIM_FIELDS} for row in retryable]
+                pending = []
+                for row in retryable:
+                    pending.append({field: row.get(field, "") for field in SIM_FIELDS})
+                    if store is not None:
+                        try:
+                            outcome = store.queue_candidate(
+                                str(row.get("code", "")).strip(),
+                                build_settings(row),
+                                source=input_path.name,
+                                requeue=True,
+                            )
+                        except (sqlite3.Error, ValueError, KeyError) as exc:
+                            logging.warning(f"store could not requeue {str(row.get('code'))[:60]!r}: {exc}")
+                        else:
+                            if outcome.candidate_id is not None:
+                                candidate_ids[outcome.canonical_key] = outcome.candidate_id
                 time.sleep(args.retry_delay)
 
-    print(f"Done. {len(processed)} results -> {results_path} | {len(failed)} skipped (see log)")
+    if store is not None:
+        store.close()
+
+    summary = f"Done. {len(processed)} results -> {results_path}"
+    if reused:
+        summary += f" | {len(reused)} served from cache"
+    print(f"{summary} | {len(failed)} skipped (see log)")
     return 0
 
 
