@@ -3,8 +3,9 @@
 Simulation workers never submit: a candidate that clears the gates is filed as READY in
 `research.db.submissions`, and this worker drains that queue independently.
 
-    claim a leased READY row            -> only one process can own a submission (P8)
-    re-check the gates                  -> metrics floors, turnover, not already ACTIVE
+    recover + reconcile uncertain rows  -> BRAIN, not the local row, decides a retry (P8)
+    claim a leased READY/RETRY row      -> only one process can own a submission (P8)
+    re-check the gates                  -> metrics floors, turnover, correlation, not ACTIVE
     POST /alphas/{id}/submit            -> 404 = already submitted, 403/409 = pending
     poll the submit endpoint + status   -> ACTIVE / SELF_CORR_FAIL / PLATFORM_REJECTED
     persist the outcome, then continue  -> the queue never stops at the first success
@@ -12,8 +13,14 @@ Simulation workers never submit: a candidate that clears the gates is filed as R
 Ordering is not FIFO: `ranking.submission_priority` scores quality + novelty + portfolio
 diversification, so a family that already owns ACTIVE alphas yields to a fresh idea.
 
-Local self-correlation (TODO P9) is a switch, not an implementation: `--require-correlation`
-makes the gate demand a fresh `self_corr` and refuse anything at or above the limit.
+Recovery (TODO P8) is explicit: an expired lease returns to READY only when the POST never
+left the process; after a POST the row is CHECK_PENDING and is reconciled against BRAIN
+before any retry. Transient failures back off automatically and retire as EXHAUSTED once
+their attempt budget is spent, so nothing has to be re-enqueued or deleted by hand.
+
+Local self-correlation (TODO P9) is a real gate: `--require-correlation` syncs the ACTIVE
+book, fetches candidate PnL, checks a fresh local `self_corr` and refuses anything at or
+above the limit; BRAIN's own SELF_CORRELATION check stays the final confirmation.
 
 Usage:
     ./.venv/bin/python scripts/submission_worker.py --dry-run          # show the queue order
@@ -43,6 +50,10 @@ DEFAULT_LEASE_SECONDS = 300.0
 CHECK_POLL_SECONDS = 5.0
 MAX_CHECK_POLLS = 60
 
+#: Submission statuses that mean "the platform is still evaluating the POST".
+PENDING_ALPHA_STATUSES = frozenset({"", "UNSUBMITTED"})
+REJECTED_ALPHA_STATUSES = frozenset({"REJECTED", "DELETED"})
+
 
 class SubmissionWorker:
     """Drains `research.db.submissions` one leased candidate at a time."""
@@ -58,6 +69,7 @@ class SubmissionWorker:
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
         poll_interval: float = CHECK_POLL_SECONDS,
         max_polls: int = MAX_CHECK_POLLS,
+        max_submission_attempts: int = research_db.DEFAULT_SUBMISSION_MAX_ATTEMPTS,
         require_correlation: bool = False,
         correlation_limit: float = 0.7,
         thresholds: Mapping[str, float] | None = None,
@@ -72,6 +84,7 @@ class SubmissionWorker:
         self.lease_seconds = lease_seconds
         self.poll_interval = poll_interval
         self.max_polls = max_polls
+        self.max_submission_attempts = max(int(max_submission_attempts), 1)
         self.require_correlation = require_correlation
         self.correlation_limit = correlation_limit
         self.thresholds = dict(thresholds or {})
@@ -88,6 +101,14 @@ class SubmissionWorker:
     # -- entry point -------------------------------------------------------
 
     def run(self) -> int:
+        # Recovery first (TODO P8): expired leases, spent attempt budgets, then BRAIN
+        # reconciliation of anything whose POST outcome is still unknown.
+        recovered = self.db.recover_expired_leases()
+        if recovered["submissions"]:
+            print(f"[submit] recovered {recovered['submissions']} expired submission lease(s)")
+        retired = self.db.expire_exhausted_submissions(self.max_submission_attempts)
+        if retired:
+            print(f"[submit] retired {retired} submission(s) past their attempt budget")
         self.reconcile_pending()
         while self.submitted < self.max_submissions and not self._runtime_exceeded():
             submission = self._claim()
@@ -100,8 +121,10 @@ class SubmissionWorker:
         return self.max_runtime is not None and self._clock() - self.started_at >= self.max_runtime
 
     def _claim(self) -> dict[str, Any] | None:
-        """Lease the highest-priority READY submission (priority set at enqueue time)."""
-        submission = self.db.claim_submission(self.worker_id, self.lease_seconds)
+        """Lease the highest-priority claimable submission (READY, or a due RETRY)."""
+        submission = self.db.claim_submission(
+            self.worker_id, self.lease_seconds, max_attempts=self.max_submission_attempts
+        )
         if submission is None:
             return None
         return submission
@@ -142,25 +165,59 @@ class SubmissionWorker:
     # -- reconciliation ----------------------------------------------------
 
     def reconcile_pending(self) -> int:
-        """Resolve CHECK_PENDING rows so a run that ran out of time never strands one."""
+        """Resolve CHECK_PENDING rows against BRAIN before anything is retried (TODO P8).
+
+        BRAIN is the source of truth after an uncertain POST: ACTIVE and rejected alphas are
+        final, a pending check keeps the row reconcilable, and READY is used only when BRAIN
+        shows the alpha is not submitted and exposes no pending submission checks.
+        """
         for row in self.db.query("SELECT * FROM submissions WHERE status='CHECK_PENDING'"):
-            alpha_id = row.get("brain_alpha_id")
+            submission_id = int(row["id"])
+            alpha_id = row.get("brain_alpha_id") or self._candidate_alpha_id(int(row["candidate_id"]))
             if not alpha_id:
-                self.db.finish_submission(int(row["id"]), "RETRY", message="CHECK_PENDING without alpha id")
+                self.db.finish_submission(submission_id, "RETRY",
+                                          message="CHECK_PENDING without an alpha id; nothing to reconcile",
+                                          max_attempts=self.max_submission_attempts)
                 self.retried += 1
+                self.reconciled += 1
                 continue
+
             status = self.client.alpha_status(str(alpha_id))
+            checks = self.client.submit_checks(str(alpha_id))
+            verdict = _self_correlation_verdict(checks)
             if status == "ACTIVE":
-                self.db.finish_submission(int(row["id"]), "ACTIVE", brain_alpha_id=str(alpha_id))
+                self.db.finish_submission(submission_id, "ACTIVE", message="reconciled: confirmed ACTIVE",
+                                          max_corr=verdict["value"], brain_alpha_id=str(alpha_id))
                 self.active += 1
-            elif status in ("UNSUBMITTED", None, ""):
-                self.db.finish_submission(int(row["id"]), "READY", message="reconciled: still open",
+            elif status in REJECTED_ALPHA_STATUSES:
+                self.db.finish_submission(submission_id, "PLATFORM_REJECTED",
+                                          message=f"reconciled: alpha status={status}", brain_alpha_id=str(alpha_id))
+                self.rejected += 1
+            elif verdict["result"] == "FAIL":
+                self.db.finish_submission(submission_id, "SELF_CORR_FAIL",
+                                          message="reconciled: platform SELF_CORRELATION failed",
+                                          max_corr=verdict["value"], brain_alpha_id=str(alpha_id))
+                self.rejected += 1
+            elif _checks_pending(checks):
+                self.db.finish_submission(submission_id, "CHECK_PENDING",
+                                          message="reconciled: submission checks still pending",
                                           brain_alpha_id=str(alpha_id))
+            elif status in PENDING_ALPHA_STATUSES:
+                self.db.finish_submission(submission_id, "READY",
+                                          message="reconciled: BRAIN reports the alpha is not submitted",
+                                          brain_alpha_id=str(alpha_id))
+                self.retried += 1
             else:
-                self.db.finish_submission(int(row["id"]), "RETRY", message=f"reconciled: status={status}")
+                self.db.finish_submission(submission_id, "RETRY", message=f"reconciled: status={status}",
+                                          brain_alpha_id=str(alpha_id),
+                                          max_attempts=self.max_submission_attempts)
                 self.retried += 1
             self.reconciled += 1
         return self.reconciled
+
+    def _candidate_alpha_id(self, candidate_id: int) -> str | None:
+        candidate = self.db.get_candidate(candidate_id)
+        return str(candidate["brain_alpha_id"]) if candidate and candidate.get("brain_alpha_id") else None
 
     # -- one submission ----------------------------------------------------
 
@@ -179,15 +236,20 @@ class SubmissionWorker:
             print(f"[submit] holding candidate {candidate['id']}: {message}")
             # A failed gate is not a rejection: the alpha stays queued for a later review.
             self.db.finish_submission(submission_id, "RETRY" if _retryable(reasons) else "PLATFORM_REJECTED",
-                                      message=message, brain_alpha_id=candidate.get("brain_alpha_id"))
+                                      message=message, brain_alpha_id=candidate.get("brain_alpha_id"),
+                                      max_attempts=self.max_submission_attempts)
             return
 
         alpha_id = str(candidate["brain_alpha_id"])
+        # Write-ahead marker: if this process dies during the POST, recovery knows the
+        # outcome is unknown and must be reconciled instead of blindly retried (TODO P8).
+        self.db.mark_submission_posted(submission_id)
         outcome = self.client.submit_alpha(alpha_id)
         print(f"[submit] alpha {_mask(alpha_id)}: {outcome['outcome']}")
         if outcome["outcome"] == "error":
             self.retried += 1
-            self.db.finish_submission(submission_id, "RETRY", message=outcome["detail"], brain_alpha_id=alpha_id)
+            self.db.finish_submission(submission_id, "RETRY", message=outcome["detail"], brain_alpha_id=alpha_id,
+                                      max_attempts=self.max_submission_attempts)
             return
         if outcome["outcome"] not in ("submitted", "already_submitted", "in_progress"):
             self.rejected += 1
@@ -251,6 +313,24 @@ class SubmissionWorker:
         }
 
 
+def _self_correlation_verdict(checks: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Read the SELF_CORRELATION check from a submit payload (TODO P8/P9)."""
+    check = next((c for c in checks if str(c.get("name", "")).upper() == "SELF_CORRELATION"), None)
+    if check is None:
+        return {"result": None, "value": None}
+    value = check.get("value")
+    return {"result": str(check.get("result", "")).upper(),
+            "value": float(value) if isinstance(value, (int, float)) else None}
+
+
+def _checks_pending(checks: Iterable[Mapping[str, Any]]) -> bool:
+    """True while the platform has checks that are neither PASS nor FAIL yet."""
+    results = [str(c.get("result", "")).upper() for c in checks]
+    if not results or "FAIL" in results:
+        return False
+    return not all(result == "PASS" for result in results)
+
+
 def _retryable(reasons: list[str]) -> bool:
     """A gate that can change (metrics/correlation) is retryable; a duplicate is not."""
     return any("correlation" in reason or "sharpe" in reason or "fitness" in reason or "turnover" in reason
@@ -292,6 +372,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stop after this many minutes (0 = no limit)")
     parser.add_argument("--lease-seconds", type=float, default=DEFAULT_LEASE_SECONDS,
                         help="how long this worker owns a claimed submission")
+    parser.add_argument("--max-submission-attempts", type=int, default=research_db.DEFAULT_SUBMISSION_MAX_ATTEMPTS,
+                        help="retries a submission may spend before it is marked EXHAUSTED (TODO P8)")
     parser.add_argument("--require-correlation", action="store_true",
                         help="demand a fresh local self-correlation before submitting (TODO P9)")
     parser.add_argument("--min-sharpe", type=float, default=research_db.IS_THRESHOLDS["sharpe"],
@@ -322,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
             max_submissions=args.max_submissions,
             max_runtime=None if not args.max_runtime else args.max_runtime * 60.0,
             lease_seconds=args.lease_seconds,
+            max_submission_attempts=args.max_submission_attempts,
             require_correlation=args.require_correlation,
             thresholds={
                 "sharpe": args.min_sharpe,

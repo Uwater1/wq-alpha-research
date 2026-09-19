@@ -13,6 +13,13 @@ State machine (TODO P0):
     GENERATED -> VALIDATED -> QUEUED -> SIMULATING -> SIMULATED -> IS_PASS
     -> CORR_PASS -> SUBMISSION_READY -> SUBMITTING -> ACTIVE / REJECTED / RETRY
 
+Submission rows have their own recovery contract (TODO P8):
+
+    READY -POST-> SUBMITTING -ACTIVE-> ACTIVE | -chec-> CHECK_PENDING | -fail-> RETRY
+    RETRY backs off and is claimable again until its attempt budget is spent (EXHAUSTED).
+    An expired SUBMITTING lease returns to READY when the POST never left the process and
+    to CHECK_PENDING when it did, so a retry always consults BRAIN before re-POSTing.
+
 ``candidates`` and ``simulations`` are 1:1 on ``canonical_key`` by design:
 ``candidates`` answers "what should we work on and why", ``simulations`` answers
 "has BRAIN already computed this exact request". A cache hit therefore replays
@@ -65,12 +72,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = REPO_ROOT / "research.db"
 DB_ENV_VAR = "WQ_RESEARCH_DB"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
 ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
-    "candidates": ("structural_json TEXT", "gate_reason TEXT"),
+    "candidates": (
+        "structural_json TEXT",
+        "gate_reason TEXT",
+        # TODO P9: local self-correlation bookkeeping (see scripts/correlation.py).
+        "max_corr_alpha_id TEXT",
+        "corr_checked_at TEXT",
+        "active_set_version INTEGER",
+        "corr_status TEXT",
+    ),
+    # TODO P8: `post_attempted_at` is the write-ahead marker that separates "never POSTed"
+    # from "POST outcome unknown" after a crash; `last_error` keeps the last reconcile note.
+    "submissions": ("post_attempted_at TEXT", "last_error TEXT"),
 }
 
 # IS gates from SKILL.md Section 5, used only when BRAIN's own IS checks are absent.
@@ -119,10 +137,46 @@ SUBMISSION_STATUSES: tuple[str, ...] = (
     "SELF_CORR_FAIL",
     "PLATFORM_REJECTED",
     "RETRY",
+    "EXHAUSTED",
 )
 
 # Terminal submission states: an expired lease on these is not "recoverable work".
-FINAL_SUBMISSION_STATUSES = frozenset({"ACTIVE", "SELF_CORR_FAIL", "PLATFORM_REJECTED"})
+FINAL_SUBMISSION_STATUSES = frozenset({"ACTIVE", "SELF_CORR_FAIL", "PLATFORM_REJECTED", "EXHAUSTED"})
+
+# TODO P8: retry policy for the submission queue. Attempt N waits base * 2**(N-1) seconds
+# (capped); once the attempt budget is spent the row becomes EXHAUSTED instead of looping.
+DEFAULT_SUBMISSION_MAX_ATTEMPTS = 5
+SUBMISSION_BACKOFF_BASE_SECONDS = 30.0
+SUBMISSION_BACKOFF_MAX_SECONDS = 3600.0
+
+# A terminal submission row never moves again (except by explicit operator enqueue, which
+# opens a fresh row); every other transition is allowed. This is the explicit READY/RETRY
+# rule the pipeline used to leave to manual re-enqueue.
+def submission_transition_allowed(current: str, target: str) -> bool:
+    if current not in SUBMISSION_STATUSES or target not in SUBMISSION_STATUSES:
+        return False
+    if current in FINAL_SUBMISSION_STATUSES:
+        return target == current
+    return True
+
+
+def submission_retry_delay(attempt: int, *, base: float = SUBMISSION_BACKOFF_BASE_SECONDS,
+                           maximum: float = SUBMISSION_BACKOFF_MAX_SECONDS) -> float:
+    """Exponential backoff for submission retries; ``attempt`` is 1-based."""
+    return min(base * (2 ** max(int(attempt) - 1, 0)), maximum)
+
+# Maps a submission verdict onto the candidate lifecycle. ``EXHAUSTED`` parks the
+# candidate back at SUBMISSION_READY so a spent retry budget is visible and recoverable
+# (re-enqueue it, or leave it) instead of requiring a manual research.db edit.
+SUBMISSION_TO_CANDIDATE_STATUS: dict[str, str] = {
+    "ACTIVE": "ACTIVE",
+    "SELF_CORR_FAIL": "REJECTED",
+    "PLATFORM_REJECTED": "REJECTED",
+    "RETRY": "RETRY",
+    "READY": "SUBMISSION_READY",
+    "CHECK_PENDING": "SUBMITTING",
+    "EXHAUSTED": "SUBMISSION_READY",
+}
 
 # CSV columns that describe simulation settings (mirrors batch_simulate.build_settings).
 SETTINGS_COLUMNS: tuple[str, ...] = (
@@ -229,6 +283,8 @@ SCHEMA: tuple[str, ...] = (
         lease_until      TEXT,
         next_attempt_at  TEXT,
         message          TEXT,
+        post_attempted_at TEXT,
+        last_error       TEXT,
         created_at       TEXT NOT NULL,
         updated_at       TEXT NOT NULL
     )
@@ -296,6 +352,22 @@ def _structural_payload(report: Any) -> str | None:
 def settings_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Build canonical settings from a CSV row (blank/absent cells fall back to defaults)."""
     return canonical.normalize_settings({column: row[column] for column in SETTINGS_COLUMNS if column in row})
+
+
+def candidate_settings(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalized settings of a stored candidate, read from ``settings_json``.
+
+    A candidate row carries no per-setting columns, so `settings_from_row` would silently
+    return defaults and give a non-default request the wrong canonical identity (TODO P8.3).
+    """
+    raw = row.get("settings_json")
+    if not raw:
+        return canonical.normalize_settings(None)
+    try:
+        parsed = json.loads(str(raw))
+    except ValueError:
+        return canonical.normalize_settings(None)
+    return canonical.normalize_settings(parsed if isinstance(parsed, Mapping) else None)
 
 
 def transition_path(current: str, target: str, max_depth: int = 3) -> list[str] | None:
@@ -1166,8 +1238,10 @@ class ResearchDB:
     def recover_expired_leases(self, lease_seconds: float | None = None) -> dict[str, int]:
         """Reclaim work left behind by a killed process (TODO P0/P8).
 
-        An expired SIMULATING/SUBMITTING lease becomes RETRY, never an automatic
-        resubmission: BRAIN state must be reconciled first (TODO P8).
+        An expired SIMULATING lease becomes RETRY. An expired SUBMITTING lease is different:
+        if the POST had already left the process (`post_attempted_at` set) the row becomes
+        CHECK_PENDING, i.e. it must be reconciled against BRAIN before any retry; only a
+        lease that never reached the POST returns to READY for a normal retry (TODO P8).
         """
         reference = now_iso()
         recovered = {"simulations": 0, "submissions": 0}
@@ -1193,15 +1267,22 @@ class ResearchDB:
                 (reference,),
             ).fetchall()
             for submission in submissions:
+                attempted = bool(submission["post_attempted_at"])
+                target = "CHECK_PENDING" if attempted else "READY"
+                message = (
+                    "lease_expired: POST outcome unknown, reconcile against BRAIN"
+                    if attempted else "lease_expired: never POSTed"
+                )
                 conn.execute(
-                    "UPDATE submissions SET status='RETRY', worker_id=NULL, lease_until=NULL, "
-                    "message='lease_expired', updated_at=? WHERE id=?",
-                    (reference, submission["id"]),
+                    "UPDATE submissions SET status=?, worker_id=NULL, lease_until=NULL, message=?, "
+                    "next_attempt_at=NULL, last_error=?, updated_at=? WHERE id=?",
+                    (target, message, message, reference, submission["id"]),
                 )
                 self.log_event(
-                    "submission", submission["id"], "lease_expired", from_status="SUBMITTING", to_status="RETRY",
-                    conn=conn,
+                    "submission", submission["id"], "lease_expired", from_status="SUBMITTING", to_status=target,
+                    payload={"reason": message}, conn=conn,
                 )
+                self._apply_candidate_submission_status(conn, int(submission["candidate_id"]), target, reference, message)
                 recovered["submissions"] += 1
         return recovered
 
@@ -1248,16 +1329,23 @@ class ResearchDB:
                 raise KeyError(f"candidate {candidate_id} not found")
             if candidate["status"] != "SUBMISSION_READY":
                 self._set_status(conn, candidate, "SUBMISSION_READY", timestamp)
+            # One open submission row per candidate (TODO P8): a terminal row is history, any
+            # other row is reused so RETRY/CHECK_PENDING work is never duplicated.
+            terminal = sorted(FINAL_SUBMISSION_STATUSES)
+            placeholders = ",".join("?" for _ in terminal)
             open_row = conn.execute(
-                "SELECT id FROM submissions WHERE candidate_id=? AND status NOT IN ('ACTIVE','SELF_CORR_FAIL','PLATFORM_REJECTED') "
+                f"SELECT id FROM submissions WHERE candidate_id=? AND status NOT IN ({placeholders}) "
                 "ORDER BY id DESC LIMIT 1",
-                (candidate_id,),
+                (candidate_id, *terminal),
             ).fetchone()
             if open_row is not None:
                 conn.execute(
-                    "UPDATE submissions SET status='READY', priority=?, updated_at=? WHERE id=?",
+                    "UPDATE submissions SET status='READY', next_attempt_at=NULL, worker_id=NULL, lease_until=NULL, "
+                    "priority=?, updated_at=? WHERE id=?",
                     (candidate["priority"] if priority is None else priority, timestamp, open_row["id"]),
                 )
+                self.log_event("submission", open_row["id"], "requeued", to_status="READY",
+                               payload={"candidate_id": candidate_id}, conn=conn)
                 return int(open_row["id"])
             cursor = conn.execute(
                 """
@@ -1272,31 +1360,47 @@ class ResearchDB:
                            payload={"candidate_id": candidate_id}, conn=conn)
             return submission_id
 
-    def claim_submission(self, worker_id: str, lease_seconds: float = 1800.0) -> dict[str, Any] | None:
-        """Lease the highest-priority READY submission (the P8 anti-duplicate lock)."""
+    def claim_submission(
+        self,
+        worker_id: str,
+        lease_seconds: float = 1800.0,
+        *,
+        max_attempts: int = DEFAULT_SUBMISSION_MAX_ATTEMPTS,
+        ready_only: bool = False,
+    ) -> dict[str, Any] | None:
+        """Lease the highest-priority claimable submission (the P8 anti-duplicate lock).
+
+        READY rows and RETRY rows whose backoff window elapsed are both claimable: a
+        transient failure must retry automatically instead of waiting for manual enqueue.
+        ``ready_only`` restores the old behaviour for callers that only want fresh work.
+        """
         timestamp = now_iso()
+        statuses = ("READY",) if ready_only else ("READY", "RETRY")
+        placeholders = ",".join("?" for _ in statuses)
         with self._tx() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT s.*, c.canonical_key, c.brain_alpha_id AS candidate_alpha_id
                 FROM submissions s JOIN candidates c ON c.id = s.candidate_id
-                WHERE s.status='READY' AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= ?)
+                WHERE s.status IN ({placeholders})
+                      AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= ?)
+                      AND s.attempt < ?
                 ORDER BY s.priority DESC, s.id ASC LIMIT 1
                 """,
-                (timestamp,),
+                (*statuses, timestamp, int(max_attempts)),
             ).fetchone()
             if row is None:
                 return None
             cursor = conn.execute(
                 "UPDATE submissions SET status='SUBMITTING', worker_id=?, lease_until=?, attempt=attempt+1, "
-                "updated_at=? WHERE id=? AND status='READY'",
-                (worker_id, plus_seconds_iso(lease_seconds), timestamp, row["id"]),
+                "next_attempt_at=NULL, updated_at=? WHERE id=? AND status=?",
+                (worker_id, plus_seconds_iso(lease_seconds), timestamp, row["id"], row["status"]),
             )
             if cursor.rowcount != 1:
                 return None
             self.log_event(
-                "submission", row["id"], "claimed", from_status="READY", to_status="SUBMITTING",
-                payload={"worker_id": worker_id}, conn=conn,
+                "submission", row["id"], "claimed", from_status=row["status"], to_status="SUBMITTING",
+                payload={"worker_id": worker_id, "attempt": int(row["attempt"]) + 1}, conn=conn,
             )
             return dict(conn.execute("SELECT * FROM submissions WHERE id=?", (row["id"],)).fetchone())
 
@@ -1309,8 +1413,15 @@ class ResearchDB:
         max_corr: float | None = None,
         max_corr_alpha_id: str | None = None,
         brain_alpha_id: str | None = None,
+        max_attempts: int | None = None,
+        retry_delay: float | None = None,
     ) -> None:
-        """Record a submission outcome and mirror terminal states onto the candidate."""
+        """Record a submission outcome and mirror it onto the candidate (TODO P8).
+
+        ``RETRY`` gets an explicit backoff window derived from the attempt count and turns
+        into ``EXHAUSTED`` once the budget is spent, so transient failures retry on their
+        own and hopeless ones stop consuming the queue. Terminal rows never move again.
+        """
         if status not in SUBMISSION_STATUSES:
             raise ValueError(f"unknown submission status: {status}")
         timestamp = now_iso()
@@ -1318,45 +1429,104 @@ class ResearchDB:
             row = conn.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             if row is None:
                 raise KeyError(f"submission {submission_id} not found")
+            if not submission_transition_allowed(str(row["status"]), status):
+                raise ValueError(
+                    f"illegal submission transition {row['status']} -> {status} for submission {submission_id}"
+                )
+
+            attempt = max(int(row["attempt"] or 0), 1)
+            if status == "RETRY":
+                limit = DEFAULT_SUBMISSION_MAX_ATTEMPTS if max_attempts is None else int(max_attempts)
+                if attempt >= limit:
+                    suffix = f"max submission attempts ({limit}) exhausted"
+                    message = f"{message} | {suffix}" if message else suffix
+                    status = "EXHAUSTED"
+            next_attempt = None
+            if status == "RETRY":
+                next_attempt = plus_seconds_iso(
+                    submission_retry_delay(attempt) if retry_delay is None else retry_delay
+                )
+            if status == "CHECK_PENDING":
+                self._mark_submission_posted(conn, submission_id, timestamp)
             conn.execute(
                 """
                 UPDATE submissions SET status=?, message=?, max_corr=COALESCE(?, max_corr),
                        max_corr_alpha_id=COALESCE(?, max_corr_alpha_id), brain_alpha_id=COALESCE(?, brain_alpha_id),
-                       worker_id=NULL, lease_until=NULL, updated_at=? WHERE id=?
+                       next_attempt_at=?, worker_id=NULL, lease_until=NULL, updated_at=? WHERE id=?
                 """,
-                (status, message, max_corr, max_corr_alpha_id, brain_alpha_id, timestamp, submission_id),
+                (status, message, max_corr, max_corr_alpha_id, brain_alpha_id, next_attempt, timestamp, submission_id),
             )
             self.log_event("submission", submission_id, "result", from_status=row["status"], to_status=status,
-                           payload={"message": message, "max_corr": max_corr}, conn=conn)
+                           payload={"message": message, "max_corr": max_corr, "attempt": attempt}, conn=conn)
 
-            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
-            if candidate is None:
-                return
-            target = {
-                "ACTIVE": "ACTIVE",
-                "SELF_CORR_FAIL": "REJECTED",
-                "PLATFORM_REJECTED": "REJECTED",
-                "RETRY": "RETRY",
-                "READY": "SUBMISSION_READY",
-                "CHECK_PENDING": "SUBMITTING",
-            }.get(status)
-            if target is None or candidate["status"] == target:
-                return
-            if transition_path(candidate["status"], target) is None:
-                return
-            self._set_status(conn, candidate, target, timestamp, reason=message)
-            if status == "ACTIVE" and brain_alpha_id:
-                # Carry the candidate's identity and metrics into the live-book snapshot so
-                # correlation re-checks (P9) and duplicate detection see a complete row.
-                self.upsert_active_alpha(
-                    brain_alpha_id,
-                    expression=candidate["expression"],
-                    settings=settings_from_row(candidate),
-                    sharpe=candidate["sharpe"],
-                    fitness=candidate["fitness"],
-                    turnover=candidate["turnover"],
-                    conn=conn,
+            self._apply_candidate_submission_status(conn, int(row["candidate_id"]), status, timestamp, message)
+            if status == "ACTIVE":
+                candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+                alpha_id = brain_alpha_id or (candidate["brain_alpha_id"] if candidate is not None else None)
+                if alpha_id and candidate is not None:
+                    # Identity comes from the stored candidate row, never a reconstruction from
+                    # defaults: non-default settings must keep their canonical key (TODO P8.3).
+                    self._upsert_active_from_candidate(conn, str(alpha_id), candidate)
+
+    def _apply_candidate_submission_status(
+        self,
+        conn: sqlite3.Connection,
+        candidate_id: int,
+        submission_status: str,
+        timestamp: str,
+        reason: str | None,
+    ) -> None:
+        """Mirror a submission verdict on its candidate using the explicit mapping table."""
+        candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        if candidate is None:
+            return
+        target = SUBMISSION_TO_CANDIDATE_STATUS.get(submission_status)
+        if target is None or candidate["status"] == target:
+            return
+        if transition_path(candidate["status"], target) is None:
+            return
+        self._set_status(conn, candidate, target, timestamp, reason=reason)
+
+    def mark_submission_posted(self, submission_id: int) -> None:
+        """Write-ahead marker recorded immediately before POST /alphas/{id}/submit.
+
+        It is what lets recovery tell "crashed before the request" (safe to retry) from
+        "crashed after the request" (POST outcome unknown, reconcile against BRAIN).
+        """
+        timestamp = now_iso()
+        with self._tx() as conn:
+            self._mark_submission_posted(conn, submission_id, timestamp)
+            self.log_event("submission", submission_id, "post_attempted", to_status="SUBMITTING", conn=conn)
+
+    def _mark_submission_posted(self, conn: sqlite3.Connection, submission_id: int, timestamp: str) -> None:
+        conn.execute(
+            "UPDATE submissions SET post_attempted_at=COALESCE(post_attempted_at, ?), updated_at=? WHERE id=?",
+            (timestamp, timestamp, submission_id),
+        )
+
+    def expire_exhausted_submissions(self, max_attempts: int = DEFAULT_SUBMISSION_MAX_ATTEMPTS) -> int:
+        """Retire RETRY rows that already spent their attempt budget (TODO P8).
+
+        A safety net for rows written before the retry policy existed; new rows become
+        EXHAUSTED inside `finish_submission`.
+        """
+        timestamp = now_iso()
+        expired = 0
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM submissions WHERE status='RETRY' AND attempt >= ?", (int(max_attempts),)
+            ).fetchall()
+            for row in rows:
+                message = f"max submission attempts ({int(max_attempts)}) exhausted"
+                conn.execute(
+                    "UPDATE submissions SET status='EXHAUSTED', message=?, next_attempt_at=NULL, "
+                    "worker_id=NULL, lease_until=NULL, updated_at=? WHERE id=?",
+                    (message, timestamp, row["id"]),
                 )
+                self.log_event("submission", row["id"], "exhausted", from_status="RETRY", to_status="EXHAUSTED",
+                               payload={"attempt": row["attempt"], "message": message}, conn=conn)
+                expired += 1
+        return expired
 
     # -- ACTIVE portfolio snapshot (TODO P9) -------------------------------
 
@@ -1370,35 +1540,40 @@ class ResearchDB:
         fitness: float | None = None,
         turnover: float | None = None,
         pnl_ref: str | None = None,
+        canonical_key: str | None = None,
+        expression_hash: str | None = None,
+        settings_hash: str | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> None:
-        """Track an ACTIVE alpha so correlation re-checks know when the set changed."""
+        """Track an ACTIVE alpha so correlation re-checks know when the set changed.
+
+        Callers holding a stored candidate row should pass its canonical identity and
+        ``settings_json`` explicitly; recomputing from absent columns would silently
+        produce a default-settings key (TODO P8.3).
+        """
+        if expression is not None and canonical_key is None:
+            canonical_key = canonical.canonical_key(expression, settings)
+        if expression is not None and expression_hash is None:
+            expression_hash = canonical.expression_hash(expression)
+        if expression is not None and settings_hash is None:
+            settings_hash = canonical.settings_hash(settings)
         timestamp = now_iso()
         owned = conn is None
         conn = conn or self._conn
         if owned:
             self._conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                """
-                INSERT INTO active_alphas(brain_alpha_id, canonical_key, expression_hash, settings_hash, sharpe,
-                       fitness, turnover, pnl_ref, first_seen_at, last_seen_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(brain_alpha_id) DO UPDATE SET
-                    canonical_key=COALESCE(excluded.canonical_key, active_alphas.canonical_key),
-                    sharpe=COALESCE(excluded.sharpe, active_alphas.sharpe),
-                    fitness=COALESCE(excluded.fitness, active_alphas.fitness),
-                    turnover=COALESCE(excluded.turnover, active_alphas.turnover),
-                    pnl_ref=COALESCE(excluded.pnl_ref, active_alphas.pnl_ref),
-                    last_seen_at=excluded.last_seen_at
-                """,
-                (
-                    brain_alpha_id,
-                    canonical.canonical_key(expression, settings) if expression else None,
-                    canonical.expression_hash(expression) if expression else None,
-                    canonical.settings_hash(settings) if expression else None,
-                    sharpe, fitness, turnover, pnl_ref, timestamp, timestamp,
-                ),
+            self._upsert_active_alpha_row(
+                conn,
+                brain_alpha_id,
+                canonical_key=canonical_key,
+                expression_hash=expression_hash,
+                settings_hash=settings_hash,
+                sharpe=sharpe,
+                fitness=fitness,
+                turnover=turnover,
+                pnl_ref=pnl_ref,
+                timestamp=timestamp,
             )
             if owned:
                 conn.execute("COMMIT")
@@ -1406,6 +1581,57 @@ class ResearchDB:
             if owned:
                 conn.execute("ROLLBACK")
             raise
+
+    def _upsert_active_alpha_row(
+        self,
+        conn: sqlite3.Connection,
+        brain_alpha_id: str,
+        *,
+        canonical_key: str | None,
+        expression_hash: str | None,
+        settings_hash: str | None,
+        sharpe: float | None,
+        fitness: float | None,
+        turnover: float | None,
+        pnl_ref: str | None,
+        timestamp: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO active_alphas(brain_alpha_id, canonical_key, expression_hash, settings_hash, sharpe,
+                   fitness, turnover, pnl_ref, first_seen_at, last_seen_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(brain_alpha_id) DO UPDATE SET
+                canonical_key=COALESCE(excluded.canonical_key, active_alphas.canonical_key),
+                sharpe=COALESCE(excluded.sharpe, active_alphas.sharpe),
+                fitness=COALESCE(excluded.fitness, active_alphas.fitness),
+                turnover=COALESCE(excluded.turnover, active_alphas.turnover),
+                pnl_ref=COALESCE(excluded.pnl_ref, active_alphas.pnl_ref),
+                last_seen_at=excluded.last_seen_at
+            """,
+            (
+                brain_alpha_id, canonical_key, expression_hash, settings_hash,
+                sharpe, fitness, turnover, pnl_ref, timestamp, timestamp,
+            ),
+        )
+
+    def _upsert_active_from_candidate(
+        self, conn: sqlite3.Connection, brain_alpha_id: str, candidate: Mapping[str, Any]
+    ) -> None:
+        """Copy a candidate's stored identity and metrics into the live-book snapshot."""
+        candidate = dict(candidate)  # sqlite3.Row is not a Mapping but converts cleanly
+        self._upsert_active_alpha_row(
+            conn,
+            brain_alpha_id,
+            canonical_key=str(candidate["canonical_key"]) if candidate.get("canonical_key") else None,
+            expression_hash=str(candidate["expression_hash"]) if candidate.get("expression_hash") else None,
+            settings_hash=str(candidate["settings_hash"]) if candidate.get("settings_hash") else None,
+            sharpe=candidate.get("sharpe"),
+            fitness=candidate.get("fitness"),
+            turnover=candidate.get("turnover"),
+            pnl_ref=None,
+            timestamp=now_iso(),
+        )
 
     def active_alpha_ids(self) -> list[str]:
         return [row["brain_alpha_id"] for row in self._conn.execute(

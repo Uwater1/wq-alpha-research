@@ -235,7 +235,8 @@ def test_submission_queue_is_leased_once(db):
     assert db.active_alpha_ids() == ["A1"]
 
 
-def test_submission_lease_expiry_returns_to_retry(db):
+def test_expired_submission_lease_never_posted_returns_to_ready(db):
+    """A crashed claim that never reached POST is safe to retry immediately (TODO P8)."""
     outcome = db.queue_candidate("rank(close)")
     db.claim_simulation("worker-1")
     db.record_simulation_result(candidate_id=outcome.candidate_id, status="DONE",
@@ -244,7 +245,25 @@ def test_submission_lease_expiry_returns_to_retry(db):
     db.claim_submission("worker-1", lease_seconds=-1)
     recovered = db.recover_expired_leases()
     assert recovered["submissions"] == 1
-    assert db.counts("submissions") == {"RETRY": 1}
+    assert db.counts("submissions") == {"READY": 1}
+
+
+def test_expired_submission_lease_after_post_becomes_reconcilable(db):
+    """Once the POST left the process, BRAIN must be consulted before any retry (TODO P8)."""
+    outcome = db.queue_candidate("rank(close)")
+    db.claim_simulation("worker-1")
+    db.record_simulation_result(candidate_id=outcome.candidate_id, status="DONE",
+                               checks=[{"name": "LOW_SHARPE", "result": "PASS"}], brain_alpha_id="A1")
+    db.enqueue_submission(outcome.candidate_id)
+    claimed = db.claim_submission("worker-1", lease_seconds=-1)
+    db.mark_submission_posted(claimed["id"])
+
+    recovered = db.recover_expired_leases()
+
+    assert recovered["submissions"] == 1
+    assert db.counts("submissions") == {"CHECK_PENDING": 1}
+    row = db.query("SELECT * FROM submissions")[0]
+    assert "reconcile" in row["message"]
 
 
 # ---------------------------------------------------------------------------
