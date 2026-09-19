@@ -1,4 +1,4 @@
-"""Tests for the P3 multi-simulation capability check and REGULAR fallback.
+"""Tests for the multi-simulation capability check and REGULAR fallback.
 
 The verdict itself is recorded from the live platform (see `scripts/multi_sim.py`):
 BRAIN answers `Object with name=MULTI does not exist`, so support must never be

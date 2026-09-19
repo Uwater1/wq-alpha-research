@@ -1,10 +1,10 @@
-"""Submission queue worker (TODO P6).
+"""Submission queue worker.
 
 Simulation workers never submit: a candidate that clears the gates is filed as READY in
 `research.db.submissions`, and this worker drains that queue independently.
 
-    recover + reconcile uncertain rows  -> BRAIN, not the local row, decides a retry (P8)
-    claim a leased READY/RETRY row      -> only one process can own a submission (P8)
+    recover + reconcile uncertain rows  -> BRAIN, not the local row, decides a retry
+    claim a leased READY/RETRY row      -> only one process can own a submission
     re-check the gates                  -> metrics floors, turnover, correlation, not ACTIVE
     POST /alphas/{id}/submit            -> 404 = already submitted, 403/409 = pending
     poll the submit endpoint + status   -> ACTIVE / SELF_CORR_FAIL / PLATFORM_REJECTED
@@ -13,12 +13,12 @@ Simulation workers never submit: a candidate that clears the gates is filed as R
 Ordering is not FIFO: `ranking.submission_priority` scores quality + novelty + portfolio
 diversification, so a family that already owns ACTIVE alphas yields to a fresh idea.
 
-Recovery (TODO P8) is explicit: an expired lease returns to READY only when the POST never
+Recovery is explicit: an expired lease returns to READY only when the POST never
 left the process; after a POST the row is CHECK_PENDING and is reconciled against BRAIN
 before any retry. Transient failures back off automatically and retire as EXHAUSTED once
 their attempt budget is spent, so nothing has to be re-enqueued or deleted by hand.
 
-Local self-correlation (TODO P9) is a real gate: `--require-correlation` syncs the ACTIVE
+Local self-correlation is a real gate: `--require-correlation` syncs the ACTIVE
 book, fetches candidate PnL, checks a fresh local `self_corr` and refuses anything at or
 above the limit; BRAIN's own SELF_CORRELATION check stays the final confirmation.
 
@@ -104,7 +104,7 @@ class SubmissionWorker:
     # -- entry point -------------------------------------------------------
 
     def run(self) -> int:
-        # Recovery first (TODO P8): expired leases, spent attempt budgets, then BRAIN
+        # Recovery first: expired leases, spent attempt budgets, then BRAIN
         # reconciliation of anything whose POST outcome is still unknown.
         recovered = self.db.recover_expired_leases()
         if recovered["submissions"]:
@@ -114,7 +114,7 @@ class SubmissionWorker:
             print(f"[submit] retired {retired} submission(s) past their attempt budget")
         if self.require_correlation:
             # A cached correlation is only fresh relative to a successfully refreshed
-            # ACTIVE book. Hold the whole run when that refresh fails (P9).
+            # ACTIVE book. Hold the whole run when that refresh fails.
             if not self._sync_active_book():
                 return 0
         self.reconcile_pending()
@@ -137,7 +137,7 @@ class SubmissionWorker:
             return None
         return submission
 
-    # -- correlation (TODO P9) ---------------------------------------------
+    # -- correlation -------------------------------------------------------
 
     def correlation_service(self) -> correlation.CorrelationService:
         """Lazily build the local correlation pipeline for this worker."""
@@ -148,7 +148,7 @@ class SubmissionWorker:
         return self._correlation
 
     def _sync_active_book(self) -> bool:
-        """Refresh the ACTIVE book once per run so cached checks are current (TODO P9)."""
+        """Refresh the ACTIVE book once per run so cached checks are current."""
         sync = self.correlation_service().sync_active_book()
         if sync.error:
             print(f"[submit] ACTIVE book sync failed: {sync.error}")
@@ -161,7 +161,7 @@ class SubmissionWorker:
         return True
 
     def _ensure_correlation(self, candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Re-check a stale/missing local correlation immediately before submitting (P9)."""
+        """Re-check a stale/missing local correlation immediately before submitting."""
         if not self.require_correlation:
             return candidate
         result = self.correlation_service().check_candidate(candidate)
@@ -212,7 +212,7 @@ class SubmissionWorker:
     # -- reconciliation ----------------------------------------------------
 
     def reconcile_pending(self) -> int:
-        """Resolve CHECK_PENDING rows against BRAIN before anything is retried (TODO P8).
+        """Resolve CHECK_PENDING rows against BRAIN before anything is retried.
 
         BRAIN is the source of truth after an uncertain POST: ACTIVE and rejected alphas are
         final, a pending check keeps the row reconcilable, and READY is used only when BRAIN
@@ -276,7 +276,7 @@ class SubmissionWorker:
             self.rejected += 1
             return
 
-        # Local correlation is re-checked here, not trusted from an earlier run (TODO P9).
+        # Local correlation is re-checked here, not trusted from an earlier run.
         candidate = self._ensure_correlation(candidate)
         allowed, reasons = self.gate(candidate)
         if not allowed:
@@ -291,13 +291,13 @@ class SubmissionWorker:
 
         alpha_id = str(candidate["brain_alpha_id"])
         # Write-ahead marker: if this process dies during the POST, recovery knows the
-        # outcome is unknown and must be reconciled instead of blindly retried (TODO P8).
+        # outcome is unknown and must be reconciled instead of blindly retried.
         self.db.mark_submission_posted(submission_id)
         outcome = self.client.submit_alpha(alpha_id)
         print(f"[submit] alpha {_mask(alpha_id)}: {outcome['outcome']}")
         if outcome["outcome"] == "uncertain":
             # The POST may have reached BRAIN even though its response was lost. Do not
-            # turn that ambiguity into a retry; reconciliation must decide first (P8).
+            # turn that ambiguity into a retry; reconciliation must decide first.
             self.db.finish_submission(submission_id, "CHECK_PENDING", message=outcome["detail"],
                                       brain_alpha_id=alpha_id)
             return
@@ -371,7 +371,7 @@ class SubmissionWorker:
 
 
 def _self_correlation_verdict(checks: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """Read the SELF_CORRELATION check from a submit payload (TODO P8/P9)."""
+    """Read the SELF_CORRELATION check from a submit payload."""
     check = next((c for c in checks if str(c.get("name", "")).upper() == "SELF_CORRELATION"), None)
     if check is None:
         return {"result": None, "value": None}
@@ -430,9 +430,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lease-seconds", type=float, default=DEFAULT_LEASE_SECONDS,
                         help="how long this worker owns a claimed submission")
     parser.add_argument("--max-submission-attempts", type=int, default=research_db.DEFAULT_SUBMISSION_MAX_ATTEMPTS,
-                        help="retries a submission may spend before it is marked EXHAUSTED (TODO P8)")
+                        help="retries a submission may spend before it is marked EXHAUSTED")
     parser.add_argument("--require-correlation", action="store_true",
-                        help="demand a fresh local self-correlation before submitting (TODO P9)")
+                        help="demand a fresh local self-correlation before submitting")
     parser.add_argument("--correlation-limit", type=float, default=0.7,
                         help="reject a candidate whose |daily-return correlation| is at least this")
     parser.add_argument("--min-sharpe", type=float, default=research_db.IS_THRESHOLDS["sharpe"],

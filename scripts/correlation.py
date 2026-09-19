@@ -1,4 +1,4 @@
-"""Local daily-return self-correlation pipeline (TODO P9).
+"""Local daily-return self-correlation pipeline.
 
 BRAIN's SELF_CORRELATION check is the final word, but it is a black box that only speaks
 once per submission attempt. This module makes the same comparison locally and cheaply so
@@ -308,7 +308,7 @@ class BookSync:
 
 
 class CorrelationService:
-    """Keeps the local ACTIVE book, cached PnL, and per-candidate checks in sync (P9)."""
+    """Keeps the local ACTIVE book, cached PnL, and per-candidate checks in sync."""
 
     def __init__(
         self,
@@ -380,7 +380,7 @@ class CorrelationService:
     # -- candidates --------------------------------------------------------
 
     def check_candidate(self, candidate: Mapping[str, Any], *, force: bool = False) -> CorrelationResult:
-        """Compute (or reuse) a candidate's local self-correlation (TODO P9)."""
+        """Compute (or reuse) a candidate's local self-correlation."""
         candidate_id = int(candidate["id"])
         if not force and str(candidate.get("corr_status") or "") in FRESH_STATUSES \
                 and candidate.get("active_set_version") == self.db.active_set_version():
@@ -392,7 +392,7 @@ class CorrelationService:
         sync = self.sync_active_book()
         if sync.error:
             # Never reuse an old book after a failed refresh: the missing ACTIVE alpha
-            # could be the candidate's closest match (P9).
+            # could be the candidate's closest match.
             return self._record(
                 candidate_id,
                 self.db.active_set_version(),

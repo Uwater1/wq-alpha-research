@@ -1,4 +1,4 @@
-"""Minimal BRAIN HTTP client for the persistent scheduler (TODO P2).
+"""Minimal BRAIN HTTP client for the persistent scheduler.
 
 The legacy `legacy/wq_brain/wq_session.py` helper stays as it is (its scripts and
 tests depend on it); this module is the modern client for the queue-driven pipeline:
@@ -93,7 +93,7 @@ class PollState:
     progress: float | None = None
     alpha_id: str | None = None
     message: str | None = None
-    # Multi-simulation progress reports one entry per child expression (TODO P3).
+    # Multi-simulation progress reports one entry per child expression.
     children: list["PollState"] = field(default_factory=list)
 
 
@@ -174,7 +174,7 @@ class BrainClient:
         return session
 
     def reauthenticate(self) -> None:
-        """Drop the current session and log in again (TODO P2: session expiry)."""
+        """Drop the current session and log in again (session expiry)."""
         self._session = None
         self._session = self.create_session()
 
@@ -266,7 +266,7 @@ class BrainClient:
         )
 
     def submit_multi(self, expressions: list[str], settings: Mapping[str, Any]) -> SimulationHandle:
-        """POST a MULTI simulation (TODO P3); callers must fall back on BrainAPIError."""
+        """POST a MULTI simulation; callers must fall back on BrainAPIError."""
         response = self.post(f"{API_BASE}/simulations", json=simulation_payload(expressions, settings, multi=True))
         location = str(response.headers.get("Location", "")).rstrip("/")
         if not location:
@@ -310,7 +310,7 @@ class BrainClient:
     def alpha_metrics(self, alpha_id: str) -> dict[str, Any]:
         return alpha_metrics(self.alpha(alpha_id))
 
-    # -- submission (TODO P6) ---------------------------------------------
+    # -- submission ---------------------------------------------------
 
     def submit_alpha(self, alpha_id: str) -> dict[str, Any]:
         """Ask BRAIN to submit an alpha.
@@ -357,7 +357,7 @@ class BrainClient:
         except BrainAPIError:
             return None
 
-    # -- ACTIVE portfolio (TODO P9) ---------------------------------------
+    # -- ACTIVE portfolio ------------------------------------------------
 
     def list_active_alphas(self, *, page_size: int = 100, max_pages: int = 200) -> list[dict[str, Any]]:
         """Every ACTIVE alpha on the book, fully paginated.

@@ -1,4 +1,4 @@
-"""Offline tests for the staged-search funnel (TODO P5/P14).
+"""Offline tests for the staged-search funnel (Priority 4 regression coverage).
 
 The funnel only matters when generation volume is real, so the tests check the spending
 decisions: a fresh grid keeps one slot, a failed structure keeps its siblings waiting, a

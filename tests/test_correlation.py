@@ -1,4 +1,4 @@
-"""Offline tests for the local self-correlation pipeline (TODO P9/P14).
+"""Offline tests for the local self-correlation pipeline (Priority 4 regression coverage).
 
 The pipeline is the one place where a wrong answer silently spends a submission slot, so
 these tests pin the failure modes: cumulative curves aligned by position, missing/short/

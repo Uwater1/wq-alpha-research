@@ -1,4 +1,4 @@
-"""Tests for the research state store and canonicalization (TODO P0/P1, P14).
+"""Tests for the research state store and canonicalization (Priority 4 regression coverage).
 
 Nothing here needs credentials or the network: `batch_simulate` is exercised with a
 mocked `run_simulation`, and every store test uses a throwaway research.db.
@@ -103,7 +103,7 @@ def test_skeleton_groups_parameter_grids_without_merging_them():
 
 
 # ---------------------------------------------------------------------------
-# P0: state machine + persistence
+# State machine + persistence
 # ---------------------------------------------------------------------------
 
 
@@ -146,7 +146,7 @@ def test_restart_keeps_state_and_never_resimulates_a_finished_request(db, tmp_pa
     with rdb.ResearchDB.open(tmp_path / "research.db") as reopened:
         replay = reopened.queue_candidate("RANK( close )", {"decay": "4"})
         assert replay.action == "cache_hit"
-        assert replay.status == "SUBMISSION_READY"  # passing work goes to the submission queue (P6)
+        assert replay.status == "SUBMISSION_READY"  # passing work goes to the submission queue
         assert replay.cached["brain_alpha_id"] == "A1"
         assert replay.cached["sharpe"] == 1.6
         assert reopened.claim_simulation("worker-2") is None  # nothing left to simulate
@@ -213,7 +213,7 @@ def test_near_duplicates_are_flagged_not_merged(db):
 
 
 # ---------------------------------------------------------------------------
-# P0: submission primitives (P6/P8 build on these)
+# Submission primitives
 # ---------------------------------------------------------------------------
 
 
@@ -236,7 +236,7 @@ def test_submission_queue_is_leased_once(db):
 
 
 def test_expired_submission_lease_never_posted_returns_to_ready(db):
-    """A crashed claim that never reached POST is safe to retry immediately (TODO P8)."""
+    """A crashed claim that never reached POST is safe to retry immediately."""
     outcome = db.queue_candidate("rank(close)")
     db.claim_simulation("worker-1")
     db.record_simulation_result(candidate_id=outcome.candidate_id, status="DONE",
@@ -249,7 +249,7 @@ def test_expired_submission_lease_never_posted_returns_to_ready(db):
 
 
 def test_expired_submission_lease_after_post_becomes_reconcilable(db):
-    """Once the POST left the process, BRAIN must be consulted before any retry (TODO P8)."""
+    """Once the POST left the process, BRAIN must be consulted before any retry."""
     outcome = db.queue_candidate("rank(close)")
     db.claim_simulation("worker-1")
     db.record_simulation_result(candidate_id=outcome.candidate_id, status="DONE",

@@ -17,7 +17,7 @@ Behavior:
     - One thread per worker (default 3 = BRAIN's concurrent simulation limit).
     - Every completed simulation is appended to data/results_<timestamp>.csv
       immediately, so a Ctrl-C never loses finished work.
-    - With the local store (default: <repo root>/research.db, TODO P0/P1) each row is
+    - With the local store (default: <repo root>/research.db) each row is
       normalized and keyed before submission: an exact completed request is served
       from cache and never re-sent to BRAIN, a request another process is already
       running is skipped, and each result is committed to SQLite the moment it lands.
@@ -364,7 +364,7 @@ def main() -> int:
             if recovered["simulations"] or recovered["submissions"]:
                 logging.info(f"recovered expired leases: {recovered}")
 
-    # ---- P1: normalize + dedup + cache check before spending BRAIN capacity ----
+    # ---- normalize + dedup + cache check before spending BRAIN capacity ----
     invalid: list[str] = []
     pending: list[dict] = []
     candidate_ids: dict[str, int] = {}
@@ -443,7 +443,7 @@ def main() -> int:
             key = sim_signature(result)
             if store is not None:
                 # Commit to SQLite first: an interrupt anywhere after this point can no
-                # longer lose the result or force BRAIN to redo it (TODO P0/P1).
+                # longer lose the result or force BRAIN to redo it.
                 record_result_in_store(store, result, candidate_ids, args.retry_delay)
             if "error" in result:
                 failed[key] = result  # last attempt for this row wins

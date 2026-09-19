@@ -1,4 +1,4 @@
-"""Successive halving for parameter variants (TODO P5, and the diversity gate of P4.3).
+"""Successive halving for parameter variants (plus the diversity gate).
 
 The expensive habit this replaces is queueing a whole grid at once:
 

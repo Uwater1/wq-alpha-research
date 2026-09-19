@@ -49,7 +49,7 @@ HEADERS = {
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-# Shared pure PnL/correlation logic (TODO P9). The reusable pieces live in
+# Shared pure PnL/correlation logic. The reusable pieces live in
 # scripts/correlation.py; this module keeps its session-based fetchers and re-exports
 # these names so the legacy reporting path and its tests keep working unchanged.
 from correlation import (  # noqa: E402
@@ -167,7 +167,7 @@ def fetch_pnl_series(session: requests.Session, alpha_id: str) -> tuple[list[str
 
     Returns ([], []) when the recordset is genuinely empty, but otherwise says *why*
     on stderr: a silent empty return here used to disable the correlation check with
-    nothing to show for it. Parsing is shared with scripts/correlation.py (TODO P9).
+    nothing to show for it. Parsing is shared with scripts/correlation.py.
     """
     try:
         resp = get_with_retry(

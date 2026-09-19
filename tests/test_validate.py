@@ -1,4 +1,4 @@
-"""Tests for static pre-screening (TODO P4.1/P4.2).
+"""Tests for static pre-screening.
 
 The point of these checks is to save BRAIN capacity, so the tests assert both sides:
 provably-broken candidates are refused, and plausible-but-suspicious ones are only

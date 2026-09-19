@@ -1,4 +1,4 @@
-"""Local research state store: ``research.db`` (TODO P0) + simulation cache (TODO P1).
+"""Local research state store: ``research.db`` + simulation cache.
 
 One SQLite file is the single source of truth for the pipeline:
 
@@ -8,12 +8,12 @@ One SQLite file is the single source of truth for the pipeline:
     active_alphas  ACTIVE portfolio snapshot + correlation bookkeeping
     events         append-only audit trail of every state transition
 
-State machine (TODO P0):
+State machine:
 
     GENERATED -> VALIDATED -> QUEUED -> SIMULATING -> SIMULATED -> IS_PASS
     -> CORR_PASS -> SUBMISSION_READY -> SUBMITTING -> ACTIVE / REJECTED / RETRY
 
-Submission rows have their own recovery contract (TODO P8):
+Submission rows have their own recovery contract:
 
     READY -POST-> SUBMITTING -ACTIVE-> ACTIVE | -chec-> CHECK_PENDING | -fail-> RETRY
     RETRY backs off and is claimable again until its attempt budget is spent (EXHAUSTED).
@@ -25,7 +25,7 @@ Submission rows have their own recovery contract (TODO P8):
 "has BRAIN already computed this exact request". A cache hit therefore replays
 metrics without ever calling BRAIN.
 
-Dedup policy before simulating (TODO P1):
+Dedup policy before simulating:
 
     cached DONE            -> action "cache_hit"       (reuse, no BRAIN call)
     QUEUED / RUNNING       -> action "in_flight"       (another process owns it)
@@ -72,7 +72,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = REPO_ROOT / "research.db"
 DB_ENV_VAR = "WQ_RESEARCH_DB"
 
-#: meta key holding the monotonic version of the local ACTIVE snapshot (TODO P9).
+#: meta key holding the monotonic version of the local ACTIVE snapshot.
 META_ACTIVE_SET_VERSION = "active_set_version"
 
 SCHEMA_VERSION = 3
@@ -83,13 +83,13 @@ ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
     "candidates": (
         "structural_json TEXT",
         "gate_reason TEXT",
-        # TODO P9: local self-correlation bookkeeping (see scripts/correlation.py).
+        # local self-correlation bookkeeping (see scripts/correlation.py).
         "max_corr_alpha_id TEXT",
         "corr_checked_at TEXT",
         "active_set_version INTEGER",
         "corr_status TEXT",
     ),
-    # TODO P8: `post_attempted_at` is the write-ahead marker that separates "never POSTed"
+    # `post_attempted_at` is the write-ahead marker that separates "never POSTed"
     # from "POST outcome unknown" after a crash; `last_error` keeps the last reconcile note.
     "submissions": ("post_attempted_at TEXT", "last_error TEXT"),
 }
@@ -146,7 +146,7 @@ SUBMISSION_STATUSES: tuple[str, ...] = (
 # Terminal submission states: an expired lease on these is not "recoverable work".
 FINAL_SUBMISSION_STATUSES = frozenset({"ACTIVE", "SELF_CORR_FAIL", "PLATFORM_REJECTED", "EXHAUSTED"})
 
-# TODO P8: retry policy for the submission queue. Attempt N waits base * 2**(N-1) seconds
+# Retry policy for the submission queue. Attempt N waits base * 2**(N-1) seconds
 # (capped); once the attempt budget is spent the row becomes EXHAUSTED instead of looping.
 DEFAULT_SUBMISSION_MAX_ATTEMPTS = 5
 SUBMISSION_BACKOFF_BASE_SECONDS = 30.0
@@ -316,7 +316,7 @@ SCHEMA: tuple[str, ...] = (
         updated_at     TEXT NOT NULL
     )
     """,
-    # TODO P5: per-structure search budget + lineage evidence for the staged funnel.
+    # Per-structure search budget + lineage evidence for the staged funnel.
     """
     CREATE TABLE IF NOT EXISTS structure_budget (
         skeleton_hash TEXT PRIMARY KEY,
@@ -367,7 +367,7 @@ def is_expired(timestamp: str | None, reference: str | None = None) -> bool:
 
 
 def _structural_payload(report: Any) -> str | None:
-    """Structural features + validation warnings for the row (TODO P4.2 / P11 features)."""
+    """Structural features + validation warnings for the row."""
     if report is None:
         return None
     return json.dumps(report.as_dict(), sort_keys=True, default=str)
@@ -382,7 +382,7 @@ def candidate_settings(row: Mapping[str, Any]) -> dict[str, Any]:
     """Normalized settings of a stored candidate, read from ``settings_json``.
 
     A candidate row carries no per-setting columns, so `settings_from_row` would silently
-    return defaults and give a non-default request the wrong canonical identity (TODO P8.3).
+    return defaults and give a non-default request the wrong canonical identity.
     """
     raw = row.get("settings_json")
     if not raw:
@@ -465,7 +465,7 @@ class QueueOutcome:
 
 @dataclass
 class StatusReport:
-    """Aggregated counters for the observability CLI (TODO P13 groundwork)."""
+    """Aggregated counters for the observability CLI (Priority 3 groundwork)."""
 
     candidates: dict[str, int] = field(default_factory=dict)
     simulations: dict[str, int] = field(default_factory=dict)
@@ -607,7 +607,7 @@ class ResearchDB:
     ) -> QueueOutcome:
         """Register a candidate and decide whether it still needs BRAIN capacity.
 
-        The candidate is screened locally first (TODO P4.1): a request BRAIN would reject
+        The candidate is screened locally first: a request BRAIN would reject
         is filed as REJECTED with the reason instead of spending a simulation slot. Warnings
         are stored as structural features and only cost priority.
         """
@@ -1026,7 +1026,7 @@ class ResearchDB:
         """Move RETRY candidates whose backoff window elapsed back to QUEUED.
 
         Turns a transient BRAIN failure into work the scheduler picks up again, while
-        a candidate that keeps failing stops consuming slots (TODO P2 retry policy).
+        a candidate that keeps failing stops consuming slots (retry policy).
         """
         timestamp = now_iso()
         requeued: list[int] = []
@@ -1056,7 +1056,7 @@ class ResearchDB:
     def list_queued(self, limit: int | None = None, *, due_only: bool = False) -> list[dict[str, Any]]:
         """Candidates waiting for a simulation slot, priority-first.
 
-        ``due_only`` excludes candidates the successive-halving gate deferred (TODO P5):
+        ``due_only`` excludes candidates the successive-halving gate deferred:
         they stay QUEUED but are not claimable until their base signal reports or the
         deferral horizon passes.
         """
@@ -1070,7 +1070,7 @@ class ResearchDB:
         return [dict(row) for row in self._conn.execute(sql, params)]
 
     def defer_candidate(self, candidate_id: int, reason: str, until: str | None) -> None:
-        """Hold a candidate back (P5) without leaving the QUEUED lifecycle."""
+        """Hold a candidate back without leaving the QUEUED lifecycle."""
         with self._tx() as conn:
             conn.execute(
                 "UPDATE candidates SET next_attempt_at=?, gate_reason=?, updated_at=? WHERE id=? AND status='QUEUED'",
@@ -1099,7 +1099,7 @@ class ResearchDB:
         return promoted
 
     def record_structure_budget(self, entries: Iterable[Mapping[str, Any]]) -> int:
-        """Persist per-structure search budget and lineage evidence (TODO P5).
+        """Persist per-structure search budget and lineage evidence.
 
         This is the funnel's memory: how many simulations a structure spent, how many
         passed, how many variants it was allowed, and whether it is expanding or stopped.
@@ -1132,13 +1132,13 @@ class ResearchDB:
         return len(rows)
 
     def structure_budgets(self) -> list[dict[str, Any]]:
-        """Stored per-structure budget/lineage rows, most-attempted first (TODO P5)."""
+        """Stored per-structure budget/lineage rows, most-attempted first."""
         return [dict(row) for row in self._conn.execute(
             "SELECT * FROM structure_budget ORDER BY attempts DESC, skeleton_hash"
         )]
 
     def skeleton_outcomes(self) -> dict[str, dict[str, int]]:
-        """Per-skeleton evidence: attempted simulations and passing members (TODO P5)."""
+        """Per-skeleton evidence: attempted simulations and passing members."""
         rows = self._conn.execute(
             """
             SELECT COALESCE(skeleton_hash, '') AS skeleton,
@@ -1178,7 +1178,7 @@ class ResearchDB:
         priority: float,
         reasons: Mapping[str, Any] | None = None,
     ) -> None:
-        """Persist the ranking components (TODO P10), not only the final score."""
+        """Persist the ranking components, not only the final score."""
         timestamp = now_iso()
         with self._tx() as conn:
             conn.execute(
@@ -1211,7 +1211,7 @@ class ResearchDB:
     ) -> dict[str, Any] | None:
         """Persist one finished simulation; DONE results are cached and IS-gated.
 
-        Called the moment a result lands so an interrupt cannot lose it (TODO P0).
+        Called the moment a result lands so an interrupt cannot lose it.
         """
         if status not in SIMULATION_STATUSES:
             raise ValueError(f"unknown simulation status: {status}")
@@ -1294,17 +1294,17 @@ class ResearchDB:
 
         candidate = self.get_candidate(int(row["id"]))
         if status == "DONE" and passed:
-            # TODO P6: a candidate that clears the IS gate joins the submission queue.
+            # A candidate that clears the IS gate joins the submission queue.
             self.auto_enqueue_submission(int(row["id"]), candidate)
         return candidate
 
     def recover_expired_leases(self, lease_seconds: float | None = None) -> dict[str, int]:
-        """Reclaim work left behind by a killed process (TODO P0/P8).
+        """Reclaim work left behind by a killed process.
 
         An expired SIMULATING lease becomes RETRY. An expired SUBMITTING lease is different:
         if the POST had already left the process (`post_attempted_at` set) the row becomes
         CHECK_PENDING, i.e. it must be reconciled against BRAIN before any retry; only a
-        lease that never reached the POST returns to READY for a normal retry (TODO P8).
+        lease that never reached the POST returns to READY for a normal retry.
         """
         reference = now_iso()
         recovered = {"simulations": 0, "submissions": 0}
@@ -1350,7 +1350,7 @@ class ResearchDB:
         return recovered
 
     def auto_enqueue_submission(self, candidate_id: int, candidate: Mapping[str, Any] | None = None) -> int | None:
-        """Move a passing candidate into the submission queue, or record why not (P6)."""
+        """Move a passing candidate into the submission queue, or record why not."""
         candidate = candidate or self.get_candidate(candidate_id)
         if candidate is None:
             return None
@@ -1381,7 +1381,7 @@ class ResearchDB:
             keys.add(str(row["canonical_key"]))
         return keys
 
-    # -- submissions (TODO P6/P8 build on these primitives) ----------------
+    # -- submissions (build on these primitives) ---------------------------
 
     def enqueue_submission(self, candidate_id: int, *, priority: float | None = None) -> int:
         """Queue a candidate for submission; reuses the open row instead of duplicating it."""
@@ -1392,7 +1392,7 @@ class ResearchDB:
                 raise KeyError(f"candidate {candidate_id} not found")
             if candidate["status"] != "SUBMISSION_READY":
                 self._set_status(conn, candidate, "SUBMISSION_READY", timestamp)
-            # One open submission row per candidate (TODO P8): a terminal row is history, any
+            # One open submission row per candidate: a terminal row is history, any
             # other row is reused so RETRY/CHECK_PENDING work is never duplicated.
             terminal = sorted(FINAL_SUBMISSION_STATUSES)
             placeholders = ",".join("?" for _ in terminal)
@@ -1431,7 +1431,7 @@ class ResearchDB:
         max_attempts: int = DEFAULT_SUBMISSION_MAX_ATTEMPTS,
         ready_only: bool = False,
     ) -> dict[str, Any] | None:
-        """Lease the highest-priority claimable submission (the P8 anti-duplicate lock).
+        """Lease the highest-priority claimable submission (the anti-duplicate lock).
 
         READY rows and RETRY rows whose backoff window elapsed are both claimable: a
         transient failure must retry automatically instead of waiting for manual enqueue.
@@ -1479,7 +1479,7 @@ class ResearchDB:
         max_attempts: int | None = None,
         retry_delay: float | None = None,
     ) -> None:
-        """Record a submission outcome and mirror it onto the candidate (TODO P8).
+        """Record a submission outcome and mirror it onto the candidate.
 
         ``RETRY`` gets an explicit backoff window derived from the attempt count and turns
         into ``EXHAUSTED`` once the budget is spent, so transient failures retry on their
@@ -1528,7 +1528,7 @@ class ResearchDB:
                 alpha_id = brain_alpha_id or (candidate["brain_alpha_id"] if candidate is not None else None)
                 if alpha_id and candidate is not None:
                     # Identity comes from the stored candidate row, never a reconstruction from
-                    # defaults: non-default settings must keep their canonical key (TODO P8.3).
+                    # defaults: non-default settings must keep their canonical key.
                     self._upsert_active_from_candidate(conn, str(alpha_id), candidate)
 
     def _apply_candidate_submission_status(
@@ -1568,7 +1568,7 @@ class ResearchDB:
         )
 
     def expire_exhausted_submissions(self, max_attempts: int = DEFAULT_SUBMISSION_MAX_ATTEMPTS) -> int:
-        """Retire RETRY rows that already spent their attempt budget (TODO P8).
+        """Retire RETRY rows that already spent their attempt budget.
 
         A safety net for rows written before the retry policy existed; new rows become
         EXHAUSTED inside `finish_submission`.
@@ -1591,7 +1591,7 @@ class ResearchDB:
                 expired += 1
         return expired
 
-    # -- ACTIVE portfolio snapshot (TODO P9) -------------------------------
+    # -- ACTIVE portfolio snapshot -----------------------------------------
 
     def upsert_active_alpha(
         self,
@@ -1612,7 +1612,7 @@ class ResearchDB:
 
         Callers holding a stored candidate row should pass its canonical identity and
         ``settings_json`` explicitly; recomputing from absent columns would silently
-        produce a default-settings key (TODO P8.3).
+        produce a default-settings key.
         """
         if expression is not None and canonical_key is None:
             canonical_key = canonical.canonical_key(expression, settings)
@@ -1638,7 +1638,7 @@ class ResearchDB:
                 pnl_ref=pnl_ref,
                 timestamp=timestamp,
             )
-            if added:  # a membership change invalidates cached correlation checks (P9)
+            if added:  # a membership change invalidates cached correlation checks
                 self.bump_active_set_version(conn)
             if owned:
                 conn.execute("COMMIT")
@@ -1711,14 +1711,14 @@ class ResearchDB:
         )]
 
     def active_set_version(self) -> int:
-        """Monotonic version of the ACTIVE book; cached correlation checks pin this (P9)."""
+        """Monotonic version of the ACTIVE book; cached correlation checks pin this."""
         try:
             return int(self.get_meta(META_ACTIVE_SET_VERSION) or 0)
         except (TypeError, ValueError):
             return 0
 
     def bump_active_set_version(self, conn: sqlite3.Connection | None = None) -> int:
-        """Increment the ACTIVE version after a membership change (TODO P9)."""
+        """Increment the ACTIVE version after a membership change."""
         version = self.active_set_version() + 1
         sql = "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
         params = (META_ACTIVE_SET_VERSION, str(version))
@@ -1732,7 +1732,7 @@ class ResearchDB:
         return version
 
     def sync_active_set(self, alpha_ids: Iterable[str]) -> dict[str, int]:
-        """Reconcile the local snapshot with the platform ACTIVE book (TODO P9).
+        """Reconcile the local snapshot with the platform ACTIVE book.
 
         New ids are recorded and any membership change bumps the version, which is what
         makes every previously cached correlation check stale. Ids that disappeared from
@@ -1753,7 +1753,7 @@ class ResearchDB:
         return {"added": len(added), "removed": len(removed), "version": version, "total": len(remote)}
 
     def cache_active_pnl(self, brain_alpha_id: str, dates: Sequence[str], values: Sequence[float]) -> None:
-        """Cache an ACTIVE alpha's daily PnL series locally (TODO P9)."""
+        """Cache an ACTIVE alpha's daily PnL series locally."""
         timestamp = now_iso()
         with self._tx() as conn:
             conn.execute(
@@ -1792,7 +1792,7 @@ class ResearchDB:
         status: str = "ok",
         checked_at: str | None = None,
     ) -> None:
-        """Store the local self-correlation result for a candidate (TODO P9).
+        """Store the local self-correlation result for a candidate.
 
         ``status`` records *why* a check is unusable (unavailable PnL, too little overlap,
         a flat series, an incomplete book) so the gate can hold the candidate explicitly
@@ -1812,7 +1812,7 @@ class ResearchDB:
             )
 
     def mark_stale_correlations(self) -> int:
-        """Flag cached checks whose ACTIVE version is no longer current (TODO P9)."""
+        """Flag cached checks whose ACTIVE version is no longer current."""
         version = self.active_set_version()
         timestamp = now_iso()
         with self._tx() as conn:
@@ -1824,7 +1824,7 @@ class ResearchDB:
             return int(cursor.rowcount or 0)
 
     def correlation_status(self) -> dict[str, Any]:
-        """Observability for the local correlation pipeline (TODO P9/P13)."""
+        """Observability for the local correlation pipeline (Priority 3)."""
         counts = {str(row["value"]): int(row["n"]) for row in self._conn.execute(
             "SELECT COALESCE(corr_status,'unchecked') AS value, COUNT(*) AS n FROM candidates GROUP BY corr_status"
         )}
@@ -1865,7 +1865,7 @@ class ResearchDB:
         return {str(row["value"]): int(row["n"]) for row in rows}
 
     def stats(self, *, window_hours: float = 24.0) -> StatusReport:
-        """Throughput snapshot (TODO P13): counts plus generated/simulated per hour."""
+        """Throughput snapshot: counts plus generated/simulated per hour."""
         since = plus_seconds_iso(-3600.0 * window_hours)
         report = StatusReport(
             candidates=self.counts("candidates"),
@@ -1893,7 +1893,7 @@ def correlation_reasons(
     limit: float = 0.7,
     active_set_version: int | None = None,
 ) -> list[str]:
-    """Why a candidate's local self-correlation does not clear the gate (TODO P9).
+    """Why a candidate's local self-correlation does not clear the gate.
 
     A missing number is never treated as "low correlation": every unusable state names
     itself (unavailable, insufficient, degenerate, incomplete, stale) so the candidate is
@@ -1930,7 +1930,7 @@ def submission_gate(
     correlation_limit: float = 0.7,
     active_set_version: int | None = None,
 ) -> tuple[bool, list[str]]:
-    """Submission gates (TODO P6/P9): metrics floors, no duplicate ACTIVE alpha, local corr."""
+    """Submission gates: metrics floors, no duplicate ACTIVE alpha, local corr."""
     limits = {**IS_THRESHOLDS, **(thresholds or {})}
     reasons: list[str] = []
     sharpe = candidate.get("sharpe")

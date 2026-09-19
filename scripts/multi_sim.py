@@ -1,6 +1,6 @@
-"""BRAIN multi-simulation capability check (TODO P3).
+"""BRAIN multi-simulation capability check.
 
-P3 asks for automatic detection, packing, and a REGULAR fallback. Detection was run
+Multi-simulation would need automatic detection, packing, and a REGULAR fallback. Detection was run
 against the live API and the answer for this platform/account is **no**:
 
     POST /simulations  {"type": "MULTI", "settings": {...}, "regular": ["rank(close)", "rank(open)"]}
@@ -12,7 +12,7 @@ So the only simulation type is REGULAR with a single expression string, the thre
 REGULAR scheduler in `scripts/sim_scheduler.py` is the whole capacity story, and no
 packing code is shipped for an endpoint that rejects it. This module keeps the check
 reproducible (and cached in `research.db.meta`) because platform tiers and features do
-change: if `--probe` ever reports support, P3 packing becomes a real project again.
+change: if `--probe` ever reports support, multi-simulation packing becomes a real project again.
 
 Usage:
     ./.venv/bin/python scripts/multi_sim.py --status   # cached result, no network

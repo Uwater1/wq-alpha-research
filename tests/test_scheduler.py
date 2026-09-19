@@ -1,4 +1,4 @@
-"""Tests for the persistent simulation scheduler and candidate ranking (TODO P2).
+"""Tests for the persistent simulation scheduler and candidate ranking.
 
 A fake BRAIN client and a fake clock keep these tests instant, offline, and
 deterministic: no credentials, no network, no real waiting.
@@ -158,7 +158,7 @@ def test_scheduler_keeps_slots_busy_and_refills_immediately(db):
     assert scheduler.submitted == 5
     assert scheduler.completed == 5
     assert scheduler.inflight == {}
-    # A passing candidate lands in the submission queue (TODO P6), not just IS_PASS.
+    # A passing candidate lands in the submission queue, not just IS_PASS.
     assert db.counts("candidates") == {"SUBMISSION_READY": 5}
     assert db.counts("simulations") == {"DONE": 5}
     assert db.counts("submissions") == {"READY": 5}

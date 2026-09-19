@@ -1,4 +1,4 @@
-"""Staged search funnel (TODO P5).
+"""Staged search funnel.
 
 `successive_halving` already lets one representative variant of a structure run before its
 siblings. This module closes the remaining hole: with three BRAIN slots and a freshly
@@ -20,7 +20,7 @@ once a structure has passed, and zero otherwise, so it adapts to whatever the ge
 actually produces. Lineage (parent/generation/mutation) already lives on the candidates;
 this module adds the per-structure budget ledger in `research_db.structure_budget`.
 
-Deferral reuses the P5 deferral fields (`next_attempt_at` + `gate_reason`), so a deferred
+Deferral reuses the variant-gate deferral fields (`next_attempt_at` + `gate_reason`), so a deferred
 variant stays QUEUED and claimable *later*; the staged horizon is only a safety valve so a
 deferred idea is never lost. Turning the funnel off (`--no-staged`) restores the plain
 representative-variant behaviour.
@@ -287,7 +287,7 @@ def status(db: research_db.ResearchDB) -> dict[str, Any]:
 
 
 def lineage(db: research_db.ResearchDB) -> list[dict[str, Any]]:
-    """Per-family search spend, combining the budget ledger with candidate lineage (P5)."""
+    """Per-family search spend, combining the budget ledger with candidate lineage."""
     return db.query(
         """
         SELECT COALESCE(signal_family, '') AS family,

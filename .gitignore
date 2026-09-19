@@ -6,7 +6,7 @@ alpha_db.json
 batch_submit_results.json
 credentials.json
 
-# local research state store (TODO P0/P1) — account-linked, never publish
+# local research state store — account-linked, never publish
 research.db
 research.db-wal
 research.db-shm

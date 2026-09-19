@@ -1,4 +1,4 @@
-"""Tests for the P5 variant gate and the P6 submission queue worker.
+"""Tests for the variant gate and the submission queue worker.
 
 Both features exist to change what the pipeline spends capacity on, so the tests check
 the spending decisions: an unproven structure gets one slot at a time, a proven one gets
@@ -272,7 +272,7 @@ def test_worker_submits_a_ready_candidate_and_confirms_active(db):
     assert db.counts("submissions") == {"ACTIVE": 1}
     assert db.get_candidate(candidate["id"])["status"] == "ACTIVE"
     assert db.active_alpha_ids() == [candidate["brain_alpha_id"]]
-    # The live-book snapshot must be complete, not just an id: P9 re-checks correlation against it.
+    # The live-book snapshot must be complete, not just an id: correlation is re-checked against it.
     active = db.query("SELECT * FROM active_alphas WHERE brain_alpha_id=?", (candidate["brain_alpha_id"],))[0]
     assert active["canonical_key"] == candidate["canonical_key"]
     assert active["sharpe"] == 1.6 and active["fitness"] == 1.3

@@ -1,4 +1,4 @@
-"""Persistent BRAIN simulation scheduler (TODO P2).
+"""Persistent BRAIN simulation scheduler.
 
 Replaces the one-shot `ThreadPoolExecutor` batch loop with a dispatcher that:
 
@@ -13,12 +13,12 @@ Replaces the one-shot `ThreadPoolExecutor` batch loop with a dispatcher that:
       research.db), so a restart resumes work instead of losing it;
     * budgets each structure's variant search once the queue is large enough, so a
       parameter grid cannot monopolize all three slots before its base signal proves
-      useful (TODO P5);
+       useful (variant gate);
     * writes every state transition to research.db — a crash never loses queue state.
 
 Priority is not FIFO: candidates are scored by `scripts/ranking.py`
 (quality + novelty + information gain + family diversity - duplicate penalty -
-failure risk) and the components are persisted for later model training (P10/P11).
+failure risk) and the components are persisted for later model training (Priority 2).
 
 Usage:
     ./.venv/bin/python scripts/sim_scheduler.py                  # drain the queue
@@ -176,7 +176,7 @@ class SimulationScheduler:
         return delay
 
     def review_halving(self) -> dict[str, int]:
-        """Apply the P5 variant gate; called at start and after every verdict."""
+        """Apply the variant gate; called at start and after every verdict."""
         if not self.halving:
             return {"promoted_total": 0, "promoted_proven": 0, "promoted_horizon": 0, "deferred": 0,
                     "blocked_structures": 0, "waiting": 0}
@@ -185,7 +185,7 @@ class SimulationScheduler:
         )
 
     def review_staged(self) -> dict[str, Any]:
-        """Apply the volume-gated staged-search funnel (TODO P5); no-op below the threshold."""
+        """Apply the volume-gated staged-search funnel; no-op below the threshold."""
         if not self.staged_search_enabled():
             return {"engaged": False, "queued": 0, "structures": 0, "deferred": 0, "promoted": 0,
                     "stopped": 0, "budget_rows": 0}
@@ -331,7 +331,7 @@ class SimulationScheduler:
     # -- restart support ---------------------------------------------------
 
     def adopt_running(self) -> int:
-        """Pick up simulations a previous process left running (TODO P2 recovery)."""
+        """Pick up simulations a previous process left running."""
         now = self._clock()
         for row in self.db.running_simulations():
             candidate_id = int(row["id"])
@@ -455,7 +455,7 @@ class SimulationScheduler:
         )
         self.completed += 1
         # A verdict just landed: the structure is either proven (siblings promote now) or
-        # unproven (siblings keep waiting), which is exactly what the P5 gate tracks.
+        # unproven (siblings keep waiting), which is exactly what the variant gate tracks.
         self.review_halving()
         self.review_staged()
         status = (candidate or {}).get("status", "?")
@@ -513,13 +513,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-simulations", type=int, help="stop after this many completed simulations")
     parser.add_argument("--once", action="store_true", help="single fill+poll pass (cron/worker style)")
     parser.add_argument("--no-halving", action="store_true",
-                        help="disable the successive-halving variant gate (TODO P5)")
+                        help="disable the successive-halving variant gate")
     parser.add_argument("--early-attempts", type=int, default=successive_halving.DEFAULT_EARLY_ATTEMPTS,
                         help="simulations a structure may spend before its variants wait")
     parser.add_argument("--variant-horizon", type=float, default=successive_halving.DEFAULT_HORIZON_MINUTES,
                         help="minutes a deferred variant waits before automatic release")
     parser.add_argument("--no-staged", action="store_true",
-                        help="disable the volume-gated staged-search funnel (TODO P5)")
+                        help="disable the volume-gated staged-search funnel")
     parser.add_argument("--staged-threshold", type=int, default=staged_search.DEFAULT_VOLUME_THRESHOLD,
                         help="queued candidates required before staged expansion engages")
     parser.add_argument("--staged-max-variants", type=int, default=staged_search.DEFAULT_MAX_VARIANTS,

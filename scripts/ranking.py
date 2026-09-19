@@ -1,11 +1,11 @@
-"""Candidate ranking for the simulation scheduler (TODO P2 score, TODO P10 storage).
+"""Candidate ranking for the simulation scheduler.
 
-    priority = expected_quality + novelty + information_gain
+priority = expected_quality + novelty + information_gain
              + family_diversity - duplicate_penalty - failure_risk
              + queue_priority
 
 Every component is stored on the candidate row, not just the total, so the same
-numbers can later train a surrogate model (TODO P11/P12).
+numbers can later train a surrogate model (Priority 2).
 
 The heuristics are the ones `SKILL.md` already encodes as rules of thumb (fundamental
 signals and group normalization are the strongest starting points, deep nesting and
@@ -26,7 +26,7 @@ from typing import Any, Mapping
 
 import canonical
 
-# Weights kept in one place so P10/P11 can tune them without touching the logic.
+# Weights kept in one place so the surrogate work can tune them without touching the logic.
 WEIGHTS: dict[str, float] = {
     "expected_quality": 1.0,
     "novelty": 1.0,
@@ -219,7 +219,7 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
 
 
 def submission_priority(row: Mapping[str, Any], context: RankingContext) -> Score:
-    """Order the submission queue (TODO P6): quality + novelty + portfolio diversification.
+    """Order the submission queue: quality + novelty + portfolio diversification.
 
     A family that already owns ACTIVE alphas scores lower, so the queue spreads across
     economic ideas instead of stacking near-clones of the same signal.

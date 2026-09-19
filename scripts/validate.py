@@ -1,4 +1,4 @@
-"""Static pre-screening of candidates before they can spend a BRAIN slot (TODO P4).
+"""Static pre-screening of candidates before they can spend a BRAIN slot.
 
 BRAIN charges 1-3 minutes of platform time for a request it will reject anyway, so the
 cheapest capacity win is refusing provably-broken work locally. This module checks an
@@ -7,7 +7,7 @@ expression and its settings against the local references:
     references/wq_operators.json                    66 operators with signatures
     references/wq_usa_top3000_delay1_data_fields.json 4,367 fields, USA TOP3000 delay 1
 
-Severity split (P4.1 rejects, P4.2 only flags):
+Severity split (errors reject, warnings only flag):
 
     errors    malformed structure, an operator that does not exist, wrong argument
               count, invalid settings values, and a field that is unknown *inside the
@@ -15,7 +15,7 @@ Severity split (P4.1 rejects, P4.2 only flags):
     warnings  everything that depends on catalog freshness or on judgement: a field
               used outside the catalog scope, a vector field that was not aggregated
               with vec_avg/vec_sum, an unknown keyword, deep nesting. Warnings lower a
-              candidate's priority instead of rejecting it, exactly as P4.2 asks.
+               candidate's priority instead of rejecting it, exactly as designed.
 
 Field checks only fire when the requested region/universe/delay is the scope the
 snapshot covers (USA/TOP3000/delay 1); for any other scope unknown names are warnings,
@@ -89,7 +89,7 @@ class OperatorSpec:
 
 @dataclass
 class ValidationReport:
-    """Outcome of a static check, plus the structural features worth storing (P4.2)."""
+    """Outcome of a static check, plus the structural features worth storing."""
 
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -263,7 +263,7 @@ def _closest(field: str, known: Iterable[str]) -> str | None:
 
 
 def validate_settings(settings: Mapping[str, Any] | None) -> list[str]:
-    """Errors for settings BRAIN cannot accept (P4.1 'impossible settings')."""
+    """Errors for settings BRAIN cannot accept ('impossible settings')."""
     errors: list[str] = []
     try:
         normalized = canonical.normalize_settings(settings)

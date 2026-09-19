@@ -1,4 +1,4 @@
-"""Canonicalization of BRAIN simulation requests (TODO P1).
+"""Canonicalization of BRAIN simulation requests.
 
 Two requests that would make BRAIN do the same work must hash to the same key,
 so the local store can serve one of them from cache and never simulate it twice.
@@ -379,7 +379,7 @@ def operators_of(expression: Any) -> tuple[str, ...]:
 
 
 def structural_features(expression: Any) -> dict[str, Any]:
-    """Cheap structural features (TODO P4.2 / P10 features, recorded per candidate)."""
+    """Cheap structural features (recorded per candidate for validation and ranking)."""
     text = str(expression or "")
     return {
         "fields": list(fields_of(text)),

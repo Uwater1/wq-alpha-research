@@ -1,4 +1,4 @@
-"""Offline tests for submission idempotency and recovery (TODO P8/P14).
+"""Offline tests for submission idempotency and recovery (Priority 4 regression coverage).
 
 The scenarios are the ones that used to require hand-editing research.db: a crash
 immediately before the POST, a crash immediately after it, a run that times out with
@@ -354,7 +354,7 @@ def test_restart_after_crash_does_not_duplicate_work(db):
 
 
 def test_active_identity_uses_stored_settings_not_reconstructed_defaults(db):
-    """Regression for P8.3: non-default settings must keep their canonical key."""
+    """Regression: non-default settings must keep their canonical key."""
     candidate = _ready_candidate(db, settings={"decay": 42, "neutralization": "SECTOR"})
     client = FakeSubmitClient(status="ACTIVE", checks=[{"name": "SELF_CORRELATION", "result": "PASS"}])
 
