@@ -322,7 +322,10 @@ class BrainClient:
         when its response did not reach us; callers must reconcile before retrying.
         """
         try:
-            self.post(f"{API_BASE}/alphas/{alpha_id}/submit", retries=1)
+            # Submission POST is non-idempotent from the client's point of view. A timeout
+            # can mean BRAIN accepted the request but its response was lost, so never retry
+            # it inside the HTTP layer; return "uncertain" and let reconciliation decide.
+            self.post(f"{API_BASE}/alphas/{alpha_id}/submit", retries=0)
         except BrainAPIError as exc:
             if exc.status == 404:
                 return {"outcome": "already_submitted", "detail": "HTTP 404"}
