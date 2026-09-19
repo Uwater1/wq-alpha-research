@@ -73,6 +73,23 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   candidate). Multi-simulation is **not** available on this platform — check with
   `./.venv/bin/python scripts/multi_sim.py --status` (TODO P3).
 
+- Pre-screening, variant gate, submission queue (TODO P4/P5/P6):
+
+  ```bash
+  ./.venv/bin/python scripts/research_db.py queue data/input.csv   # validates + dedups first
+  ./.venv/bin/python scripts/successive_halving.py --status        # what is deferred and why
+  ./.venv/bin/python scripts/submission_worker.py --dry-run        # submission queue order
+  ./.venv/bin/python scripts/submission_worker.py --max-submissions 1
+  ```
+
+  `scripts/validate.py` rejects malformed expressions, unknown operators/fields (within
+  the USA/TOP3000/delay 1 catalog scope) and impossible settings before a slot is spent;
+  warnings only lower priority. `scripts/successive_halving.py` admits one representative
+  variant per structure and defers the rest until it passes (or the horizon elapses).
+  Passing candidates land in the submission queue automatically; the worker leases one,
+  re-checks the gates, submits, polls and continues. Local self-correlation is still a
+  switch (`--require-correlation`), owned by TODO P9.
+
 - Load the local field catalog (4,367 USA TOP3000 delay=1 fields):
 
   ```python

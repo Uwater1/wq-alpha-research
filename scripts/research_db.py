@@ -65,7 +65,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = REPO_ROOT / "research.db"
 DB_ENV_VAR = "WQ_RESEARCH_DB"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Columns added after the first release; `_ensure_columns` upgrades an existing file in
+# place so a long-running research.db never has to be rebuilt by hand.
+ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "candidates": ("structural_json TEXT", "gate_reason TEXT"),
+}
 
 # IS gates from SKILL.md Section 5, used only when BRAIN's own IS checks are absent.
 IS_THRESHOLDS = {"sharpe": 1.25, "fitness": 1.1, "turnover_min": 0.01, "turnover_max": 0.20}
@@ -155,6 +161,8 @@ SCHEMA: tuple[str, ...] = (
         expected_quality      REAL,
         novelty_score         REAL,
         failure_risk          REAL,
+        structural_json       TEXT,
+        gate_reason           TEXT,
         signal_family         TEXT,
         source                TEXT,
         parent_id             INTEGER REFERENCES candidates(id),
@@ -278,6 +286,13 @@ def is_expired(timestamp: str | None, reference: str | None = None) -> bool:
     return timestamp <= (reference or now_iso())
 
 
+def _structural_payload(report: Any) -> str | None:
+    """Structural features + validation warnings for the row (TODO P4.2 / P11 features)."""
+    if report is None:
+        return None
+    return json.dumps(report.as_dict(), sort_keys=True, default=str)
+
+
 def settings_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Build canonical settings from a CSV row (blank/absent cells fall back to defaults)."""
     return canonical.normalize_settings({column: row[column] for column in SETTINGS_COLUMNS if column in row})
@@ -340,11 +355,12 @@ def is_gate(
 class QueueOutcome:
     """Result of asking the store whether a candidate still needs BRAIN capacity."""
 
-    action: str  # cache_hit | in_flight | skipped_final | queued | requeued
+    action: str  # cache_hit | in_flight | skipped_final | rejected_invalid | queued | requeued
     canonical_key: str
     candidate_id: int | None = None
     status: str | None = None
     cached: dict[str, Any] | None = None
+    issues: list[str] = field(default_factory=list)
 
     @property
     def needs_simulation(self) -> bool:
@@ -414,11 +430,23 @@ class ResearchDB:
         with self._tx() as conn:
             for statement in SCHEMA:
                 conn.execute(statement)
+            self._ensure_columns(conn)
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(SCHEMA_VERSION),),
             )
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        """Add columns a newer schema expects, so an existing research.db keeps working."""
+        for table, definitions in ADDED_COLUMNS.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not existing:
+                continue
+            for definition in definitions:
+                column = definition.split()[0]
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
     @contextlib.contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -479,13 +507,28 @@ class ResearchDB:
         generation: int = 0,
         mutation_type: str | None = None,
         requeue: bool = False,
+        validate: bool = True,
     ) -> QueueOutcome:
-        """Register a candidate and decide whether it still needs BRAIN capacity."""
+        """Register a candidate and decide whether it still needs BRAIN capacity.
+
+        The candidate is screened locally first (TODO P4.1): a request BRAIN would reject
+        is filed as REJECTED with the reason instead of spending a simulation slot. Warnings
+        are stored as structural features and only cost priority.
+        """
         normalized_expression = canonical.normalize_expression(expression)
         normalized_settings = canonical.normalize_settings(settings)
         key = canonical.canonical_key(normalized_expression, normalized_settings)
         settings_json = json.dumps(normalized_settings, sort_keys=True)
         timestamp = now_iso()
+        report = None
+        if validate:
+            import validate as validator  # local import: keeps the store import-light
+
+            report = validator.validate(normalized_expression, normalized_settings)
+            if not report.ok:
+                return self._reject_invalid(
+                    key, expression, normalized_expression, normalized_settings, settings_json, report, source
+                )
 
         with self._tx() as conn:
             simulation = conn.execute("SELECT * FROM simulations WHERE canonical_key=?", (key,)).fetchone()
@@ -507,6 +550,7 @@ class ResearchDB:
                     generation=generation,
                     mutation_type=mutation_type,
                     status="SIMULATED",
+                    structural_json=_structural_payload(report),
                 )
                 self.log_event(
                     "candidate", candidate_id, "cache_hit", to_status=candidate["status"] if candidate else "SIMULATED",
@@ -544,6 +588,7 @@ class ResearchDB:
                     generation=generation,
                     mutation_type=mutation_type,
                     status="QUEUED",
+                    structural_json=_structural_payload(report),
                 )
                 from_status = None
             else:
@@ -580,6 +625,7 @@ class ResearchDB:
         generation: int,
         mutation_type: str | None,
         status: str,
+        structural_json: str | None = None,
     ) -> int:
         skeleton_hash = canonical.skeleton_hash(normalized_expression)
         duplicate = conn.execute(
@@ -591,14 +637,14 @@ class ResearchDB:
             INSERT INTO candidates(
                 canonical_key, expression, normalized_expression, expression_hash, settings_hash,
                 settings_json, skeleton_hash, status, priority, signal_family, source, parent_id,
-                generation, mutation_type, near_duplicate_of, created_at, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                generation, mutation_type, near_duplicate_of, structural_json, created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 key, expression, normalized_expression, canonical.expression_hash(normalized_expression),
                 canonical.settings_hash(normalized_settings), settings_json, skeleton_hash, status, priority,
                 signal_family, source, parent_id, generation, mutation_type,
-                duplicate["id"] if duplicate else None, timestamp, timestamp,
+                duplicate["id"] if duplicate else None, structural_json, timestamp, timestamp,
             ),
         )
         candidate_id = int(cursor.lastrowid)
@@ -608,6 +654,50 @@ class ResearchDB:
                 payload={"near_duplicate_of": duplicate["id"]}, conn=conn,
             )
         return candidate_id
+
+    def _reject_invalid(
+        self,
+        key: str,
+        expression: str,
+        normalized_expression: str,
+        normalized_settings: Mapping[str, Any],
+        settings_json: str,
+        report: Any,
+        source: str,
+    ) -> QueueOutcome:
+        """File a statically invalid request so the generator can learn from it, never simulate it."""
+        timestamp = now_iso()
+        reason = "validation: " + "; ".join(report.errors)[:500]
+        with self._tx() as conn:
+            existing = conn.execute("SELECT * FROM candidates WHERE canonical_key=?", (key,)).fetchone()
+            if existing is not None:
+                candidate_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE candidates SET failure_reason=?, structural_json=?, updated_at=? WHERE id=?",
+                    (reason, _structural_payload(report), timestamp, candidate_id),
+                )
+            else:
+                candidate_id = self._insert_candidate(
+                    conn,
+                    key,
+                    expression,
+                    normalized_expression,
+                    normalized_settings,
+                    settings_json,
+                    timestamp,
+                    source=source,
+                    signal_family=None,
+                    priority=0.0,
+                    parent_id=None,
+                    generation=0,
+                    mutation_type=None,
+                    status="REJECTED",
+                    structural_json=_structural_payload(report),
+                )
+                conn.execute("UPDATE candidates SET failure_reason=? WHERE id=?", (reason, candidate_id))
+                self.log_event("candidate", candidate_id, "validation_failed", to_status="REJECTED",
+                               payload={"errors": report.errors}, conn=conn)
+        return QueueOutcome("rejected_invalid", key, candidate_id, "REJECTED", issues=list(report.errors))
 
     def get_candidate(self, candidate_id: int) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
@@ -867,12 +957,71 @@ class ResearchDB:
                 requeued.append(int(row["id"]))
         return requeued
 
-    def list_queued(self, limit: int | None = None) -> list[dict[str, Any]]:
-        """Candidates waiting for a simulation slot, priority-first."""
-        sql = "SELECT * FROM candidates WHERE status='QUEUED' ORDER BY priority DESC, id ASC"
+    def list_queued(self, limit: int | None = None, *, due_only: bool = False) -> list[dict[str, Any]]:
+        """Candidates waiting for a simulation slot, priority-first.
+
+        ``due_only`` excludes candidates the successive-halving gate deferred (TODO P5):
+        they stay QUEUED but are not claimable until their base signal reports or the
+        deferral horizon passes.
+        """
+        sql = "SELECT * FROM candidates WHERE status='QUEUED'"
+        if due_only:
+            sql += " AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+        sql += " ORDER BY priority DESC, id ASC"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
-        return [dict(row) for row in self._conn.execute(sql)]
+        params: tuple[Any, ...] = (now_iso(),) if due_only else ()
+        return [dict(row) for row in self._conn.execute(sql, params)]
+
+    def defer_candidate(self, candidate_id: int, reason: str, until: str | None) -> None:
+        """Hold a candidate back (P5) without leaving the QUEUED lifecycle."""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE candidates SET next_attempt_at=?, gate_reason=?, updated_at=? WHERE id=? AND status='QUEUED'",
+                (until, reason, now_iso(), candidate_id),
+            )
+            self.log_event("candidate", candidate_id, "deferred", payload={"reason": reason, "until": until}, conn=conn)
+
+    def promote_deferred(self, candidate_ids: Iterable[int], reason: str = "base_signal_passed") -> int:
+        """Release deferred candidates so the scheduler can claim them again."""
+        ids = [int(candidate_id) for candidate_id in candidate_ids]
+        if not ids:
+            return 0
+        timestamp = now_iso()
+        promoted = 0
+        with self._tx() as conn:
+            for candidate_id in ids:
+                cursor = conn.execute(
+                    "UPDATE candidates SET next_attempt_at=NULL, gate_reason=NULL, updated_at=? "
+                    "WHERE id=? AND status='QUEUED' AND gate_reason IS NOT NULL",
+                    (timestamp, candidate_id),
+                )
+                if cursor.rowcount:
+                    promoted += 1
+                    self.log_event("candidate", candidate_id, "promoted", to_status="QUEUED",
+                                   payload={"reason": reason}, conn=conn)
+        return promoted
+
+    def skeleton_outcomes(self) -> dict[str, dict[str, int]]:
+        """Per-skeleton evidence: attempted simulations and passing members (TODO P5)."""
+        rows = self._conn.execute(
+            """
+            SELECT COALESCE(skeleton_hash, '') AS skeleton,
+                   SUM(CASE WHEN attempt_count > 0 THEN 1 ELSE 0 END) AS attempted,
+                   SUM(CASE WHEN status IN ('IS_PASS','CORR_PASS','SUBMISSION_READY','SUBMITTING','ACTIVE')
+                            THEN 1 ELSE 0 END) AS passed,
+                   COUNT(*) AS total
+            FROM candidates GROUP BY skeleton
+            """
+        )
+        return {
+            str(row["skeleton"]): {
+                "attempted": int(row["attempted"] or 0),
+                "passed": int(row["passed"] or 0),
+                "total": int(row["total"] or 0),
+            }
+            for row in rows
+        }
 
     def running_simulations(self) -> list[dict[str, Any]]:
         """Leased simulations, with the BRAIN handle needed to resume polling them."""
@@ -977,7 +1126,14 @@ class ResearchDB:
                         max(int(row["attempt_count"]), 1), timestamp, row["id"],
                     ),
                 )
-                self._set_status(conn, row, "IS_PASS" if passed else "REJECTED", timestamp, reason=reason or None)
+                target = "IS_PASS" if passed else "REJECTED"
+                if transition_path(row["status"], target) is not None:
+                    self._set_status(conn, row, target, timestamp, reason=reason or None)
+                else:
+                    # A replayed/late result must never drag a candidate backwards
+                    # (SUBMISSION_READY or ACTIVE already passed the IS gate).
+                    self.log_event("candidate", row["id"], "result_status_ignored",
+                                   from_status=row["status"], to_status=target, conn=conn)
             else:
                 conn.execute(
                     """
@@ -1000,7 +1156,12 @@ class ResearchDB:
                 },
                 conn=conn,
             )
-            return self.get_candidate(int(row["id"]))
+
+        candidate = self.get_candidate(int(row["id"]))
+        if status == "DONE" and passed:
+            # TODO P6: a candidate that clears the IS gate joins the submission queue.
+            self.auto_enqueue_submission(int(row["id"]), candidate)
+        return candidate
 
     def recover_expired_leases(self, lease_seconds: float | None = None) -> dict[str, int]:
         """Reclaim work left behind by a killed process (TODO P0/P8).
@@ -1043,6 +1204,38 @@ class ResearchDB:
                 )
                 recovered["submissions"] += 1
         return recovered
+
+    def auto_enqueue_submission(self, candidate_id: int, candidate: Mapping[str, Any] | None = None) -> int | None:
+        """Move a passing candidate into the submission queue, or record why not (P6)."""
+        candidate = candidate or self.get_candidate(candidate_id)
+        if candidate is None:
+            return None
+        allowed, reasons = submission_gate(candidate, active_keys=self.active_keys())
+        if not allowed:
+            self.log_event("candidate", candidate_id, "submission_gate_failed", payload={"reasons": reasons})
+            return None
+        priority = float(candidate.get("priority") or 0.0)
+        try:
+            import ranking  # local import keeps the store free of scoring dependencies
+
+            priority = ranking.submission_priority(candidate, ranking.build_context(self)).priority
+        except Exception:  # scoring must never block a queue entry
+            pass
+        return self.enqueue_submission(candidate_id, priority=priority)
+
+    def active_keys(self) -> set[str]:
+        """canonical_keys and alpha ids already ACTIVE, so they are never re-submitted."""
+        keys: set[str] = set()
+        for row in self._conn.execute("SELECT brain_alpha_id, canonical_key FROM active_alphas"):
+            if row["brain_alpha_id"]:
+                keys.add(str(row["brain_alpha_id"]))
+            if row["canonical_key"]:
+                keys.add(str(row["canonical_key"]))
+        for row in self._conn.execute("SELECT brain_alpha_id, canonical_key FROM candidates WHERE status='ACTIVE'"):
+            if row["brain_alpha_id"]:
+                keys.add(str(row["brain_alpha_id"]))
+            keys.add(str(row["canonical_key"]))
+        return keys
 
     # -- submissions (TODO P6/P8 build on these primitives) ----------------
 
@@ -1269,6 +1462,45 @@ class ResearchDB:
             "SELECT COUNT(*) AS n FROM simulations WHERE completed_at IS NOT NULL AND completed_at >= ?", (since,)
         ).fetchone()["n"] / hours, 3)
         return report
+
+
+def submission_gate(
+    candidate: Mapping[str, Any],
+    *,
+    active_keys: set[str] | None = None,
+    thresholds: Mapping[str, float] | None = None,
+    require_correlation: bool = False,
+    correlation_limit: float = 0.7,
+) -> tuple[bool, list[str]]:
+    """Submission gates (TODO P6): metrics floors, no duplicate ACTIVE alpha, optional local corr.
+
+    Correlation belongs to TODO P9; ``require_correlation`` is the hook it will switch on.
+    """
+    limits = {**IS_THRESHOLDS, **(thresholds or {})}
+    reasons: list[str] = []
+    sharpe = candidate.get("sharpe")
+    fitness = candidate.get("fitness")
+    turnover = candidate.get("turnover")
+    if not isinstance(sharpe, (int, float)) or sharpe < limits["sharpe"]:
+        reasons.append(f"sharpe<{limits['sharpe']}")
+    if not isinstance(fitness, (int, float)) or fitness < limits["fitness"]:
+        reasons.append(f"fitness<{limits['fitness']}")
+    if not isinstance(turnover, (int, float)) or not (limits["turnover_min"] <= turnover <= limits["turnover_max"]):
+        reasons.append("turnover outside configured range")
+    if not candidate.get("brain_alpha_id"):
+        reasons.append("no BRAIN alpha id (nothing to submit)")
+    if active_keys:
+        if str(candidate.get("canonical_key")) in active_keys:
+            reasons.append("an identical alpha is already ACTIVE")
+        elif str(candidate.get("brain_alpha_id")) in active_keys:
+            reasons.append("this alpha is already ACTIVE")
+    if require_correlation:
+        self_corr = candidate.get("self_corr")
+        if not isinstance(self_corr, (int, float)):
+            reasons.append("local self-correlation has not been checked (TODO P9)")
+        elif abs(self_corr) >= correlation_limit:
+            reasons.append(f"self-correlation {self_corr:.2f} >= {correlation_limit}")
+    return (not reasons), reasons
 
 
 def resolve_db_path(path: str | Path | None = None) -> Path:

@@ -146,7 +146,7 @@ def test_restart_keeps_state_and_never_resimulates_a_finished_request(db, tmp_pa
     with rdb.ResearchDB.open(tmp_path / "research.db") as reopened:
         replay = reopened.queue_candidate("RANK( close )", {"decay": "4"})
         assert replay.action == "cache_hit"
-        assert replay.status == "IS_PASS"
+        assert replay.status == "SUBMISSION_READY"  # passing work goes to the submission queue (P6)
         assert replay.cached["brain_alpha_id"] == "A1"
         assert replay.cached["sharpe"] == 1.6
         assert reopened.claim_simulation("worker-2") is None  # nothing left to simulate
@@ -371,7 +371,8 @@ def test_batch_simulate_dedupes_identical_rows_and_records_results(monkeypatch, 
     assert calls["n"] == 2  # the formatting clone never reached BRAIN
 
     with rdb.ResearchDB.open(db_path) as store:
-        assert store.counts("candidates") == {"IS_PASS": 2}
+        assert store.counts("candidates") == {"SUBMISSION_READY": 2}
+        assert store.counts("submissions") == {"READY": 2}
         assert store.cache_lookup("rank(close)", {"decay": 6})["brain_alpha_id"] == "A9"
     rows = list(csv.DictReader(sorted(tmp_path.glob("results_*.csv"))[-1].open()))
     assert len(rows) == 2

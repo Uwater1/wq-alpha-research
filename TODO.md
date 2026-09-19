@@ -252,6 +252,16 @@ Acceptance:
 
 ## P4 — Candidate Pre-Screening
 
+> **Status: P4.1 + P4.2 implemented, P4.3 folded into P5.** `scripts/validate.py` refuses
+> malformed expressions, unknown operators, wrong arity, unknown fields (inside the
+> USA/TOP3000/delay 1 scope the local catalog actually covers) and impossible settings at
+> queue time, filing them as REJECTED with the reason instead of spending a slot.
+> Structural features (field categories, operator counts, depth, windows, groups) land on
+> the candidate row and feed ranking; warnings lower priority rather than rejecting, as
+> P4.2 asks. Not built on purpose: a separate structural-screening stage (it would
+> duplicate the ranking components) and a second diversity gate (the P5 halving gate is
+> that gate).
+
 Do not spend BRAIN capacity on obviously weak candidates.
 
 ### P4.1 Static validation
@@ -307,6 +317,16 @@ Expand parameter search only if the base signal works.
 
 ## P5 — Successive-Halving Search
 
+> **Status: the gate is implemented, the fixed-ratio funnel is not** — and the funnel is
+> the part that would be redundant today. `scripts/successive_halving.py` admits one
+> representative variant per structure and holds its siblings (QUEUED +
+> `next_attempt_at` + `gate_reason`, invisible to the slot scheduler) until the structure
+> passes or its horizon elapses, so a grid can no longer occupy every slot before anyone
+> knows whether the base signal works. `parent_id` / `generation` / `mutation_type`
+> already exist for the generator to fill. The 2000 -> 800 -> baseline -> survivors
+> ratios assume a mass generator this repo does not have yet; wiring ratios without it
+> would be ceremony, so it waits for that generator.
+
 Replace exhaustive parameter grids.
 
 Example:
@@ -358,6 +378,15 @@ This lets the agent learn which modifications improved results.
 ---
 
 ## P6 — Submission Queue
+
+> **Status: implemented** (`scripts/submission_worker.py` + the `submissions` table).
+> A candidate that clears the IS gate is filed READY automatically with the P6 gates
+> (sharpe/fitness/turnover floors, no identical ACTIVE alpha, and a
+> `--require-correlation` switch that P9 will turn on), ordered by quality + novelty +
+> portfolio diversification instead of arrival order. The worker leases one row at a
+> time, re-checks the gates at claim time, submits, polls within a bounded budget, keeps
+> CHECK_PENDING rows reconcilable, and continues to the next candidate after a success
+> instead of stopping the queue. Nothing here submits from a simulation worker.
 
 Do not submit directly from simulation workers.
 

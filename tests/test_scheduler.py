@@ -49,8 +49,10 @@ class FakeBrain:
         poll_errors: list | None = None,
         never_finishes: bool = False,
         error_message: str | None = None,
+        passes: bool = True,
     ) -> None:
         self.polls_to_finish = polls_to_finish
+        self.passes = passes
         self.submit_errors = list(submit_errors or [])
         self.poll_errors = list(poll_errors or [])
         self.never_finishes = never_finishes
@@ -94,8 +96,11 @@ class FakeBrain:
             return brain_api.PollState("RUNNING", progress=0.3)
         alpha_id = f"A{handle.simulation_id}"
         self.alphas[alpha_id] = {
-            "sharpe": 1.6, "fitness": 1.3, "turnover": 0.05, "drawdown": 0.04,
-            "checks": [{"name": "LOW_SHARPE", "result": "PASS"}], "passed": 1,
+            "sharpe": 1.6 if self.passes else 0.3,
+            "fitness": 1.3 if self.passes else 0.2,
+            "turnover": 0.05, "drawdown": 0.04,
+            "checks": [{"name": "LOW_SHARPE", "result": "PASS" if self.passes else "FAIL"}],
+            "passed": 1 if self.passes else 0,
         }
         self.open_simulations.discard(handle.simulation_id)
         return brain_api.PollState("DONE", alpha_id=alpha_id)
@@ -153,8 +158,10 @@ def test_scheduler_keeps_slots_busy_and_refills_immediately(db):
     assert scheduler.submitted == 5
     assert scheduler.completed == 5
     assert scheduler.inflight == {}
-    assert db.counts("candidates") == {"IS_PASS": 5}
+    # A passing candidate lands in the submission queue (TODO P6), not just IS_PASS.
+    assert db.counts("candidates") == {"SUBMISSION_READY": 5}
     assert db.counts("simulations") == {"DONE": 5}
+    assert db.counts("submissions") == {"READY": 5}
 
 
 def test_scheduler_dedupes_work_already_in_flight(db):
@@ -179,7 +186,7 @@ def test_scheduler_retries_after_rate_limit_without_a_request_storm(db):
     assert client.submitted and len(client.submitted) == 1  # one retry, not a tight loop
     assert scheduler.rate_limited == 1
     assert clock.now >= 60.0  # the whole Retry-After window was honoured
-    assert db.counts("candidates") == {"IS_PASS": 1}
+    assert db.counts("candidates") == {"SUBMISSION_READY": 1}
 
 
 def test_scheduler_reauthenticates_once_then_continues(db):
@@ -191,7 +198,7 @@ def test_scheduler_reauthenticates_once_then_continues(db):
 
     assert client.auths == 1
     assert scheduler.reauths == 1
-    assert db.counts("candidates") == {"IS_PASS": 1}
+    assert db.counts("candidates") == {"SUBMISSION_READY": 1}
 
 
 def test_scheduler_adopts_simulations_left_by_a_dead_process(db):
@@ -206,7 +213,7 @@ def test_scheduler_adopts_simulations_left_by_a_dead_process(db):
     assert scheduler.adopted == 1
     assert scheduler.submitted == 0  # adopted work is polled, never re-submitted
     candidate = db.get_candidate(ids[0])
-    assert candidate["status"] == "IS_PASS"
+    assert candidate["status"] == "SUBMISSION_READY"
     assert candidate["brain_alpha_id"] == "ASIMORPHAN"
 
 
@@ -278,7 +285,7 @@ def test_retry_windows_are_requeued_by_the_scheduler(db):
     )
     db.query("UPDATE candidates SET next_attempt_at=NULL, attempt_count=1 WHERE id=?", (ids[0],))
     later.run()
-    assert db.get_candidate(ids[0])["status"] == "IS_PASS"
+    assert db.get_candidate(ids[0])["status"] == "SUBMISSION_READY"
 
 
 def test_dry_run_scores_the_queue_without_calling_brain(db, capsys):
@@ -297,7 +304,7 @@ def test_dry_run_scores_the_queue_without_calling_brain(db, capsys):
 
 
 def _settle(db, candidate_id, *, passed: bool):
-    db.claim_simulation("seed")
+    db.claim_simulation("seed", candidate_id=candidate_id)
     db.record_simulation_result(
         candidate_id=candidate_id,
         status="DONE",

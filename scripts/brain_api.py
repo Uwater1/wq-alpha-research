@@ -309,3 +309,43 @@ class BrainClient:
 
     def alpha_metrics(self, alpha_id: str) -> dict[str, Any]:
         return alpha_metrics(self.alpha(alpha_id))
+
+    # -- submission (TODO P6) ---------------------------------------------
+
+    def submit_alpha(self, alpha_id: str) -> dict[str, Any]:
+        """Ask BRAIN to submit an alpha.
+
+        Mirrors the legacy tool's reading of the platform: 404 means it was already
+        submitted, 403/409 means a previous request is still being evaluated (the
+        server-side correlation check can stay pending for minutes).
+        """
+        try:
+            self.post(f"{API_BASE}/alphas/{alpha_id}/submit", retries=1)
+        except BrainAPIError as exc:
+            if exc.status == 404:
+                return {"outcome": "already_submitted", "detail": "HTTP 404"}
+            if exc.status in (403, 409):
+                return {"outcome": "in_progress", "detail": f"HTTP {exc.status}"}
+            return {"outcome": "error", "detail": str(exc)[:200]}
+        return {"outcome": "submitted", "detail": ""}
+
+    def submit_checks(self, alpha_id: str) -> list[dict[str, Any]]:
+        """Checks reported by GET /alphas/{id}/submit while submission is pending."""
+        try:
+            response = self.get(f"{API_BASE}/alphas/{alpha_id}/submit", retries=1)
+        except BrainAPIError:
+            return []
+        if not response.content:
+            return []
+        try:
+            payload = response.json()
+        except ValueError:
+            return []
+        checks = (payload.get("is") or {}).get("checks") if isinstance(payload, Mapping) else None
+        return [c for c in (checks or []) if isinstance(c, Mapping)]
+
+    def alpha_status(self, alpha_id: str) -> str | None:
+        try:
+            return str(self.alpha(alpha_id).get("status") or "")
+        except BrainAPIError:
+            return None

@@ -41,6 +41,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import brain_api  # noqa: E402
 import ranking  # noqa: E402
 import research_db  # noqa: E402
+import successive_halving  # noqa: E402
 
 MAX_SIMULATION_SLOTS = 3
 POLL_INTERVAL_INITIAL = 3.0
@@ -74,6 +75,9 @@ class SimulationScheduler:
         max_runtime: float | None = DEFAULT_RUNTIME_SECONDS,
         max_simulations: int | None = None,
         adopt_orphans: bool = True,
+        halving: bool = True,
+        early_attempts: int = successive_halving.DEFAULT_EARLY_ATTEMPTS,
+        variant_horizon_minutes: float = successive_halving.DEFAULT_HORIZON_MINUTES,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -90,6 +94,9 @@ class SimulationScheduler:
         self.max_runtime = max_runtime
         self.max_simulations = max_simulations
         self.adopt_orphans = adopt_orphans
+        self.halving = halving
+        self.early_attempts = early_attempts
+        self.variant_horizon_minutes = variant_horizon_minutes
         self._clock = clock
         self._sleep = sleep
 
@@ -120,6 +127,10 @@ class SimulationScheduler:
         requeued = self.db.requeue_due_retries()
         if requeued:
             print(f"[scheduler] re-queued {len(requeued)} candidate(s) whose retry window elapsed")
+        counters = self.review_halving()
+        if counters["promoted_total"] or counters["deferred"]:
+            print(f"[scheduler] successive halving: promoted {counters['promoted_total']}, "
+                  f"deferred {counters['deferred']} variant(s) of unproven structures")
         try:
             while True:
                 self.fill_slots()
@@ -139,7 +150,7 @@ class SimulationScheduler:
     def _next_delay(self, wait: float) -> float:
         """How long to sleep: refill at once when a slot is free, else wait for BRAIN."""
         delay = max(0.0, wait)
-        if len(self.inflight) < self.slots and self.db.list_queued(limit=1):
+        if len(self.inflight) < self.slots and self.db.list_queued(limit=1, due_only=True):
             return 0.05  # a slot is free and work is waiting — come straight back
         block_left = self.blocked_until - self._clock()
         if block_left > 0 and not self.inflight:
@@ -147,10 +158,19 @@ class SimulationScheduler:
             return min(block_left, self.backoff_max)
         return delay
 
+    def review_halving(self) -> dict[str, int]:
+        """Apply the P5 variant gate; called at start and after every verdict."""
+        if not self.halving:
+            return {"promoted_total": 0, "promoted_proven": 0, "promoted_horizon": 0, "deferred": 0,
+                    "blocked_structures": 0, "waiting": 0}
+        return successive_halving.review(
+            self.db, early_attempts=self.early_attempts, horizon_minutes=self.variant_horizon_minutes
+        )
+
     def _work_remaining(self) -> bool:
         if self.inflight:
             return True
-        return bool(self.db.list_queued(limit=1))
+        return bool(self.db.list_queued(limit=1, due_only=True))
 
     def _should_stop(self) -> bool:
         if self.max_simulations is not None and self.completed >= self.max_simulations:
@@ -185,8 +205,8 @@ class SimulationScheduler:
         return max(0, min(self.slots, self.max_simulations - self.completed))
 
     def select_next(self) -> dict[str, Any] | None:
-        """Score queued candidates and atomically claim the best one."""
-        rows = self.db.list_queued(limit=QUEUE_SCAN_LIMIT)
+        """Score the claimable candidates and atomically claim the best one."""
+        rows = self.db.list_queued(limit=QUEUE_SCAN_LIMIT, due_only=True)
         if not rows:
             return None
         context = self.ranking_context()
@@ -397,6 +417,9 @@ class SimulationScheduler:
             simulation_id=handle.simulation_id,
         )
         self.completed += 1
+        # A verdict just landed: the structure is either proven (siblings promote now) or
+        # unproven (siblings keep waiting), which is exactly what the P5 gate tracks.
+        self.review_halving()
         status = (candidate or {}).get("status", "?")
         print(
             f"[scheduler] done in {latency:.0f}s: {status} "
@@ -451,6 +474,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stop after this many minutes (0 = run until the queue drains)")
     parser.add_argument("--max-simulations", type=int, help="stop after this many completed simulations")
     parser.add_argument("--once", action="store_true", help="single fill+poll pass (cron/worker style)")
+    parser.add_argument("--no-halving", action="store_true",
+                        help="disable the successive-halving variant gate (TODO P5)")
+    parser.add_argument("--early-attempts", type=int, default=successive_halving.DEFAULT_EARLY_ATTEMPTS,
+                        help="simulations a structure may spend before its variants wait")
+    parser.add_argument("--variant-horizon", type=float, default=successive_halving.DEFAULT_HORIZON_MINUTES,
+                        help="minutes a deferred variant waits before automatic release")
     parser.add_argument("--dry-run", action="store_true", help="rank the queue and print it; never call BRAIN")
     parser.add_argument("--json", action="store_true", help="print the run summary as JSON")
     return parser
@@ -471,6 +500,9 @@ def main(argv: list[str] | None = None) -> int:
             sim_timeout=args.sim_timeout,
             max_runtime=None if not args.max_runtime else args.max_runtime * 60.0,
             max_simulations=args.max_simulations,
+            halving=not args.no_halving,
+            early_attempts=args.early_attempts,
+            variant_horizon_minutes=args.variant_horizon,
         )
         try:
             code = scheduler.run(once=args.once)

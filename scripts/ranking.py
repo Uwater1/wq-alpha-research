@@ -21,7 +21,7 @@ Usage:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 import canonical
@@ -34,6 +34,7 @@ WEIGHTS: dict[str, float] = {
     "family_diversity": 0.5,
     "duplicate_penalty": 1.0,
     "failure_risk": 1.0,
+    "portfolio_diversification": 0.5,
 }
 
 #: Minimum observations before an empirical family pass rate outweighs the prior.
@@ -214,6 +215,24 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
         duplicate_penalty=round(duplicate_penalty, 6),
         failure_risk=round(failure_risk, 6),
         reasons=reasons,
+    )
+
+
+def submission_priority(row: Mapping[str, Any], context: RankingContext) -> Score:
+    """Order the submission queue (TODO P6): quality + novelty + portfolio diversification.
+
+    A family that already owns ACTIVE alphas scores lower, so the queue spreads across
+    economic ideas instead of stacking near-clones of the same signal.
+    """
+    base = score_candidate(row, context)
+    family = str(row.get("signal_family") or "")
+    active_in_family = context.family_active_counts.get(family, 0)
+    diversification = 1.0 / (1.0 + active_in_family)
+    return replace(
+        base,
+        priority=round(base.priority + WEIGHTS["portfolio_diversification"] * diversification, 6),
+        reasons={**base.reasons, "active_in_family": active_in_family,
+                 "portfolio_diversification": round(diversification, 6)},
     )
 
 

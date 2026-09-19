@@ -63,6 +63,9 @@ wq-alpha-research/
 │   ├── brain_api.py         # BRAIN HTTP client (Retry-After, session refresh)
 │   ├── ranking.py           # candidate priority components
 │   ├── sim_scheduler.py     # persistent 3-slot simulation dispatcher
+│   ├── validate.py          # static pre-screening (fields, operators, settings)
+│   ├── successive_halving.py # one variant at a time until a structure proves itself
+│   ├── submission_worker.py # drains the submission queue
 │   └── multi_sim.py         # multi-simulation capability check
 ├── legacy/
 │   └── wq_brain/            # batch simulate / scrape / submit tooling
@@ -207,6 +210,20 @@ blocking submissions, honours `Retry-After`, re-authenticates when the session
 transition to `research.db`. Multi-simulation is not offered by the BRAIN API today
 (`scripts/multi_sim.py --status`); the scheduler therefore runs REGULAR simulations
 with three concurrent slots, which is the platform limit.
+
+Three gates decide what the capacity is spent on:
+
+```bash
+./.venv/bin/python scripts/research_db.py queue data/input.csv  # static validation + dedup
+./.venv/bin/python scripts/successive_halving.py --status       # deferred variants
+./.venv/bin/python scripts/submission_worker.py --dry-run       # submission order
+./.venv/bin/python scripts/submission_worker.py --max-submissions 1
+```
+
+Invalid candidates (typo'd field, unknown operator, wrong arity, impossible settings)
+never reach BRAIN; parameter grids wait until one representative variant shows the
+structure is worth expanding; and a candidate that passes the IS gate enters a submission
+queue that is drained independently, one leased row at a time.
 
 The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
 
