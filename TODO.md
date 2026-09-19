@@ -1,6 +1,6 @@
 # TODO — Active Roadmap
 
-Last audited: 2026-09-19 against `main@5b27f02`.
+Last audited: 2026-09-19 against `main@611f818`.
 
 Goal: maximize useful WorldQuant BRAIN research throughput while keeping simulation, submission, and learned knowledge restart-safe, private, auditable, and agent-agnostic.
 
@@ -22,117 +22,23 @@ Goal: maximize useful WorldQuant BRAIN research throughput while keeping simulat
 | P2 persistent scheduler | ✅ | `scripts/sim_scheduler.py`; slot refill, polling, retry/backoff, re-auth, orphan adoption. |
 | P3 multi-simulation | ✅ blocked by platform | Live probe rejected `MULTI`; keep REGULAR scheduler. Re-probe only after account/platform changes. |
 | P4 pre-screening | ✅ scoped | Static validation + structural features/ranking. Current field coverage is mainly USA/TOP3000/delay=1; expand the catalog before treating other scopes as fully validated. |
-| P6 submission queue | ✅ core | Dedicated priority queue and worker exist. Correlation and uncertain-submit recovery still depend on P8/P9 below. |
+| P6 submission queue | ✅ core | Dedicated priority queue and worker exist. |
+| P8 submission recovery | ✅ | `submissions.post_attempted_at` separates "never POSTed" from "POST outcome unknown"; expired POST leases become CHECK_PENDING and reconcile against BRAIN; explicit READY/RETRY backoff plus an EXHAUSTED attempt budget; ACTIVE identity comes from the stored candidate row. |
+| P9 local self-correlation | ✅ | `scripts/correlation.py`: fully paginated + versioned ACTIVE book, locally cached daily PnL, aligned daily-return checks persisted per candidate (`max_corr`, `max_corr_alpha_id`, `corr_checked_at`, `active_set_version`, `corr_status`); a real submission gate behind `--require-correlation`. |
+| P5 staged search | ✅ volume-gated | `scripts/staged_search.py`: evidence-derived per-structure budgets above `--staged-threshold`, expand on proof, stop saturated families; spend recorded in `structure_budget`. |
 | P10 heuristic ranking | ✅ baseline | `scripts/ranking.py` already scores quality/novelty/information/diversity/risk. Keep it heuristic until P11. |
 
 Do not expand these sections again unless a regression or design change requires work.
 
----
+Caveats kept on purpose:
 
-# Priority 1 — Fix submission idempotency/recovery (P8)
-
-Status: ⚠️ implemented incompletely. Fix this before unattended submission.
-
-### Known problems
-
-1. **Expired uncertain submissions are not reconciled first.**
-   - `ResearchDB.recover_expired_leases()` changes expired `SUBMITTING -> RETRY`.
-   - P8 requires BRAIN to be the source of truth before any retry after an uncertain POST.
-
-2. **Submission RETRY rows can become stranded.**
-   - `claim_submission()` claims only `READY`.
-   - worker reconciliation handles `CHECK_PENDING`, not generic `RETRY`.
-   - a transient submit error or expired lease can therefore leave work requiring manual re-enqueue.
-
-3. **ACTIVE duplicate identity can be reconstructed incorrectly for non-default settings.**
-   - `finish_submission()` calls `settings_from_row(candidate)`, but candidate rows store settings in `settings_json`, not individual setting columns.
-   - use the candidate's stored `canonical_key` / parsed `settings_json` directly when writing `active_alphas`.
-
-### Implement
-
-- introduce one explicit uncertain state/path, e.g. `CHECK_PENDING` / `RECONCILE`;
-- on restart/expired lease:
-  1. query BRAIN by known alpha id;
-  2. if ACTIVE -> persist ACTIVE;
-  3. if checks/status are still pending -> remain reconcilable;
-  4. only return to READY when BRAIN proves the alpha was not submitted;
-- add retry backoff + maximum attempts for submission retries;
-- make READY/RETRY transition rules explicit instead of relying on manual enqueue;
-- preserve one open submission row per candidate;
-- write ACTIVE identity from stored candidate canonical data, not reconstructed defaults.
-
-### Acceptance
-
-- two workers cannot submit the same candidate twice;
-- crash immediately before/after POST is recoverable without blind resubmit;
-- transient failures eventually retry automatically;
-- uncertain outcomes never require deleting DB rows by hand;
-- non-default settings retain the correct canonical identity;
-- offline tests cover overlap, crash, timeout, expired lease, transient error, and restart.
+- P8 reconciliation trusts BRAIN's alpha status plus the submit endpoint's checks; a POST that BRAIN never registered resolves to READY, with the platform's own 404-on-resubmit as the final backstop.
+- P9 is a local pre-gate only — BRAIN's own SELF_CORRELATION remains the confirmation. An ACTIVE book with uncached PnL holds every candidate rather than reporting a false low correlation.
+- P5 still has no mass candidate generator, so no fixed 2000→800 style ratios were added; budgets are evidence-derived and only engage above the volume threshold.
 
 ---
 
-# Priority 2 — Complete local self-correlation pipeline (P9)
-
-Status: ⚠️ utilities exist, queue integration does not.
-
-Current `submission_worker.py --require-correlation` only checks whether `candidate.self_corr` was already populated. It does **not** fetch/cache ACTIVE PnL or compute freshness itself.
-
-Reuse the tested PnL/correlation logic currently living in `scripts/evolve_skill.py`, but move reusable logic into a dedicated module.
-
-### Implement
-
-- fetch the **entire paginated ACTIVE book**;
-- cache ACTIVE daily PnL locally;
-- fetch candidate PnL after simulation;
-- correlate aligned **daily PnL changes/returns**, not cumulative curves;
-- persist at least:
-  - `max_corr`
-  - `max_corr_alpha_id`
-  - `corr_checked_at`
-  - `active_set_version`;
-- increment/version the ACTIVE set when membership changes;
-- mark prior checks stale when their `active_set_version` is old;
-- re-check stale candidates immediately before submission;
-- make local correlation a normal submission gate once the pipeline is reliable;
-- retain BRAIN SELF_CORRELATION as final confirmation.
-
-### Acceptance
-
-- no candidate can be submitted with a missing/stale local correlation when the gate is enabled;
-- an ACTIVE-book change invalidates affected cached checks;
-- pagination cannot silently omit ACTIVE alphas;
-- unavailable/short/degenerate PnL produces an explicit hold reason, not a false low-correlation result.
-
----
-
-# Priority 3 — Finish staged search only when generation needs it (P5)
-
-Status: ⚠️ representative-variant gate is implemented; full funnel is not.
-
-Already working:
-
-- one representative variant can run before siblings;
-- siblings are deferred with `next_attempt_at` / `gate_reason`;
-- parent/generation/mutation columns exist.
-
-Do **not** add fixed 2000→800-style ratios until a mass candidate generator exists.
-
-When generation volume warrants it:
-
-1. generate diverse base structures;
-2. validate/dedup;
-3. simulate one baseline per structure;
-4. expand only successful structures;
-5. tune windows/decay/neutralization/truncation/blends;
-6. stop families with poor marginal information gain;
-7. persist lineage and budget consumed per family.
-
-Acceptance: parameter grids cannot monopolize all BRAIN slots before their base structure proves useful.
-
----
-
-# Priority 4 — Open issue #1: agent-agnostic self-evolving knowledge + skills (P12)
+# Priority 1 — Open issue #1: agent-agnostic self-evolving knowledge + skills (P12)
 
 Tracking issue: [#1 — Build agent-agnostic self-evolving knowledge + skill system](https://github.com/Uwater1/wq-alpha-research/issues/1)
 
@@ -262,7 +168,7 @@ Before autonomous promotion:
 
 ---
 
-# Priority 5 — Learned simulation surrogate (P11)
+# Priority 2 — Learned simulation surrogate (P11)
 
 Status: ⏳ wait for enough clean history.
 
@@ -284,7 +190,7 @@ Do not hard-reject solely from model prediction at first.
 
 ---
 
-# Priority 6 — Complete observability (P13)
+# Priority 3 — Complete observability (P13)
 
 Status: ⚠️ partial.
 
@@ -316,15 +222,15 @@ Track at least:
 
 ---
 
-# Priority 7 — Keep tests aligned with active work (P14)
+# Priority 4 — Keep tests aligned with active work (P14)
 
 Status: ⚠️ broad coverage exists; extend with each active phase.
 
-Required additions:
+Done: P8 uncertain-submit/retry/restart cases, P9 pagination/cache/staleness/correlation
+cases, the non-default ACTIVE canonical identity regression, and P5 staged-budget cases.
 
-- P8 uncertain-submit/retry/restart cases;
-- P9 ACTIVE pagination/cache/staleness/correlation cases;
-- non-default ACTIVE canonical identity regression;
+Still required:
+
 - P12 rule evidence/proposal/promotion/rollback/concurrency/privacy cases;
 - mocked end-to-end flow:
   `generate -> queue -> simulate -> correlate -> submit -> ACTIVE -> learn`.
@@ -336,14 +242,11 @@ No default test may require live credentials. Live BRAIN probes remain explicit/
 # Implementation order
 
 ```text
-1. P8 submission recovery fixes
-2. P9 correlation pipeline
-3. P5 staged-search completion only when generator volume requires it
-4. Issue #1 / P12 storage + terse skill + retrieval
-5. P12 proposal learning + safe mutation + eval gate
-6. P11 surrogate model
-7. P13 observability + P14 regression coverage throughout
-8. GitHub Actions submission automation — LAST
+1. Issue #1 / P12 storage + terse skill + retrieval
+2. P12 proposal learning + safe mutation + eval gate
+3. P11 surrogate model
+4. P13 observability + P14 regression coverage throughout
+5. GitHub Actions submission automation — LAST
 ```
 
 ---

@@ -78,6 +78,7 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   ```bash
   ./.venv/bin/python scripts/research_db.py queue data/input.csv   # validates + dedups first
   ./.venv/bin/python scripts/successive_halving.py --status        # what is deferred and why
+  ./.venv/bin/python scripts/staged_search.py --status             # per-structure search budgets
   ./.venv/bin/python scripts/submission_worker.py --dry-run        # submission queue order
   ./.venv/bin/python scripts/submission_worker.py --max-submissions 1
   ```
@@ -86,9 +87,29 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   the USA/TOP3000/delay 1 catalog scope) and impossible settings before a slot is spent;
   warnings only lower priority. `scripts/successive_halving.py` admits one representative
   variant per structure and defers the rest until it passes (or the horizon elapses).
-  Passing candidates land in the submission queue automatically; the worker leases one,
-  re-checks the gates, submits, polls and continues. Local self-correlation is still a
-  switch (`--require-correlation`), owned by TODO P9.
+  `scripts/staged_search.py` additionally budgets each structure once the queue passes
+  `--staged-threshold`, so a parameter grid holds one slot until its base proves useful,
+  expands when it does, and stops when its marginal pass rate goes bad. Passing candidates
+  land in the submission queue automatically; the worker leases one, re-checks the gates,
+  submits, polls and continues.
+
+- Local self-correlation + submission recovery (TODO P8/P9):
+
+  ```bash
+  ./.venv/bin/python scripts/correlation.py sync    # paginated ACTIVE book + cached daily PnL
+  ./.venv/bin/python scripts/correlation.py status  # book version, cached PnL, check counts
+  ./.venv/bin/python scripts/submission_worker.py --require-correlation --max-submissions 1
+  ```
+
+  `--require-correlation` is a real gate: the worker syncs and versions the ACTIVE book,
+  fetches the candidate's PnL, correlates aligned **daily returns** (never cumulative
+  curves) and refuses anything at or above `--correlation-limit`. Unusable inputs (missing
+  or short PnL, a flat series, an incompletely cached book) become explicit holds, not low
+  correlations; a book change invalidates every cached check. Submission rows recover
+  themselves: an expired lease returns to `READY` only when the POST never left the
+  process, otherwise it becomes `CHECK_PENDING` and is reconciled against BRAIN before any
+  retry; transient failures back off and retire as `EXHAUSTED` after
+  `--max-submission-attempts`. BRAIN's own SELF_CORRELATION check remains the confirmation.
 
 - Load the local field catalog (4,367 USA TOP3000 delay=1 fields):
 

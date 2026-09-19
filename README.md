@@ -65,7 +65,9 @@ wq-alpha-research/
 │   ├── sim_scheduler.py     # persistent 3-slot simulation dispatcher
 │   ├── validate.py          # static pre-screening (fields, operators, settings)
 │   ├── successive_halving.py # one variant at a time until a structure proves itself
-│   ├── submission_worker.py # drains the submission queue
+│   ├── staged_search.py     # per-structure search budget (volume-gated funnel)
+│   ├── correlation.py       # ACTIVE-book PnL cache + local daily-return correlation
+│   ├── submission_worker.py # drains the submission queue, recovers uncertain submits
 │   └── multi_sim.py         # multi-simulation capability check
 ├── legacy/
 │   └── wq_brain/            # batch simulate / scrape / submit tooling
@@ -211,19 +213,24 @@ transition to `research.db`. Multi-simulation is not offered by the BRAIN API to
 (`scripts/multi_sim.py --status`); the scheduler therefore runs REGULAR simulations
 with three concurrent slots, which is the platform limit.
 
-Three gates decide what the capacity is spent on:
+The gates decide what the capacity is spent on:
 
 ```bash
 ./.venv/bin/python scripts/research_db.py queue data/input.csv  # static validation + dedup
 ./.venv/bin/python scripts/successive_halving.py --status       # deferred variants
+./.venv/bin/python scripts/staged_search.py --status            # per-structure budgets
+./.venv/bin/python scripts/correlation.py status                # ACTIVE book + cached PnL
 ./.venv/bin/python scripts/submission_worker.py --dry-run       # submission order
-./.venv/bin/python scripts/submission_worker.py --max-submissions 1
+./.venv/bin/python scripts/submission_worker.py --require-correlation --max-submissions 1
 ```
 
 Invalid candidates (typo'd field, unknown operator, wrong arity, impossible settings)
-never reach BRAIN; parameter grids wait until one representative variant shows the
+never reach BRAIN; parameter grids hold one slot until a representative variant shows the
 structure is worth expanding; and a candidate that passes the IS gate enters a submission
-queue that is drained independently, one leased row at a time.
+queue that is drained independently, one leased row at a time. With `--require-correlation`
+the worker also compares aligned daily returns against the locally cached ACTIVE book and
+holds anything too redundant, while an uncertain POST is reconciled against BRAIN instead
+of being blindly retried.
 
 The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
 
