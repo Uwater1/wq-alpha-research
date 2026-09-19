@@ -1,955 +1,393 @@
-# TODO — BRAIN Throughput & Submission Pipeline
+# TODO — Active Roadmap
 
-Goal: maximize useful alpha throughput under WorldQuant BRAIN simulation/submission limits without brute-force concurrency.
+Last audited: 2026-09-19 against `main@5b27f02`.
 
-## P0 — Separate Research, Simulation, and Submission
+Goal: maximize useful WorldQuant BRAIN research throughput while keeping simulation, submission, and learned knowledge restart-safe, private, auditable, and agent-agnostic.
 
-> **Status: implemented** (`scripts/research_db.py`, wired into
-> `legacy/wq_brain/batch_simulate.py`). Schema, state machine, leased claims and
-> per-result commits are in place; P6/P8 will build their workers on the
-> `submissions` primitives already exposed there.
+## Status legend
 
-Current workflows couple generation, simulation, checking, and submission too tightly.
-
-Create explicit states:
-
-```text
-GENERATED
-→ VALIDATED
-→ QUEUED
-→ SIMULATING
-→ SIMULATED
-→ IS_PASS
-→ CORR_PASS
-→ SUBMISSION_READY
-→ SUBMITTING
-→ ACTIVE / REJECTED / RETRY
-```
-
-Persist state so every process can stop/restart safely.
-
-Use one local DB:
-
-```text
-research.db
-```
-
-Recommended tables:
-
-```text
-candidates
-simulations
-submissions
-active_alphas
-events
-```
-
-Each candidate should store at least:
-
-```text
-id
-expression
-expression_hash
-settings_hash
-status
-priority
-signal_family
-source
-created_at
-updated_at
-brain_alpha_id
-simulation_id
-sharpe
-fitness
-turnover
-self_corr
-failure_reason
-attempt_count
-```
-
-Acceptance:
-
-- no completed simulation is lost on interruption;
-- submission can run independently of research;
-- restarting scripts does not duplicate work.
+- ✅ done: keep only regression coverage; do not rebuild.
+- ⚠️ partial/problem: implementation exists but has a known gap.
+- ⏳ pending: not implemented yet.
+- 💤 deferred: intentionally last.
 
 ---
 
-## P1 — Canonicalization, Dedup, and Simulation Cache
+## Completed baseline
 
-> **Status: implemented** (`scripts/canonical.py` + the `simulations` cache table).
-> Formatting/parameter variants collapse to one key, exact duplicates and in-flight
-> requests are skipped, and `batch_simulate.py` reuses completed results instead of
-> re-simulating. Near-duplicates are flagged via `skeleton_hash`/`near_duplicate_of`,
-> never merged.
+| Area | Status | Current implementation / note |
+|---|---|---|
+| P0 research state | ✅ | `research.db`, candidate/simulation/submission lifecycle, events, restartable state. |
+| P1 canonicalization/cache | ✅ | `scripts/canonical.py` + reusable simulation cache + exact dedup. |
+| P2 persistent scheduler | ✅ | `scripts/sim_scheduler.py`; slot refill, polling, retry/backoff, re-auth, orphan adoption. |
+| P3 multi-simulation | ✅ blocked by platform | Live probe rejected `MULTI`; keep REGULAR scheduler. Re-probe only after account/platform changes. |
+| P4 pre-screening | ✅ scoped | Static validation + structural features/ranking. Current field coverage is mainly USA/TOP3000/delay=1; expand the catalog before treating other scopes as fully validated. |
+| P6 submission queue | ✅ core | Dedicated priority queue and worker exist. Correlation and uncertain-submit recovery still depend on P8/P9 below. |
+| P10 heuristic ranking | ✅ baseline | `scripts/ranking.py` already scores quality/novelty/information/diversity/risk. Keep it heuristic until P11. |
 
-Before calling BRAIN, normalize candidate expressions and settings.
-
-Canonical key:
-
-```text
-SHA256(
-    normalized_expression
-    + region
-    + universe
-    + delay
-    + decay
-    + neutralization
-    + truncation
-    + pasteurization
-    + unitHandling
-    + nanHandling
-    + language
-)
-```
-
-Normalize:
-
-- whitespace;
-- operator capitalization where safe;
-- numeric formatting;
-- settings defaults;
-- deterministic field ordering.
-
-Before simulation:
-
-```text
-if exact completed cache hit:
-    reuse result
-elif already queued/running:
-    skip duplicate
-else:
-    queue
-```
-
-Also detect near-duplicates:
-
-- same expression with trivial formatting differences;
-- same economic signal with only tiny parameter changes;
-- duplicate parameter grids produced by different agents.
-
-Do not automatically merge semantically different expressions unless equivalence is proven.
-
-Acceptance:
-
-- identical simulation requests never hit BRAIN twice;
-- old results are reusable across research sessions;
-- cache survives process/container restart.
+Do not expand these sections again unless a regression or design change requires work.
 
 ---
 
-## P2 — Persistent BRAIN Simulation Scheduler
+# Priority 1 — Fix submission idempotency/recovery (P8)
 
-> **Status: implemented** (`scripts/sim_scheduler.py`, `scripts/brain_api.py`,
-> `scripts/ranking.py`), verified against live BRAIN: two slots filled at once,
-> progress polled, results committed and IS-gated. `Retry-After`, exponential
-> backoff, re-authentication, orphan adoption, lease recovery and priority ordering
-> are covered by tests, and the score components are stored on every candidate.
+Status: ⚠️ implemented incompletely. Fix this before unattended submission.
 
-Replace simple `ThreadPoolExecutor` batch execution with a persistent dispatcher.
+### Known problems
 
-Default maximum:
+1. **Expired uncertain submissions are not reconciled first.**
+   - `ResearchDB.recover_expired_leases()` changes expired `SUBMITTING -> RETRY`.
+   - P8 requires BRAIN to be the source of truth before any retry after an uncertain POST.
 
-```text
-MAX_SIMULATION_SLOTS = 3
-```
+2. **Submission RETRY rows can become stranded.**
+   - `claim_submission()` claims only `READY`.
+   - worker reconciliation handles `CHECK_PENDING`, not generic `RETRY`.
+   - a transient submit error or expired lease can therefore leave work requiring manual re-enqueue.
 
-Scheduler responsibilities:
+3. **ACTIVE duplicate identity can be reconstructed incorrectly for non-default settings.**
+   - `finish_submission()` calls `settings_from_row(candidate)`, but candidate rows store settings in `settings_json`, not individual setting columns.
+   - use the candidate's stored `canonical_key` / parsed `settings_json` directly when writing `active_alphas`.
 
-- maintain exactly the allowed number of active simulations;
-- immediately refill a free slot;
-- poll running simulations separately from submitting new ones;
-- obey `Retry-After`;
-- exponential backoff on transient failures;
-- re-authenticate when session expires;
-- retry recoverable failures;
-- persist all state transitions.
+### Implement
 
-Priority order should not be FIFO only.
+- introduce one explicit uncertain state/path, e.g. `CHECK_PENDING` / `RECONCILE`;
+- on restart/expired lease:
+  1. query BRAIN by known alpha id;
+  2. if ACTIVE -> persist ACTIVE;
+  3. if checks/status are still pending -> remain reconcilable;
+  4. only return to READY when BRAIN proves the alpha was not submitted;
+- add retry backoff + maximum attempts for submission retries;
+- make READY/RETRY transition rules explicit instead of relying on manual enqueue;
+- preserve one open submission row per candidate;
+- write ACTIVE identity from stored candidate canonical data, not reconstructed defaults.
 
-Suggested score:
+### Acceptance
 
-```text
-priority =
-    expected_quality
-    + novelty
-    + information_gain
-    + family_diversity
-    - duplicate_penalty
-    - failure_risk
-```
-
-Initial version may use simple heuristics from `SKILL.md`.
-
-Acceptance:
-
-- slots remain occupied whenever queued work exists;
-- 429 responses do not cause request storms;
-- failed workers do not lose queue state.
+- two workers cannot submit the same candidate twice;
+- crash immediately before/after POST is recoverable without blind resubmit;
+- transient failures eventually retry automatically;
+- uncertain outcomes never require deleting DB rows by hand;
+- non-default settings retain the correct canonical identity;
+- offline tests cover overlap, crash, timeout, expired lease, transient error, and restart.
 
 ---
 
-## P3 — Multi-Simulation Support
+# Priority 2 — Complete local self-correlation pipeline (P9)
 
-> **Status: checked — the platform does not offer it.** A live probe on this account
-> returns HTTP 400 `{"type": ["Object with name=MULTI does not exist."],
-> "regular": ["Not a valid string."]}`: the only simulation type is REGULAR with a
-> single expression string, so there is nothing to pack. `scripts/multi_sim.py`
-> records the verdict in `research.db.meta` (`--probe` / `--status`) and the pipeline
-> never assumes support, so the 3-slot REGULAR scheduler is the implemented path.
-> Packing is deliberately not built for an endpoint that rejects it — re-run
-> `--probe` after an account/platform change and this section becomes actionable.
+Status: ⚠️ utilities exist, queue integration does not.
 
-Detect whether the account/API supports BRAIN multi-simulation.
+Current `submission_worker.py --require-correlation` only checks whether `candidate.self_corr` was already populated. It does **not** fetch/cache ACTIVE PnL or compute freshness itself.
 
-If supported, pack compatible candidates into batches.
+Reuse the tested PnL/correlation logic currently living in `scripts/evolve_skill.py`, but move reusable logic into a dedicated module.
 
-Candidates in one batch must share all required common settings, e.g.:
+### Implement
 
-```text
-region
-universe
-delay
-language
-instrument type
-```
+- fetch the **entire paginated ACTIVE book**;
+- cache ACTIVE daily PnL locally;
+- fetch candidate PnL after simulation;
+- correlate aligned **daily PnL changes/returns**, not cumulative curves;
+- persist at least:
+  - `max_corr`
+  - `max_corr_alpha_id`
+  - `corr_checked_at`
+  - `active_set_version`;
+- increment/version the ACTIVE set when membership changes;
+- mark prior checks stale when their `active_set_version` is old;
+- re-check stale candidates immediately before submission;
+- make local correlation a normal submission gate once the pipeline is reliable;
+- retain BRAIN SELF_CORRELATION as final confirmation.
 
-Group by compatible settings before packing.
+### Acceptance
 
-Target:
-
-```text
-MULTI_SIM_BATCH_SIZE = platform-supported maximum
-```
-
-Architecture:
-
-```text
-candidate queue
-→ group by compatible settings
-→ pack batch
-→ multi-simulation
-→ unpack child results
-→ persist individually
-```
-
-Fallback:
-
-```text
-if unsupported:
-    use REGULAR simulation scheduler
-```
-
-Never assume multi-simulation support.
-
-Acceptance:
-
-- automatic capability detection;
-- REGULAR fallback remains fully functional;
-- each child alpha retains independent metrics/status.
+- no candidate can be submitted with a missing/stale local correlation when the gate is enabled;
+- an ACTIVE-book change invalidates affected cached checks;
+- pagination cannot silently omit ACTIVE alphas;
+- unavailable/short/degenerate PnL produces an explicit hold reason, not a false low-correlation result.
 
 ---
 
-## P4 — Candidate Pre-Screening
+# Priority 3 — Finish staged search only when generation needs it (P5)
 
-> **Status: P4.1 + P4.2 implemented, P4.3 folded into P5.** `scripts/validate.py` refuses
-> malformed expressions, unknown operators, wrong arity, unknown fields (inside the
-> USA/TOP3000/delay 1 scope the local catalog actually covers) and impossible settings at
-> queue time, filing them as REJECTED with the reason instead of spending a slot.
-> Structural features (field categories, operator counts, depth, windows, groups) land on
-> the candidate row and feed ranking; warnings lower priority rather than rejecting, as
-> P4.2 asks. Not built on purpose: a separate structural-screening stage (it would
-> duplicate the ranking components) and a second diversity gate (the P5 halving gate is
-> that gate).
+Status: ⚠️ representative-variant gate is implemented; full funnel is not.
 
-Do not spend BRAIN capacity on obviously weak candidates.
+Already working:
 
-### P4.1 Static validation
+- one representative variant can run before siblings;
+- siblings are deferred with `next_attempt_at` / `gate_reason`;
+- parent/generation/mutation columns exist.
 
-Reject before simulation when:
+Do **not** add fixed 2000→800-style ratios until a mass candidate generator exists.
 
-- unknown field;
-- unsupported operator;
-- invalid operator arity;
-- impossible settings;
-- malformed FASTEXPR;
-- known incompatible field/operator combination.
+When generation volume warrants it:
 
-Use local field catalog first.
+1. generate diverse base structures;
+2. validate/dedup;
+3. simulate one baseline per structure;
+4. expand only successful structures;
+5. tune windows/decay/neutralization/truncation/blends;
+6. stop families with poor marginal information gain;
+7. persist lineage and budget consumed per family.
 
-### P4.2 Structural screening
-
-Record features:
-
-```text
-field categories
-operator counts
-expression depth
-time-series windows
-group operators
-decay
-neutralization
-truncation
-signal family
-```
-
-Flag candidates strongly resembling previously poor families.
-
-Do not hard-reject solely from heuristic predictions at first; lower their priority instead.
-
-### P4.3 Diversity gate
-
-Avoid simulating hundreds of minor variants simultaneously.
-
-Example:
-
-```text
-same base expression
-windows = [20, 40, 60, 120, 250]
-decays = [0, 2, 4, 8, 16]
-```
-
-Initially test only representative configurations.
-
-Expand parameter search only if the base signal works.
+Acceptance: parameter grids cannot monopolize all BRAIN slots before their base structure proves useful.
 
 ---
 
-## P5 — Successive-Halving Search
+# Priority 4 — Open issue #1: agent-agnostic self-evolving knowledge + skills (P12)
 
-> **Status: the gate is implemented, the fixed-ratio funnel is not** — and the funnel is
-> the part that would be redundant today. `scripts/successive_halving.py` admits one
-> representative variant per structure and holds its siblings (QUEUED +
-> `next_attempt_at` + `gate_reason`, invisible to the slot scheduler) until the structure
-> passes or its horizon elapses, so a grid can no longer occupy every slot before anyone
-> knows whether the base signal works. `parent_id` / `generation` / `mutation_type`
-> already exist for the generator to fill. The 2000 -> 800 -> baseline -> survivors
-> ratios assume a mass generator this repo does not have yet; wiring ratios without it
-> would be ceremony, so it waits for that generator.
+Tracking issue: [#1 — Build agent-agnostic self-evolving knowledge + skill system](https://github.com/Uwater1/wq-alpha-research/issues/1)
 
-Replace exhaustive parameter grids.
+Status: ⏳ open. This replaces the old small “append lessons to SKILL.md” concept.
 
-Example:
+Important current problem: the latest research flow still appends large dated campaign records into root `SKILL.md`. That directly conflicts with the goal of keeping prompt-loaded context terse.
 
-```text
-Stage 0
-2000 generated ideas
+### P12.1 — Storage + compatibility
 
-Stage 1
-local validation / dedup
-→ 800
+Extend `research.db` with structured knowledge, not another agent-specific store:
 
-Stage 2
-one baseline simulation per core signal
-→ retain top ~15–25%
+- observations / evidence;
+- scoped rules;
+- rule proposals;
+- support vs contradiction counts;
+- lineage/mutation outcomes;
+- family aggregates;
+- provenance;
+- privacy class;
+- lifecycle state.
 
-Stage 3
-parameter tuning on survivors
-→ retain top ~20–30%
+Keep existing simulation/submission behavior and legacy export compatibility.
 
-Stage 4
-final IS / correlation validation
-→ submission-ready set
+### P12.2 — Terse skill + retrieval
+
+Refactor root `SKILL.md` into a short procedure only:
+
+1. scope;
+2. research workflow;
+3. generation rules;
+4. validation/simulation gates;
+5. correlation/submission gates;
+6. recall command;
+7. learning command;
+8. privacy/safety;
+9. pointers to references.
+
+Move dated campaign logs, raw experiment records, large field/operator material, and rarely needed examples out of root `SKILL.md`.
+
+Start retrieval with SQLite FTS5 + structured filters; embeddings are optional later.
+
+### P12.3 — Proposal-based learning
+
+Replace direct append/update behavior with:
+
+`events -> scoped observations -> aggregate evidence -> rule proposal`
+
+Each learned rule must carry:
+
+- scope;
+- supporting evidence;
+- contradicting evidence;
+- provenance;
+- independence/grouping information;
+- status: proposed / active / weakened / retired / pinned.
+
+One simulation result must not become a global instruction.
+
+### P12.4 — Safe skill manager
+
+All skill mutations go through one manager:
+
+- expected-SHA/version guard;
+- atomic write;
+- mutation ledger;
+- content-addressed backup;
+- diff;
+- rollback;
+- user-owned/pinned rule protection;
+- privacy checks before compiling tracked files.
+
+### P12.5 — Universal CLI
+
+Core correctness must not depend on Codex, Pi, OpenCode, Hermes, MCP, etc.
+
+Expose stable commands such as:
+
+```bash
+python -m wq status --json
+python -m wq candidate ...
+python -m wq simulate ...
+python -m wq recall ... --json
+python -m wq knowledge rules --json
+python -m wq knowledge evidence <rule-id> --json
+python -m wq learn review
+python -m wq learn proposals
+python -m wq learn evaluate <proposal-id>
+python -m wq learn promote <proposal-id>
+python -m wq learn reject <proposal-id>
+python -m wq skill validate
+python -m wq skill history
+python -m wq skill rollback <mutation-id>
 ```
 
-Parameters worth tuning after a signal proves viable:
+Optional agent integrations must wrap the same service layer and contain no unique logic.
 
-```text
-window
-decay
-neutralization
-truncation
-signal blend weights
-trade_when / smoothing
-```
+### P12.6 — Privacy classes
 
-Avoid tuning dozens of variants of a signal with clearly poor Sharpe/Fitness.
+At minimum:
 
-Persist parent-child relationships:
+- `PUBLIC`
+- `SANITIZED`
+- `PRIVATE`
+- `SECRET`
 
-```text
-candidate.parent_id
-candidate.generation
-candidate.mutation_type
-```
+Credentials must never enter the learning store. Exact private expressions, account-linked alpha IDs/PnL, and submission history must not be compiled into public git-tracked skill files.
 
-This lets the agent learn which modifications improved results.
+### P12.7 — Evaluation-gated promotion
+
+Before autonomous promotion:
+
+- replay historical research;
+- compare candidate rule/skill vs current baseline;
+- measure ranking/search utility, regressions, and privacy violations;
+- promote only on configured criteria;
+- automatically reject/retire harmful rules.
+
+### Acceptance for issue #1
+
+- a fresh shell-capable agent can operate from `AGENTS.md` + terse `SKILL.md`;
+- raw experiments stay outside prompt-loaded skill;
+- rules are scoped, evidenced, versioned, auditable, reversible;
+- conflicting evidence can weaken/retire a rule;
+- concurrent agents cannot overwrite stale skill state;
+- private data cannot be promoted into public skill/reference files;
+- no specific agent runtime is required for correctness.
 
 ---
 
-## P6 — Submission Queue 
+# Priority 5 — Learned simulation surrogate (P11)
 
-> **Status: implemented** (`scripts/submission_worker.py` + the `submissions` table).
-> A candidate that clears the IS gate is filed READY automatically with the P6 gates
-> (sharpe/fitness/turnover floors, no identical ACTIVE alpha, and a
-> `--require-correlation` switch that P9 will turn on), ordered by quality + novelty +
-> portfolio diversification instead of arrival order. The worker leases one row at a
-> time, re-checks the gates at claim time, submits, polls within a bounded budget, keeps
-> CHECK_PENDING rows reconcilable, and continues to the next candidate after a success
-> instead of stopping the queue. Nothing here submits from a simulation worker.
+Status: ⏳ wait for enough clean history.
 
-Do not submit directly from simulation workers.
+Train ranking models from:
 
-Create a dedicated queue containing only candidates that pass configured gates.
+- AST/operator structure;
+- fields/categories/coverage;
+- windows/settings;
+- signal family;
+- lineage/mutation features;
+- parent outcomes;
+- local correlation/diversification.
 
-Suggested default gates:
+Targets may include Sharpe, Fitness, Turnover, IS pass/fail, common failure checks, and submission-readiness.
+
+Primary objective: **ranking quality / top-candidate recall**, not exact metric prediction.
+
+Do not hard-reject solely from model prediction at first.
+
+---
+
+# Priority 6 — Complete observability (P13)
+
+Status: ⚠️ partial.
+
+Existing DB events and `status` counters are useful groundwork, but full BRAIN interaction observability is missing.
+
+Add:
+
+- operation + timestamp;
+- candidate/simulation/submission identifiers;
+- HTTP status/category;
+- retry count;
+- latency;
+- rate-limit/backoff events;
+- result class.
+
+Track at least:
+
+- generated/hour;
+- validated/hour;
+- simulated/hour;
+- cache-hit rate;
+- simulation success rate;
+- IS pass rate;
+- correlation pass rate;
+- submission success rate;
+- ACTIVE/week;
+- BRAIN simulations per IS_PASS;
+- BRAIN simulations per ACTIVE.
+
+---
+
+# Priority 7 — Keep tests aligned with active work (P14)
+
+Status: ⚠️ broad coverage exists; extend with each active phase.
+
+Required additions:
+
+- P8 uncertain-submit/retry/restart cases;
+- P9 ACTIVE pagination/cache/staleness/correlation cases;
+- non-default ACTIVE canonical identity regression;
+- P12 rule evidence/proposal/promotion/rollback/concurrency/privacy cases;
+- mocked end-to-end flow:
+  `generate -> queue -> simulate -> correlate -> submit -> ACTIVE -> learn`.
+
+No default test may require live credentials. Live BRAIN probes remain explicit/manual.
+
+---
+
+# Implementation order
 
 ```text
-IS checks pass
-Sharpe >= configured floor
-Fitness >= configured floor
-turnover within configured range
-local self-correlation gate passes
-not already ACTIVE
-not already queued/submitted
-```
-
-Queue ordering should consider:
-
-```text
-submission_priority =
-    quality
-    + novelty
-    + portfolio_diversification
-```
-
-Do not stop the entire queue after the first successful submission.
-
-Track independently:
-
-```text
-READY
-SUBMITTING
-CHECK_PENDING
-ACTIVE
-SELF_CORR_FAIL
-PLATFORM_REJECTED
-RETRY
+1. P8 submission recovery fixes
+2. P9 correlation pipeline
+3. P5 staged-search completion only when generator volume requires it
+4. Issue #1 / P12 storage + terse skill + retrieval
+5. P12 proposal learning + safe mutation + eval gate
+6. P11 surrogate model
+7. P13 observability + P14 regression coverage throughout
+8. GitHub Actions submission automation — LAST
 ```
 
 ---
 
-## P7 — Hourly GitHub Actions Submission Worker (too aggressive, need updates)
+# LAST / DEFERRED — GitHub Actions submission worker (old P7)
 
-Use GitHub Actions as a low-frequency queue drainer.
+Status: 💤 deliberately postponed.
 
-Purpose:
+Do not build unattended GitHub-hosted submission until P8/P9 are proven and persistent/private state has a safe home.
 
-```text
-research continuously builds SUBMISSION_READY candidates
-GitHub Action wakes hourly
-→ attempts limited submissions/checks
-→ persists result
-→ exits
-```
+Requirements before enabling:
 
-Workflow:
+- P8 uncertain-submit recovery is tested;
+- P9 stale-correlation gate is mandatory;
+- canonical queue state is **not** runner-local SQLite;
+- private/account-linked research state is not committed;
+- secrets exist only in an approved secret store;
+- run is bounded by `MAX_SUBMISSIONS_PER_RUN`, runtime, and polling budget;
+- duplicate overlapping runs are harmless.
 
-```yaml
-schedule:
-  - cron: "17 * * * *"
+Preferred order of deployment:
 
-workflow_dispatch:
-```
+1. local/manual worker;
+2. persistent self-hosted runner or private service;
+3. only then consider GitHub-hosted Actions with a private persistent backend.
 
-Use a non-zero minute to avoid common `:00` scheduler congestion.
-
-Worker behavior:
+If GitHub Actions is eventually used:
 
 ```text
-1. authenticate
-2. load submission queue
-3. refresh ACTIVE/current statuses
-4. select highest-priority READY candidate
-5. re-check stale gates if needed
-6. submit
-7. poll only within bounded runtime
-8. persist result
-9. optionally process next candidate up to configured limit
-10. exit
+workflow_dispatch first
+-> low-frequency schedule later
+-> MAX_SUBMISSIONS_PER_RUN=1 initially
 ```
 
-Configuration:
-
-```text
-MAX_SUBMISSIONS_PER_RUN
-MAX_RUNTIME_MINUTES
-CHECK_POLL_SECONDS
-MAX_CHECK_POLLS
-```
-
-Start conservatively:
-
-```text
-MAX_SUBMISSIONS_PER_RUN=1
-```
-
-Increase only if platform behavior confirms it is safe and useful.
-
-### Secrets
-
-Store only in GitHub Actions secrets:
-
-```text
-WQ_BRAIN_USERNAME
-WQ_BRAIN_PASSWORD
-```
-
-Never commit credentials/session cookies.
-
-Prefer an isolated submission script:
-
-```text
-scripts/submission_worker.py
-```
-
-### Persistence problem
-
-GitHub Actions runners are ephemeral.
-
-Do not use runner-local SQLite as the canonical queue.
-
-Choose one persistent backend:
-
-```text
-A. committed sanitized queue metadata — only if no private/account-linked data
-B. GitHub artifact — poor choice for canonical mutable state
-C. external DB/object store
-D. self-hosted runner with persistent disk
-E. API-backed private service
-```
-
-Preferred architecture:
-
-```text
-private persistent DB/service
-        ↑
-local researcher
-        ↓
-GitHub Actions submission worker
-```
-
-Do not commit:
-
-```text
-alpha IDs
-private expressions
-PnL
-account-linked metrics
-submission history
-credentials
-```
-
-If all research state must remain local/private, use a self-hosted runner instead of GitHub-hosted runners.
+A compiled binary does **not** make credentials safe by itself; the runtime still needs access to the secret. Do not rely on obfuscation as a security boundary.
 
 ---
 
-## P8 — Idempotent Submission Worker
+## Maintenance rule
 
-Hourly jobs must be safe if duplicated or delayed.
+Keep this file as the **active roadmap**, not a historical design document.
 
-Before submit:
+When work is completed:
 
-```text
-SELECT candidate
-WHERE status = SUBMISSION_READY
-AND next_attempt_at <= now
-ORDER BY priority DESC
-LIMIT 1
-```
-
-Acquire lock/lease:
-
-```text
-status = SUBMITTING
-lease_until = now + N minutes
-worker_id = ...
-```
-
-Then submit.
-
-After crash:
-
-```text
-expired SUBMITTING lease
-→ reconcile against BRAIN
-→ READY / ACTIVE / REJECTED
-```
-
-Use BRAIN state as source of truth before retrying an uncertain submission.
-
-Never blindly resubmit after timeout.
-
-Acceptance:
-
-- two overlapping GitHub Actions cannot submit the same alpha twice;
-- crash during submission is recoverable;
-- every attempt is auditable.
-
----
-
-## P9 — Self-Correlation Pipeline
-
-Separate cheap local correlation from expensive platform checks.
-
-Before submission:
-
-```text
-candidate daily PnL
-vs
-ACTIVE alpha daily PnL
-```
-
-Use daily PnL changes/returns, not cumulative PnL curves.
-
-Cache ACTIVE PnL locally and refresh when:
-
-- an alpha becomes ACTIVE;
-- old cache exceeds configured age;
-- BRAIN data changes.
-
-Record:
-
-```text
-max_corr
-max_corr_alpha_id
-corr_checked_at
-active_set_version
-```
-
-If ACTIVE portfolio changes after local checking, mark old candidates:
-
-```text
-CORR_STALE
-```
-
-and re-check before submission.
-
----
-
-## P10 — Better Candidate Ranking
-
-Initially derive ranking from known empirical rules.
-
-Example positive features:
-
-```text
-fundamental signal
-good field coverage
-reasonable expression depth
-group normalization
-moderate turnover family
-novel signal family
-successful parent candidate
-```
-
-Negative features:
-
-```text
-historically poor family
-extreme expected turnover
-many nested operators
-tiny mutation of failed alpha
-similarity to existing ACTIVE alpha
-```
-
-Store the ranking components, not only the final score.
-
-Example:
-
-```json
-{
-  "quality_score": 0.72,
-  "novelty_score": 0.84,
-  "failure_risk": 0.21,
-  "priority": 1.35
-}
-```
-
-This makes later model training possible.
-
----
-
-## P11 — Learn a Simulation Surrogate
-
-After enough simulations are collected, train a model to predict candidate quality.
-
-Input features:
-
-```text
-AST/operator features
-fields/categories
-field metadata
-windows
-decay
-neutralization
-truncation
-expression depth
-signal family
-parent performance
-```
-
-Targets:
-
-```text
-Sharpe
-Fitness
-Turnover
-IS pass/fail
-LOW_SUB_UNIVERSE_SHARPE
-CONCENTRATED_WEIGHT
-submission-ready probability
-```
-
-Primary goal is ranking, not exact metric prediction.
-
-Useful metric:
-
-```text
-precision/recall for identifying top simulation candidates
-```
-
-Use model output as scheduler priority.
-
-Do not initially hard-reject candidates solely from model prediction.
-
----
-
-## P12 — Research Feedback Loop
-
-Extend `evolve_skill.py`.
-
-Current output:
-
-```text
-human-readable lessons
-```
-
-Add machine-readable observations:
-
-```text
-research_events
-candidate lineage
-simulation outcomes
-mutation outcomes
-family statistics
-```
-
-Compute aggregates:
-
-```text
-pass rate by signal family
-pass rate by dataset/category
-parameter success rate
-mutation improvement rate
-median Sharpe/Fitness/turnover
-simulation cost per successful alpha
-```
-
-Write only sanitized/general lessons into `SKILL.md`.
-
-Keep private research data outside git.
-
----
-
-## P13 — Observability
-
-Log every BRAIN interaction with:
-
-```text
-timestamp
-operation
-candidate_id
-simulation_id
-alpha_id
-HTTP status
-retry count
-latency
-result
-```
-
-Track throughput:
-
-```text
-generated/hour
-validated/hour
-simulated/hour
-cache-hit rate
-simulation success rate
-IS pass rate
-correlation pass rate
-submission success rate
-ACTIVE/week
-```
-
-Most important efficiency metric:
-
-```text
-BRAIN simulations per ACTIVE alpha
-```
-
-Also track:
-
-```text
-BRAIN simulations per IS_PASS alpha
-```
-
-Goal is to reduce these over time.
-
----
-
-## P14 — Tests
-
-Add unit tests for:
-
-```text
-expression normalization
-simulation-key generation
-exact dedup
-queue state transitions
-priority ordering
-retry/backoff
-lease recovery
-GitHub worker idempotency
-correlation calculation
-successive-halving selection
-multi-sim packing
-multi-sim fallback
-```
-
-Add mocked integration flow:
-
-```text
-generate
-→ queue
-→ simulate
-→ result
-→ correlation
-→ submission queue
-→ submit
-→ ACTIVE
-```
-
-No test should require live credentials by default.
-
-Live BRAIN tests must be explicit/manual.
-
----
-
-## P15 — Recommended Implementation Order
-
-### Phase 1 — Make Current Pipeline Reliable
-
-```text
-P0 state model
-P1 cache/dedup
-P2 persistent 3-slot scheduler
-P6 submission queue
-P8 idempotency
-```
-
-### Phase 2 — Use Time Better
-
-```text
-P7 hourly GitHub Actions worker
-P9 correlation cache
-P4 pre-screening
-P5 successive halving
-```
-
-### Phase 3 — Increase Effective Capacity
-
-```text
-P3 multi-simulation
-P10 smarter ranking
-P12 structured learning
-```
-
-### Phase 4 — Learned Research System
-
-```text
-P11 surrogate model
-advanced candidate generation
-adaptive search budgets
-```
-
----
-
-# Target Architecture
-
-```text
-                     ┌─────────────────────┐
-                     │   Agent Generator   │
-                     └──────────┬──────────┘
-                                │
-                                ▼
-                     ┌─────────────────────┐
-                     │ Validate + Normalize│
-                     │ Dedup + Cache Check │
-                     └──────────┬──────────┘
-                                │
-                                ▼
-                     ┌─────────────────────┐
-                     │ Priority Queue / DB │
-                     └──────────┬──────────┘
-                                │
-                ┌───────────────┴───────────────┐
-                ▼                               ▼
-      ┌───────────────────┐          ┌───────────────────┐
-      │ Multi-Sim Packer  │          │ REGULAR Fallback  │
-      └─────────┬─────────┘          └─────────┬─────────┘
-                └───────────────┬───────────────┘
-                                ▼
-                     ┌─────────────────────┐
-                     │ BRAIN Slot Scheduler│
-                     │      max = 3        │
-                     └──────────┬──────────┘
-                                │
-                                ▼
-                     ┌─────────────────────┐
-                     │ Results + Learning  │
-                     └──────────┬──────────┘
-                                │
-                      successive halving
-                                │
-                                ▼
-                     ┌─────────────────────┐
-                     │ IS + Correlation    │
-                     │       Gate          │
-                     └──────────┬──────────┘
-                                │
-                                ▼
-                     ┌─────────────────────┐
-                     │ Submission Queue    │
-                     └──────────┬──────────┘
-                                │
-                       hourly / manual
-                                │
-                                ▼
-                     ┌─────────────────────┐
-                     │ Submission Worker   │
-                     │ GitHub Action or    │
-                     │ self-hosted runner  │
-                     └──────────┬──────────┘
-                                │
-                                ▼
-                           ACTIVE
-```
-
-# Definition of Done
-
-The pipeline is complete when:
-
-- research can generate candidates faster than BRAIN can consume them without losing state;
-- duplicate simulations are eliminated;
-- three simulation slots stay efficiently utilized;
-- multi-simulation is used automatically when a probe proves the platform supports
-  it (it does not today — see P3), with the REGULAR scheduler as the fallback;
-- parameter brute force is replaced by staged search;
-- simulation and submission operate independently;
-- submission-ready alphas remain queued until processed;
-- an hourly worker can safely drain the queue;
-- overlapping/restarted workers cannot duplicate submissions;
-- private/account-linked research data never enters the public repository;
-- each simulation improves future candidate ranking;
-- useful output is measured by `simulations / ACTIVE alpha`, not raw simulation count.
+- collapse it to one short row in “Completed baseline”;
+- keep only unresolved regressions/caveats;
+- link detailed open work to a GitHub issue instead of duplicating a full issue body here.
