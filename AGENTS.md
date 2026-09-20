@@ -75,6 +75,19 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   an identical request is never sent to BRAIN twice; `batch_simulate.py` uses the
   store by default (`--no-db` for the legacy CSV-only behavior).
 
+- Learned simulation surrogate (advisory only):
+
+  ```bash
+  ./.venv/bin/python scripts/surrogate.py status
+  ./.venv/bin/python scripts/surrogate.py train --min-samples 5
+  ./.venv/bin/python scripts/surrogate.py evaluate
+  ./.venv/bin/python scripts/surrogate.py rank --limit 20
+  ```
+
+  It learns from settled local candidates using structural fields/operators, settings,
+  signal family, lineage, and outcomes. It only reorders candidates; it never rejects a
+  candidate solely from model prediction.
+
 - Persistent 3-slot simulation dispatcher. Queue work first, then run it:
 
   ```bash

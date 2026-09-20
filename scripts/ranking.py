@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 import canonical
+import surrogate
 
 # Weights kept in one place so the surrogate work can tune them without touching the logic.
 WEIGHTS: dict[str, float] = {
@@ -59,6 +60,7 @@ class RankingContext:
     field_counts: dict[str, int] = field(default_factory=dict)                 # field -> rows using it
     queued_total: int = 0
     total_candidates: int = 0
+    surrogate_model: dict[str, Any] | None = None
 
 
 @dataclass
@@ -114,6 +116,7 @@ def build_context(db: Any) -> RankingContext:
 
     context.queued_total = int(db.query("SELECT COUNT(*) AS n FROM candidates WHERE status='QUEUED'")[0]["n"])
     context.total_candidates = int(db.query("SELECT COUNT(*) AS n FROM candidates")[0]["n"])
+    context.surrogate_model = surrogate.load(db)
     return context
 
 
@@ -161,6 +164,11 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
         reasons["family_pass_rate"] = round(observed, 3)
     else:
         expected_quality = prior
+    if context.surrogate_model:
+        prediction = surrogate.predict(context.surrogate_model, row).get("is_pass")
+        if prediction is not None:
+            expected_quality = 0.7 * expected_quality + 0.3 * max(0.0, min(1.0, prediction))
+            reasons["surrogate_is_pass"] = round(prediction, 4)
     reasons["prior_quality"] = round(prior, 3)
 
     # The counts include this very candidate, so subtract it: we want prior attempts.

@@ -94,7 +94,7 @@ Acceptance:
 
 ## Priority 2 — Learned simulation surrogate
 
-Status: pending; the ranking feature ledger is ready for training but no surrogate is allowed to hard-reject candidates yet.
+Status: implemented as an advisory ridge surrogate. It trains from settled local history and contributes only a ranking bonus; predictions never hard-reject candidates.
 
 Train ranking models from structural features, fields/categories/coverage, windows and
 settings, signal family, lineage/mutation features, parent outcomes, and local
