@@ -106,7 +106,7 @@ metric prediction. Do not hard-reject candidates solely from model prediction at
 
 ## Priority 3 — Complete observability
 
-Status: implementation underway; structured event fields and expanded local throughput counters are now present.
+Status: implemented. Structured transport/event dimensions and expanded local throughput counters are persisted in `research.db`; remaining work is to add deployment dashboards if needed.
 
 Extend the existing event and status groundwork to record operation, timestamp,
 candidate/simulation/submission identifiers, HTTP status/category, retry count,

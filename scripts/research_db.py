@@ -2607,7 +2607,7 @@ class ResearchDB:
         ).fetchone()["n"])
         corr_pass = int(self._conn.execute(
             "SELECT COUNT(*) AS n FROM candidates WHERE corr_status IN ('ok','empty_book') "
-            "AND (self_corr IS NULL OR ABS(self_corr) < ?)", (CORRELATION_EXCEPTION_RATIO,)
+            "AND (self_corr IS NULL OR ABS(self_corr) < ?)", (0.7,)
         ).fetchone()["n"])
         submission_total = int(self._conn.execute("SELECT COUNT(*) AS n FROM submissions").fetchone()["n"])
         active_submissions = int(self._conn.execute(

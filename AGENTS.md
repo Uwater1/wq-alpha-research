@@ -131,6 +131,10 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   ./.venv/bin/python scripts/submission_worker.py --require-correlation --max-submissions 1
   ```
 
+  `research.db` events also retain operation, HTTP status/category, retry count, latency,
+  rate-limit/backoff seconds, and result class without response bodies or credentials;
+  `research_db.py status` reports throughput and pass-rate metrics.
+
   `--require-correlation` is a real gate: the worker syncs and versions the ACTIVE book,
   fetches the candidate's PnL, correlates aligned **daily returns** (never cumulative
   curves) and refuses anything at or above `--correlation-limit`. Unusable inputs (missing

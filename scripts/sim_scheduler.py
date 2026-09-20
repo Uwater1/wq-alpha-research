@@ -283,6 +283,10 @@ class SimulationScheduler:
             self._retire(candidate_id, str(exc))
             return False
 
+        self._log_transport(
+            candidate_id=candidate_id, simulation_id=handle.simulation_id,
+            operation="simulation.submit", result_class="accepted",
+        )
         self.db.mark_simulation_started(
             candidate_id, handle.simulation_id, worker_id=self.worker_id, lease_seconds=self.lease_seconds
         )
@@ -292,6 +296,19 @@ class SimulationScheduler:
         self.submitted += 1
         print(f"[scheduler] slot {len(self.inflight)}/{self.slots}: {expression[:60]!r} -> {handle.simulation_id}")
         return True
+
+    def _log_transport(self, *, candidate_id: int | None = None, simulation_id: str | None = None,
+                       submission_id: int | None = None, operation: str, result_class: str) -> None:
+        """Persist non-sensitive HTTP telemetry when the client exposes it."""
+        request = getattr(self.client, "last_request", {}) or {}
+        self.db.log_event(
+            "transport", candidate_id or simulation_id or submission_id, "http",
+            operation=operation, candidate_id=candidate_id, simulation_id=simulation_id,
+            submission_id=submission_id, http_status=request.get("http_status"),
+            error_category=request.get("error_category"), retry_count=int(request.get("retry_count") or 0),
+            latency_ms=request.get("latency_ms"), rate_limit_seconds=request.get("rate_limit_seconds"),
+            result_class=result_class,
+        )
 
     def _submit_with_reauth(self, expression: str, settings: Mapping[str, Any], candidate_id: int):
         try:
@@ -377,6 +394,8 @@ class SimulationScheduler:
                 continue
             try:
                 state = self.client.poll(handle)
+                self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                    operation="simulation.poll", result_class=state.status.lower())
             except brain_api.RateLimitError as exc:
                 self.rate_limited += 1
                 handle.next_poll_at = self._clock() + max(exc.retry_after, self.poll_interval)

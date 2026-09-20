@@ -152,6 +152,9 @@ class BrainClient:
         self.retries = retries
         self.last_latency: float = 0.0
         self.auth_count = 0
+        # Last-request telemetry is intentionally data-only; callers may persist it in
+        # research.db without ever logging credentials or response bodies.
+        self.last_request: dict[str, Any] = {}
 
     # -- session -----------------------------------------------------------
 
@@ -207,20 +210,31 @@ class BrainClient:
                 response = self.session.request(method, url, **kwargs)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 self.last_latency = time.monotonic() - started
+                self.last_request = {
+                    "method": method, "url": url, "http_status": None,
+                    "error_category": type(exc).__name__, "retry_count": attempt,
+                    "latency_ms": round(self.last_latency * 1000.0, 3),
+                }
                 if attempt >= attempts:
                     raise BrainAPIError(f"{method} {url} failed: {exc}") from exc
                 time.sleep(DEFAULT_BACKOFF_BASE * (2**attempt))
                 continue
             self.last_latency = time.monotonic() - started
+            self.last_request = {
+                "method": method, "url": url, "http_status": response.status_code,
+                "retry_count": attempt, "latency_ms": round(self.last_latency * 1000.0, 3),
+            }
 
             if response.status_code == 429:
                 last_retry_after = self.retry_after_seconds(response)
+                self.last_request.update({"error_category": "rate_limit", "rate_limit_seconds": last_retry_after})
                 if attempt >= attempts:
                     raise RateLimitError(f"{method} {url} rate-limited", last_retry_after)
                 time.sleep(min(last_retry_after, 30.0))
                 continue
 
             if response.status_code in (401, 403):
+                self.last_request["error_category"] = "session_expired"
                 raise SessionExpiredError(f"{method} {url} -> HTTP {response.status_code}", response.status_code)
 
             if response.status_code >= 400:
@@ -230,7 +244,9 @@ class BrainClient:
                 except (ValueError, AttributeError):
                     pass
                 if "credentials" in detail.lower():
+                    self.last_request["error_category"] = "session_expired"
                     raise SessionExpiredError(f"BRAIN rejected the request: {detail}", response.status_code)
+                self.last_request["error_category"] = "http_error"
                 raise BrainAPIError(f"{method} {url} -> HTTP {response.status_code}: {detail}", response.status_code)
 
             return response

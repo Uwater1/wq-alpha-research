@@ -300,6 +300,14 @@ class SubmissionWorker:
         # outcome is unknown and must be reconciled instead of blindly retried.
         self.db.mark_submission_posted(submission_id)
         outcome = self.client.submit_alpha(alpha_id)
+        request = getattr(self.client, "last_request", {}) or {}
+        self.db.log_event(
+            "transport", submission_id, "http", operation="submission.submit",
+            candidate_id=int(candidate["id"]), submission_id=submission_id,
+            http_status=request.get("http_status"), error_category=request.get("error_category"),
+            retry_count=int(request.get("retry_count") or 0), latency_ms=request.get("latency_ms"),
+            rate_limit_seconds=request.get("rate_limit_seconds"), result_class=outcome.get("outcome"),
+        )
         print(f"[submit] alpha {_mask(alpha_id)}: {outcome['outcome']}")
         if outcome["outcome"] == "uncertain":
             # The POST may have reached BRAIN even though its response was lost. Do not
