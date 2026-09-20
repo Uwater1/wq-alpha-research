@@ -122,7 +122,7 @@ Track at least:
 
 ## Priority 4 — Regression coverage and safe deployment
 
-Status: partial; extend coverage with each active phase.
+Status: implemented for offline correctness and bounded local deployment; live BRAIN/GitHub Actions submission remains explicit/manual.
 
 Keep the default test suite offline. Live BRAIN probes remain explicit/manual and may
 not require credentials in default tests.
@@ -134,11 +134,13 @@ staleness, canonical identity, staged-search budgeting, and the recent cases whe
 - a failed ACTIVE-book refresh holds correlation-enabled submissions;
 - `--no-staged` actually disables staged search above its volume threshold.
 
-Still required:
+Covered:
 
 - rule evidence, proposal, promotion, rollback, concurrency, and privacy cases;
 - a mocked end-to-end flow:
   `generate -> queue -> simulate -> correlate -> submit -> ACTIVE -> learn`.
+
+Deployment remains bounded and restart-safe: default tests are offline, credentials are resolved only in memory, uncertain submissions reconcile before retry, correlation freshness is required when enabled, and unattended GitHub Actions submission remains deferred.
 
 Unattended GitHub Actions submission remains deferred until submission recovery,
 correlation freshness, persistent/private state, bounded runs, secret handling, and

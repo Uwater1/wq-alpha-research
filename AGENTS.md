@@ -123,6 +123,10 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
   land in the submission queue automatically; the worker leases one, re-checks the gates,
   submits, polls and continues.
 
+- Offline end-to-end regression coverage is in `tests/test_pipeline_e2e.py` and uses only fakes.
+  Run `./.venv/bin/python -m pytest -q` before any live probe. Live BRAIN probes are explicit,
+  bounded, and never part of the default test suite.
+
 - Local self-correlation + submission recovery:
 
   ```bash
