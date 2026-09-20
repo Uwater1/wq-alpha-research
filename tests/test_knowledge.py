@@ -134,6 +134,18 @@ def test_skill_manager_uses_expected_sha_atomic_backup_and_rollback(tmp_path, db
     assert skill_manager.read_skill(skill)[1] == before
 
 
+def test_skill_manager_applies_sanitized_snippets_through_the_same_ledger(tmp_path, db):
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("# Router\n", encoding="utf-8")
+    before = skill_manager.read_skill(skill)[1]
+    result = skill_manager.apply_snippet(
+        db, skill, "### General lesson\n\nPrefer independent evidence.", expected_sha=before,
+    )
+    assert result["version"] == 1
+    assert "Prefer independent evidence" in skill.read_text(encoding="utf-8")
+    assert db.query("SELECT operation FROM skill_mutations")[0]["operation"] == "skill.apply_snippet"
+
+
 def test_skill_manager_refuses_private_rules_and_secret_text(tmp_path, db):
     skill = tmp_path / "SKILL.md"
     skill.write_text("# Router\n", encoding="utf-8")

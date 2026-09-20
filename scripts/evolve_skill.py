@@ -460,19 +460,21 @@ def build_incremental_report(entries: list[dict[str, Any]], sanitize: bool = Tru
     return "\n".join(lines)
 
 
-def append_to_skill(snippet: str) -> None:
-    """Append snippet to the end of SKILL.md (Section 12 is the last section)."""
+def append_to_skill(snippet: str, *, expected_sha: str | None = None) -> dict[str, Any]:
+    """Append reviewed sanitized prose through the shared guarded skill manager."""
     if not SKILL_PATH.exists():
         raise FileNotFoundError(f"SKILL.md not found at {SKILL_PATH}")
-    content = SKILL_PATH.read_text(encoding="utf-8")
-    marker = "## 12. Empirical Record (Auto-Updated)"
-    if marker not in content:
-        content += f"\n\n{marker}\n\n{snippet}"
-    else:
-        if not content.endswith("\n"):
-            content += "\n"
-        content += snippet + "\n"
-    SKILL_PATH.write_text(content, encoding="utf-8")
+    from skill_manager import apply_snippet, read_skill
+    from research_db import ResearchDB
+
+    _, actual_sha = read_skill(SKILL_PATH)
+    with ResearchDB.open() as knowledge_db:
+        return apply_snippet(
+            knowledge_db, SKILL_PATH, snippet,
+            expected_sha=expected_sha or actual_sha,
+            actor="evolve_skill",
+            privacy_class="SANITIZED",
+        )
 
 
 def main() -> int:
@@ -611,10 +613,13 @@ def main() -> int:
     print("=" * 60)
 
     if args.apply:
-        append_to_skill(snippet)
+        from skill_manager import read_skill
+
+        _, expected_sha = read_skill(SKILL_PATH)
+        mutation = append_to_skill(snippet, expected_sha=expected_sha)
         db["last_update"] = datetime.now(timezone.utc).isoformat()
         save_alpha_db(db)
-        print(f"\nAppended to {SKILL_PATH}")
+        print(f"\nAppended to {SKILL_PATH} via skill manager (mutation {mutation['mutation_id']}, version {mutation['version']})")
         print(f"alpha_db.json updated: {len(db['alphas'])} alphas tracked.")
     else:
         print("\nDry-run: SKILL.md and alpha_db.json were NOT modified. Use --apply to commit.")

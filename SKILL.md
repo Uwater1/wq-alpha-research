@@ -1084,3 +1084,6 @@ orthogonal: they died on LOW_FITNESS (Fitness 0.12-0.86) before correlation ever
    in it. A static validator must classify a keyword argument by its *own* leading `name =`, not by an `=`
    nested inside a call.
 
+### Sanitized 2026-09-20 campaign lesson
+
+Repeated estimate-yield variants can produce strong IS metrics (Sharpe roughly 1.9–2.1 and Fitness roughly 1.5–1.9) while remaining highly correlated with the existing estimate-yield book. Treat transform/window/neutralization variants as one family: require a genuinely different data source or economic logic before spending a submission slot, and let the daily-return correlation gate hold redundant candidates.

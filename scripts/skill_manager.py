@@ -47,6 +47,13 @@ def _assert_public(rule: Mapping[str, Any]) -> None:
         raise ValueError("rule contains private identifiers, credentials, or account-linked data")
 
 
+def _assert_snippet_public(snippet: str, privacy_class: str) -> None:
+    if str(privacy_class).upper() not in TRACKED_PRIVACY:
+        raise ValueError("only PUBLIC or SANITIZED snippets may enter tracked skill text")
+    if SECRET_RE.search(snippet):
+        raise ValueError("snippet contains private identifiers, credentials, or account-linked data")
+
+
 def render_rule(rule: Mapping[str, Any]) -> str:
     """Render only general rule prose, never raw evidence payloads."""
     _assert_public(rule)
@@ -74,6 +81,74 @@ def _atomic_write(path: Path, content: str) -> None:
         raise
 
 
+def _record_mutation(
+    db: research_db.ResearchDB,
+    *,
+    operation: str,
+    actor: str,
+    expected_sha: str | None,
+    before_sha: str,
+    after_sha: str,
+    backup_sha: str,
+    backup_path: Path,
+    rule_id: int | None,
+    privacy_class: str,
+) -> dict[str, Any]:
+    version = int(db.get_meta("skill_version") or 0) + 1
+    db.set_meta("skill_version", str(version))
+    mutation_id = db.record_skill_mutation(
+        operation=operation, actor=actor, expected_sha=expected_sha,
+        before_sha=before_sha, after_sha=after_sha, backup_sha=backup_sha,
+        backup_path=str(backup_path), rule_id=rule_id,
+        privacy_class=privacy_class, version=version,
+    )
+    return {"mutation_id": mutation_id, "before_sha": before_sha, "after_sha": after_sha,
+            "backup_sha": backup_sha, "version": version}
+
+
+def _prepare_mutation(path: Path, expected_sha: str | None, backup_dir: str | Path | None) -> tuple[str, str, Path]:
+    before, actual_sha = read_skill(path)
+    if expected_sha is not None and expected_sha != actual_sha:
+        raise ValueError(f"skill SHA mismatch: expected {expected_sha}, current {actual_sha}")
+    backup_root = Path(backup_dir) if backup_dir else path.parent / ".skill-history"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_root / f"{actual_sha}.md"
+    if not backup_path.exists():
+        _atomic_write(backup_path, before)
+    return before, actual_sha, backup_path
+
+
+def _write_compare_and_swap(path: Path, before_sha: str, after: str) -> str:
+    _, latest_sha = read_skill(path)
+    if latest_sha != before_sha:
+        raise ValueError("skill changed during mutation; retry with a fresh expected SHA")
+    _atomic_write(path, after)
+    return sha256_text(after)
+
+
+def apply_snippet(
+    db: research_db.ResearchDB,
+    skill_path: str | Path,
+    snippet: str,
+    *,
+    expected_sha: str | None = None,
+    actor: str = "agent",
+    backup_dir: str | Path | None = None,
+    privacy_class: str = "SANITIZED",
+) -> dict[str, Any]:
+    """Append reviewed self-evolution prose through the guarded mutation path."""
+    _assert_snippet_public(snippet, privacy_class)
+    path = Path(skill_path)
+    before, before_sha, backup_path = _prepare_mutation(path, expected_sha, backup_dir)
+    after = before + ("\n" if before and not before.endswith("\n") else "") + snippet + "\n"
+    after_sha = _write_compare_and_swap(path, before_sha, after)
+    return _record_mutation(
+        db, operation="skill.apply_snippet", actor=actor, expected_sha=expected_sha,
+        before_sha=before_sha, after_sha=after_sha, backup_sha=before_sha,
+        backup_path=backup_path, rule_id=None, privacy_class=str(privacy_class).upper(),
+    )
+
+
 def apply_rule(
     db: research_db.ResearchDB,
     skill_path: str | Path,
@@ -86,33 +161,16 @@ def apply_rule(
     """Append an evaluated rule with compare-and-swap and a content-addressed backup."""
     _assert_public(rule)
     path = Path(skill_path)
-    before, actual_sha = read_skill(path)
-    if expected_sha is not None and expected_sha != actual_sha:
-        raise ValueError(f"skill SHA mismatch: expected {expected_sha}, current {actual_sha}")
+    before, actual_sha, backup_path = _prepare_mutation(path, expected_sha, backup_dir)
     rendered = render_rule(rule)
     after = before + ("\n" if before and not before.endswith("\n") else "") + rendered
-    after_sha = sha256_text(after)
-    backup_root = Path(backup_dir) if backup_dir else path.parent / ".skill-history"
-    backup_root.mkdir(parents=True, exist_ok=True)
-    backup_sha = actual_sha
-    backup_path = backup_root / f"{backup_sha}.md"
-    if not backup_path.exists():
-        _atomic_write(backup_path, before)
-    # Re-read immediately before replacement: a concurrent agent must not lose its edit.
-    _, latest_sha = read_skill(path)
-    if latest_sha != actual_sha:
-        raise ValueError("skill changed during mutation; retry with a fresh expected SHA")
-    _atomic_write(path, after)
-    version = int(db.get_meta("skill_version") or 0) + 1
-    db.set_meta("skill_version", str(version))
-    mutation_id = db.record_skill_mutation(
-        operation="skill.apply", actor=actor, expected_sha=expected_sha,
-        before_sha=actual_sha, after_sha=after_sha, backup_sha=backup_sha,
-        backup_path=str(backup_path), rule_id=int(rule["id"]) if rule.get("id") else None,
-        privacy_class=str(rule["privacy_class"]).upper(), version=version,
+    after_sha = _write_compare_and_swap(path, actual_sha, after)
+    return _record_mutation(
+        db, operation="skill.apply", actor=actor, expected_sha=expected_sha,
+        before_sha=actual_sha, after_sha=after_sha, backup_sha=actual_sha,
+        backup_path=backup_path, rule_id=int(rule["id"]) if rule.get("id") else None,
+        privacy_class=str(rule["privacy_class"]).upper(),
     )
-    return {"mutation_id": mutation_id, "before_sha": actual_sha, "after_sha": after_sha,
-            "backup_sha": backup_sha, "version": version}
 
 
 def rollback(db: research_db.ResearchDB, skill_path: str | Path, backup_sha: str,
@@ -120,7 +178,7 @@ def rollback(db: research_db.ResearchDB, skill_path: str | Path, backup_sha: str
              backup_dir: str | Path | None = None) -> dict[str, Any]:
     """Restore a content-addressed backup, also guarded and ledgered."""
     path = Path(skill_path)
-    before, actual_sha = read_skill(path)
+    _, actual_sha = read_skill(path)
     if expected_sha is not None and expected_sha != actual_sha:
         raise ValueError(f"skill SHA mismatch: expected {expected_sha}, current {actual_sha}")
     backup_path = (Path(backup_dir) if backup_dir else path.parent / ".skill-history") / f"{backup_sha}.md"
@@ -128,16 +186,12 @@ def rollback(db: research_db.ResearchDB, skill_path: str | Path, backup_sha: str
         raise FileNotFoundError(f"skill backup not found: {backup_sha}")
     restored = backup_path.read_text(encoding="utf-8")
     restored_sha = sha256_text(restored)
-    _atomic_write(path, restored)
-    version = int(db.get_meta("skill_version") or 0) + 1
-    db.set_meta("skill_version", str(version))
-    mutation_id = db.record_skill_mutation(
-        operation="skill.rollback", actor=actor, expected_sha=expected_sha,
+    _write_compare_and_swap(path, actual_sha, restored)
+    return _record_mutation(
+        db, operation="skill.rollback", actor=actor, expected_sha=expected_sha,
         before_sha=actual_sha, after_sha=restored_sha, backup_sha=backup_sha,
-        backup_path=str(backup_path), rule_id=None, privacy_class="SANITIZED", version=version,
+        backup_path=backup_path, rule_id=None, privacy_class="SANITIZED",
     )
-    return {"mutation_id": mutation_id, "before_sha": actual_sha, "after_sha": restored_sha,
-            "backup_sha": backup_sha, "version": version}
 
 
 def main(argv: list[str] | None = None) -> int:
