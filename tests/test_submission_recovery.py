@@ -7,6 +7,8 @@ Nothing here touches BRAIN: a fake client records what the worker actually POSTe
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import brain_api
@@ -50,6 +52,46 @@ class FakeSubmitClient:
 
     def close(self):
         pass
+
+
+class _Resp:
+    """Minimal requests-like response."""
+
+    def __init__(self, payload, status_code=200, content=None):
+        self._payload = payload
+        self.status_code = status_code
+        self.content = (json.dumps(payload).encode() if payload is not None else b"") if content is None else content
+        self.text = self.content.decode()
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json body")
+        return self._payload
+
+
+class SilentSubmitClient(brain_api.BrainClient):
+    """A real BrainClient over fake HTTP where /alphas/{id}/submit has *no body*.
+
+    That is what BRAIN does while a submission check is still computing, so the checks have
+    to come from the alpha record. Keeps the real ``submit_checks`` logic under test.
+    """
+
+    def __init__(self, alpha_payload):
+        super().__init__()
+        self.alpha_payload = alpha_payload
+        self.posts: list[str] = []
+        self.submit_reads = 0
+
+    def get(self, url, **kwargs):
+        url = str(url)
+        if url.endswith("/submit"):
+            self.submit_reads += 1
+            return _Resp(None, 200, content=b"")  # accepted, nothing to say yet
+        return _Resp(self.alpha_payload)
+
+    def post(self, url, **kwargs):
+        self.posts.append(str(url))
+        return _Resp({}, 201)
 
 
 @pytest.fixture()
@@ -161,6 +203,47 @@ def test_reconcile_returns_to_ready_only_when_brain_proves_not_submitted(db):
     # Reconcile put the row back to READY, then the worker submitted it once.
     assert client.posts == [candidate["brain_alpha_id"]]
     assert db.counts("submissions") == {"CHECK_PENDING": 1}  # the new POST is pending checks
+
+
+def test_submit_checks_fall_back_to_the_alpha_record_while_a_check_computes(db):
+    """A silent /submit endpoint must not read as "nothing is pending".
+
+    This is the live failure observed on a real submission: the alpha record showed
+    SELF_CORRELATION=PENDING while /alphas/{id}/submit answered with an empty body, and the
+    empty body was taken as proof the alpha had never been submitted -- which re-POSTs an
+    alpha BRAIN is already evaluating.
+    """
+    alpha_id = "A1NYG0VW"
+    client = SilentSubmitClient({
+        "id": alpha_id,
+        "status": "UNSUBMITTED",
+        "is": {"checks": [{"name": "SELF_CORRELATION", "result": "PENDING"}]},
+    })
+
+    checks = client.submit_checks(alpha_id)
+
+    assert client.submit_reads == 1
+    assert [c["name"] for c in checks] == ["SELF_CORRELATION"]
+    assert checks[0]["result"] == "PENDING"
+
+
+def test_reconcile_keeps_a_pending_alpha_pending_instead_of_resubmitting_it(db):
+    candidate = _ready_candidate(db)
+    submission_id = db.enqueue_submission(candidate["id"])
+    db.claim_submission("worker-1", lease_seconds=-1)
+    db.mark_submission_posted(submission_id)
+    db.recover_expired_leases()
+    _clear_backoff(db)
+
+    client = SilentSubmitClient({
+        "id": candidate["brain_alpha_id"],
+        "status": "UNSUBMITTED",
+        "is": {"checks": [{"name": "SELF_CORRELATION", "result": "PENDING"}]},
+    })
+    _worker(db, client, max_submissions=1).run()
+
+    assert client.posts == []  # the pending alpha is never POSTed twice
+    assert db.counts("submissions") == {"CHECK_PENDING": 1}
 
 
 def test_reconcile_resolves_a_platform_correlation_failure(db):

@@ -337,18 +337,28 @@ class BrainClient:
         return {"outcome": "submitted", "detail": ""}
 
     def submit_checks(self, alpha_id: str) -> list[dict[str, Any]]:
-        """Checks reported by GET /alphas/{id}/submit while submission is pending."""
+        """Checks reported for an alpha whose submission is being evaluated.
+
+        GET /alphas/{id}/submit is the authoritative source while it has a body, but it goes
+        silent exactly while a check is still computing. The alpha record carries the same
+        ``is.checks`` list (with SELF_CORRELATION stuck at PENDING), so falling back to it is
+        what keeps "still being evaluated" distinguishable from "never submitted" -- reading
+        a silent endpoint as "nothing pending" makes the caller re-POST an alpha BRAIN is
+        already working on.
+        """
         try:
             response = self.get(f"{API_BASE}/alphas/{alpha_id}/submit", retries=1)
+            payload = response.json() if response.content else None
+        except (BrainAPIError, ValueError):
+            payload = None
+        checks = (payload.get("is") or {}).get("checks") if isinstance(payload, Mapping) else None
+        if checks:
+            return [c for c in checks if isinstance(c, Mapping)]
+        try:
+            alpha = self.alpha(alpha_id)
         except BrainAPIError:
             return []
-        if not response.content:
-            return []
-        try:
-            payload = response.json()
-        except ValueError:
-            return []
-        checks = (payload.get("is") or {}).get("checks") if isinstance(payload, Mapping) else None
+        checks = (alpha.get("is") or {}).get("checks") if isinstance(alpha, Mapping) else None
         return [c for c in (checks or []) if isinstance(c, Mapping)]
 
     def alpha_status(self, alpha_id: str) -> str | None:
