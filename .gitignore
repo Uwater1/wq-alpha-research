@@ -17,6 +17,7 @@ __pycache__/
 .venv/
 venv/
 .freebuff
+.skill-history/
 
 # legacy/wq_brain local outputs (account-linked, never publish)
 legacy/wq_brain/data/*.csv

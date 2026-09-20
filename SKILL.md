@@ -550,7 +550,18 @@ Daily-return correlation across ACTIVE alphas shows that:
 12. Correlation is a property of the *field family*, not of the transform: `ts_rank(ROE,126)` vs `ts_zscore(ROE,252)` measured +0.76, and ROE vs ROA +0.79. Changing window/transform/denominator inside a family does not create a new alpha; switching family (for example accrual profitability to realized cash flow, +0.21) does.
 13. Cash-flow fundamentals are the cheapest orthogonal block next to profitability within the same `fundamental` dataset: they clear the same Sharpe range while correlating only 0.2-0.3 with accrual-based quality alphas.
 
-## 11. Self-Evolution Loop
+## 11. Agent-Agnostic Knowledge and Self-Evolution Loop
+
+The durable learning path is `events -> scoped observations -> aggregate evidence -> rule proposal -> evaluation -> promotion/rejection`. Use `scripts/knowledge_cli.py` for status, recall, observations, proposals, evaluation, and lifecycle transitions; use `scripts/skill_manager.py` for SHA-guarded atomic skill mutations and rollback. Raw account-linked evidence remains PRIVATE in `research.db`; tracked skill text accepts only PUBLIC/SANITIZED rules.
+
+```bash
+./.venv/bin/python scripts/knowledge_cli.py status
+./.venv/bin/python scripts/knowledge_cli.py recall "cash flow" --max-privacy SANITIZED
+./.venv/bin/python scripts/research_db.py status
+```
+
+Do not promote a rule from one simulation. Require independent evidence groups, review contradiction counts, and keep promotion reversible. Credentials, exact alpha identifiers, private expressions, PnL series, and submission history never enter tracked skill text.
+
 
 After each BRAIN interaction, such as a submission, query, or analysis, the AI should write the useful findings back into this skill so that it keeps improving with practice.
 

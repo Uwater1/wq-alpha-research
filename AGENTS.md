@@ -32,6 +32,23 @@ Session/submit scripts decrypt in memory. **Agents must never view or print
 
 ## 3. How to Run Things
 
+- Agent-agnostic knowledge and safe skill management:
+
+  ```bash
+  ./.venv/bin/python scripts/knowledge_cli.py status
+  ./.venv/bin/python scripts/knowledge_cli.py recall "cash flow" --max-privacy SANITIZED
+  ./.venv/bin/python scripts/knowledge_cli.py observe --subject-type signal_structure --subject-key STRUCTURE \\
+      --claim simulation_outcome --value '{"is_pass":true}' --evidence-group campaign-1
+  ./.venv/bin/python scripts/knowledge_cli.py propose --title "General rule" --body "Sanitized rule text" \\
+      --evidence OBS_ID:support
+  ./.venv/bin/python scripts/knowledge_cli.py evaluate RULE_ID
+  ./.venv/bin/python scripts/knowledge_cli.py transition RULE_ID active --expected-version 1
+  ```
+
+  Observations are scoped and private by default. Rules require independent evidence and
+  evaluation before promotion; `skill_manager.py` enforces SHA compare-and-swap, atomic
+  content-addressed backups, rollback, and PUBLIC/SANITIZED-only tracked mutations.
+
 - Preview skill evolution (does NOT modify files):
 
   ```bash

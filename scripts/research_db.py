@@ -55,8 +55,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -75,7 +77,7 @@ DB_ENV_VAR = "WQ_RESEARCH_DB"
 #: meta key holding the monotonic version of the local ACTIVE snapshot.
 META_ACTIVE_SET_VERSION = "active_set_version"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
@@ -92,6 +94,18 @@ ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
     # `post_attempted_at` is the write-ahead marker that separates "never POSTed"
     # from "POST outcome unknown" after a crash; `last_error` keeps the last reconcile note.
     "submissions": ("post_attempted_at TEXT", "last_error TEXT"),
+    "events": (
+        "operation TEXT",
+        "candidate_id INTEGER",
+        "simulation_id TEXT",
+        "submission_id INTEGER",
+        "http_status INTEGER",
+        "error_category TEXT",
+        "retry_count INTEGER NOT NULL DEFAULT 0",
+        "latency_ms REAL",
+        "rate_limit_seconds REAL",
+        "result_class TEXT",
+    ),
 }
 
 # IS gates from SKILL.md Section 5, used only when BRAIN's own IS checks are absent.
@@ -151,6 +165,20 @@ FINAL_SUBMISSION_STATUSES = frozenset({"ACTIVE", "SELF_CORR_FAIL", "PLATFORM_REJ
 DEFAULT_SUBMISSION_MAX_ATTEMPTS = 5
 SUBMISSION_BACKOFF_BASE_SECONDS = 30.0
 SUBMISSION_BACKOFF_MAX_SECONDS = 3600.0
+
+# Knowledge and tracked-skill privacy/lifecycle vocabulary. Privacy is ordered from
+# publishable to most sensitive; PUBLIC/SANITIZED are the only classes allowed into
+# tracked skill text by the skill manager.
+PRIVACY_CLASSES = frozenset({"PUBLIC", "SANITIZED", "PRIVATE", "SECRET"})
+PRIVACY_RANK = {"PUBLIC": 0, "SANITIZED": 1, "PRIVATE": 2, "SECRET": 3}
+KNOWLEDGE_RULE_STATES = frozenset({"proposed", "active", "weakened", "retired", "rejected", "pinned"})
+KNOWLEDGE_OBSERVATION_STATES = frozenset({"active", "superseded", "retracted"})
+
+# These markers are deliberately conservative. The store must refuse credentials even
+# when a caller labels them PRIVATE: learning is not a secret vault.
+_SECRET_MARKER_RE = re.compile(
+    r"(?i)(wq[_-]?brain[_-]?(?:username|password)|credential\.(?:txt|key)|password\s*=|secret\s*=|authorization\s*:)"
+)
 
 # A terminal submission row never moves again (except by explicit operator enqueue, which
 # opens a fresh row); every other transition is allowed. This is the explicit READY/RETRY
@@ -331,17 +359,111 @@ SCHEMA: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS events (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at   TEXT NOT NULL,
-        entity       TEXT NOT NULL,
-        entity_id    TEXT,
-        event        TEXT NOT NULL,
-        from_status  TEXT,
-        to_status    TEXT,
-        payload_json TEXT
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at          TEXT NOT NULL,
+        entity              TEXT NOT NULL,
+        entity_id           TEXT,
+        event               TEXT NOT NULL,
+        from_status         TEXT,
+        to_status           TEXT,
+        operation           TEXT,
+        candidate_id        INTEGER,
+        simulation_id       TEXT,
+        submission_id       INTEGER,
+        http_status         INTEGER,
+        error_category      TEXT,
+        retry_count         INTEGER NOT NULL DEFAULT 0,
+        latency_ms          REAL,
+        rate_limit_seconds  REAL,
+        result_class        TEXT,
+        payload_json        TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_operation ON events(operation, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_observations (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject_type       TEXT NOT NULL,
+        subject_key        TEXT NOT NULL,
+        claim              TEXT NOT NULL,
+        value_json         TEXT NOT NULL,
+        scope_json         TEXT NOT NULL,
+        evidence_group     TEXT NOT NULL,
+        provenance_json    TEXT NOT NULL,
+        source_event_id    INTEGER,
+        candidate_id       INTEGER,
+        simulation_id      TEXT,
+        submission_id      INTEGER,
+        privacy_class      TEXT NOT NULL,
+        lifecycle_state    TEXT NOT NULL,
+        created_at         TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_observations_subject ON knowledge_observations(subject_type, subject_key)",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_observations_claim ON knowledge_observations(claim, privacy_class)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_observations_event ON knowledge_observations(source_event_id) WHERE source_event_id IS NOT NULL",
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_rules (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_key            TEXT NOT NULL UNIQUE,
+        title               TEXT NOT NULL,
+        body                TEXT NOT NULL,
+        scope_json          TEXT NOT NULL,
+        state               TEXT NOT NULL,
+        support_count       INTEGER NOT NULL DEFAULT 0,
+        contradiction_count INTEGER NOT NULL DEFAULT 0,
+        provenance_json     TEXT NOT NULL,
+        evaluation_json     TEXT,
+        privacy_class       TEXT NOT NULL,
+        owner               TEXT NOT NULL DEFAULT 'agent',
+        pinned              INTEGER NOT NULL DEFAULT 0,
+        version             INTEGER NOT NULL DEFAULT 1,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_rules_state ON knowledge_rules(state, updated_at)",
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_rule_evidence (
+        rule_id           INTEGER NOT NULL REFERENCES knowledge_rules(id) ON DELETE CASCADE,
+        observation_id    INTEGER NOT NULL REFERENCES knowledge_observations(id) ON DELETE CASCADE,
+        polarity          TEXT NOT NULL,
+        independence_group TEXT NOT NULL,
+        created_at        TEXT NOT NULL,
+        PRIMARY KEY(rule_id, observation_id, polarity)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_aggregates (
+        aggregate_key TEXT PRIMARY KEY,
+        subject_type  TEXT NOT NULL,
+        subject_key   TEXT NOT NULL,
+        scope_json    TEXT NOT NULL,
+        metrics_json  TEXT NOT NULL,
+        sample_count  INTEGER NOT NULL DEFAULT 0,
+        privacy_class TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS skill_mutations (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation      TEXT NOT NULL,
+        actor          TEXT NOT NULL,
+        expected_sha   TEXT,
+        before_sha     TEXT NOT NULL,
+        after_sha      TEXT NOT NULL,
+        backup_sha     TEXT NOT NULL,
+        backup_path    TEXT NOT NULL,
+        rule_id        INTEGER,
+        privacy_class  TEXT NOT NULL,
+        version        INTEGER NOT NULL,
+        result         TEXT NOT NULL,
+        created_at     TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_skill_mutations_created ON skill_mutations(created_at)",
 )
 
 
@@ -465,7 +587,7 @@ class QueueOutcome:
 
 @dataclass
 class StatusReport:
-    """Aggregated counters for the observability CLI (Priority 3 groundwork)."""
+    """Aggregated counters for the observability CLI (Priority 3)."""
 
     candidates: dict[str, int] = field(default_factory=dict)
     simulations: dict[str, int] = field(default_factory=dict)
@@ -474,7 +596,16 @@ class StatusReport:
     active_alphas: int = 0
     events: int = 0
     generated_per_hour: float = 0.0
+    validated_per_hour: float = 0.0
     simulated_per_hour: float = 0.0
+    cache_hit_rate: float = 0.0
+    simulation_success_rate: float = 0.0
+    is_pass_rate: float = 0.0
+    correlation_pass_rate: float = 0.0
+    submission_success_rate: float = 0.0
+    active_alphas_per_week: float = 0.0
+    simulations_per_is_pass: float | None = None
+    simulations_per_active_alpha: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -485,7 +616,16 @@ class StatusReport:
             "active_alphas": self.active_alphas,
             "events": self.events,
             "generated_per_hour": self.generated_per_hour,
+            "validated_per_hour": self.validated_per_hour,
             "simulated_per_hour": self.simulated_per_hour,
+            "cache_hit_rate": self.cache_hit_rate,
+            "simulation_success_rate": self.simulation_success_rate,
+            "is_pass_rate": self.is_pass_rate,
+            "correlation_pass_rate": self.correlation_pass_rate,
+            "submission_success_rate": self.submission_success_rate,
+            "active_alphas_per_week": self.active_alphas_per_week,
+            "simulations_per_is_pass": self.simulations_per_is_pass,
+            "simulations_per_active_alpha": self.simulations_per_active_alpha,
         }
 
 
@@ -527,6 +667,27 @@ class ResearchDB:
             for statement in SCHEMA:
                 conn.execute(statement)
             self._ensure_columns(conn)
+            try:
+                conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_rules_fts USING fts5("
+                    "rule_id UNINDEXED, rule_key, title, body, scope, state, privacy_class)"
+                )
+                conn.execute(
+                    "INSERT INTO knowledge_rules_fts(rule_id, rule_key, title, body, scope, state, privacy_class) "
+                    "SELECT r.id, r.rule_key, r.title, r.body, r.scope_json, r.state, r.privacy_class "
+                    "FROM knowledge_rules r WHERE NOT EXISTS "
+                    "(SELECT 1 FROM knowledge_rules_fts f WHERE f.rule_id=r.id)"
+                )
+                fts5 = "available"
+            except sqlite3.OperationalError:
+                # SQLite builds without FTS5 still get the structured/LIKE fallback; the
+                # capability is explicit so an agent can report degraded retrieval.
+                fts5 = "unavailable"
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('knowledge_fts5', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (fts5,),
+            )
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -566,13 +727,28 @@ class ResearchDB:
         *,
         from_status: str | None = None,
         to_status: str | None = None,
+        operation: str | None = None,
+        candidate_id: int | None = None,
+        simulation_id: str | None = None,
+        submission_id: int | None = None,
+        http_status: int | None = None,
+        error_category: str | None = None,
+        retry_count: int = 0,
+        latency_ms: float | None = None,
+        rate_limit_seconds: float | None = None,
+        result_class: str | None = None,
         payload: Mapping[str, Any] | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> None:
-        """Append to the audit trail; safe to call inside an open transaction."""
+        """Append to the audit trail; safe to call inside an open transaction.
+
+        The optional transport fields make events useful for both debugging and throughput
+        accounting while preserving the original entity/status API used by older callers.
+        """
         sql = (
-            "INSERT INTO events(created_at, entity, entity_id, event, from_status, to_status, payload_json) "
-            "VALUES(?,?,?,?,?,?,?)"
+            "INSERT INTO events(created_at, entity, entity_id, event, from_status, to_status, operation, "
+            "candidate_id, simulation_id, submission_id, http_status, error_category, retry_count, latency_ms, "
+            "rate_limit_seconds, result_class, payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         )
         params = (
             now_iso(),
@@ -581,6 +757,16 @@ class ResearchDB:
             event,
             from_status,
             to_status,
+            operation,
+            candidate_id,
+            simulation_id,
+            submission_id,
+            http_status,
+            error_category,
+            int(retry_count or 0),
+            latency_ms,
+            rate_limit_seconds,
+            result_class,
             json.dumps(payload, sort_keys=True, default=str) if payload else None,
         )
         if conn is not None:
@@ -1864,6 +2050,501 @@ class ResearchDB:
             "candidate_checks": counts,
         }
 
+    # -- durable knowledge -------------------------------------------------
+
+    @staticmethod
+    def _knowledge_privacy(privacy_class: str) -> str:
+        value = str(privacy_class or "").upper()
+        if value not in PRIVACY_CLASSES:
+            raise ValueError(f"privacy_class must be one of {sorted(PRIVACY_CLASSES)}")
+        return value
+
+    @staticmethod
+    def _knowledge_json(value: Any, *, field_name: str) -> str:
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} is not JSON-serializable") from exc
+
+    @classmethod
+    def _assert_knowledge_safe(cls, values: Any, privacy_class: str) -> str:
+        """Reject credentials before they can enter any learning table."""
+        privacy = cls._knowledge_privacy(privacy_class)
+        encoded = cls._knowledge_json(values, field_name="knowledge payload")
+        def has_secret_key(value: Any) -> bool:
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    if re.search(r"(?i)(password|secret|credential|api[_-]?key|token)", str(key)):
+                        return True
+                    if has_secret_key(nested):
+                        return True
+            elif isinstance(value, (list, tuple, set)):
+                return any(has_secret_key(item) for item in value)
+            return False
+
+        if _SECRET_MARKER_RE.search(encoded) or has_secret_key(values):
+            raise ValueError("credential-like material cannot enter the learning store")
+        if privacy == "SECRET":
+            raise ValueError("SECRET data is never accepted by the learning store")
+        return privacy
+
+    def record_observation(
+        self,
+        *,
+        subject_type: str,
+        subject_key: str,
+        claim: str,
+        value: Any,
+        scope: Mapping[str, Any] | None = None,
+        evidence_group: str,
+        provenance: Mapping[str, Any] | None = None,
+        source_event_id: int | None = None,
+        candidate_id: int | None = None,
+        simulation_id: str | None = None,
+        submission_id: int | None = None,
+        privacy_class: str = "PRIVATE",
+        lifecycle_state: str = "active",
+    ) -> int:
+        """Store one scoped observation without turning it into a rule automatically.
+
+        ``evidence_group`` is the independence boundary used by evaluation: multiple
+        mutations from one simulation/campaign cannot manufacture independent support.
+        """
+        if not str(subject_type).strip() or not str(subject_key).strip() or not str(claim).strip():
+            raise ValueError("subject_type, subject_key, and claim are required")
+        if not str(evidence_group).strip():
+            raise ValueError("evidence_group is required")
+        privacy = self._assert_knowledge_safe(
+            {"claim": claim, "value": value, "scope": scope or {}, "provenance": provenance or {}},
+            privacy_class,
+        )
+        state = str(lifecycle_state).lower()
+        if state not in KNOWLEDGE_OBSERVATION_STATES:
+            raise ValueError(f"unknown observation lifecycle state: {state}")
+        timestamp = now_iso()
+        with self._tx() as conn:
+            if source_event_id is not None:
+                existing = conn.execute(
+                    "SELECT id FROM knowledge_observations WHERE source_event_id=?", (int(source_event_id),)
+                ).fetchone()
+                if existing is not None:
+                    return int(existing["id"])
+            cursor = conn.execute(
+                """
+                INSERT INTO knowledge_observations(
+                    subject_type, subject_key, claim, value_json, scope_json, evidence_group,
+                    provenance_json, source_event_id, candidate_id, simulation_id, submission_id,
+                    privacy_class, lifecycle_state, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(subject_type), str(subject_key), str(claim), self._knowledge_json(value, field_name="value"),
+                    self._knowledge_json(scope or {}, field_name="scope"), str(evidence_group),
+                    self._knowledge_json(provenance or {}, field_name="provenance"), source_event_id,
+                    candidate_id, simulation_id, submission_id, privacy, state, timestamp,
+                ),
+            )
+            observation_id = int(cursor.lastrowid)
+            self.log_event(
+                "knowledge", observation_id, "observation_recorded", operation="learn.observe",
+                candidate_id=candidate_id, simulation_id=simulation_id, submission_id=submission_id,
+                payload={"claim": str(claim), "privacy_class": privacy, "evidence_group": str(evidence_group)},
+                conn=conn,
+            )
+            return observation_id
+
+    def observations(self, *, subject_type: str | None = None, subject_key: str | None = None,
+                     claim: str | None = None, privacy_class: str | None = None,
+                     lifecycle_state: str = "active") -> list[dict[str, Any]]:
+        """Read observations with structured filters; payloads are decoded for agents."""
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if subject_type is not None:
+            clauses.append("subject_type=?")
+            params.append(subject_type)
+        if subject_key is not None:
+            clauses.append("subject_key=?")
+            params.append(subject_key)
+        if claim is not None:
+            clauses.append("claim=?")
+            params.append(claim)
+        if privacy_class is not None:
+            clauses.append("privacy_class=?")
+            params.append(self._knowledge_privacy(privacy_class))
+        if lifecycle_state:
+            clauses.append("lifecycle_state=?")
+            params.append(lifecycle_state)
+        rows = self.query(
+            "SELECT * FROM knowledge_observations WHERE " + " AND ".join(clauses) + " ORDER BY id", params
+        )
+        for row in rows:
+            for key in ("value_json", "scope_json", "provenance_json"):
+                try:
+                    row[key[:-5]] = json.loads(row[key])
+                except (TypeError, ValueError):
+                    row[key[:-5]] = {}
+        return rows
+
+    def _sync_rule_fts(self, conn: sqlite3.Connection, rule: Mapping[str, Any]) -> None:
+        if self.get_meta("knowledge_fts5") != "available":
+            return
+        conn.execute("DELETE FROM knowledge_rules_fts WHERE rule_id=?", (int(rule["id"]),))
+        conn.execute(
+            "INSERT INTO knowledge_rules_fts(rule_id, rule_key, title, body, scope, state, privacy_class) VALUES(?,?,?,?,?,?,?)",
+            (
+                int(rule["id"]), rule["rule_key"], rule["title"], rule["body"],
+                rule["scope_json"], rule["state"], rule["privacy_class"],
+            ),
+        )
+
+    def _refresh_rule_evidence_counts(self, conn: sqlite3.Connection, rule_id: int) -> None:
+        counts = conn.execute(
+            """
+            SELECT polarity, COUNT(*) AS n FROM knowledge_rule_evidence e
+            JOIN knowledge_observations o ON o.id=e.observation_id
+            WHERE e.rule_id=? AND o.lifecycle_state='active' GROUP BY polarity
+            """,
+            (rule_id,),
+        )
+        values = {str(row["polarity"]): int(row["n"]) for row in counts}
+        conn.execute(
+            "UPDATE knowledge_rules SET support_count=?, contradiction_count=?, updated_at=? WHERE id=?",
+            (values.get("support", 0), values.get("contradiction", 0), now_iso(), rule_id),
+        )
+
+    def propose_rule(
+        self,
+        *,
+        rule_key: str | None = None,
+        title: str,
+        body: str,
+        scope: Mapping[str, Any] | None = None,
+        evidence: Iterable[tuple[int, str] | Mapping[str, Any]] = (),
+        provenance: Mapping[str, Any] | None = None,
+        privacy_class: str = "SANITIZED",
+        owner: str = "agent",
+        pinned: bool = False,
+    ) -> int:
+        """Create a PROPOSED rule and attach explicit supporting/contradicting evidence."""
+        if not str(title).strip() or not str(body).strip():
+            raise ValueError("rule title and body are required")
+        privacy = self._assert_knowledge_safe(
+            {"title": title, "body": body, "scope": scope or {}, "provenance": provenance or {}},
+            privacy_class,
+        )
+        if privacy in {"PUBLIC", "SANITIZED"} and _SECRET_MARKER_RE.search(str(body)):
+            raise ValueError("public rule contains credential-like material")
+        state = "pinned" if pinned else "proposed"
+        if state not in KNOWLEDGE_RULE_STATES:
+            raise ValueError(f"unknown rule state: {state}")
+        if rule_key is None:
+            rule_key = "rule-" + hashlib.sha256(
+                f"{title}\\x1f{body}\\x1f{self._knowledge_json(scope or {}, field_name='scope')}".encode("utf-8")
+            ).hexdigest()[:24]
+        timestamp = now_iso()
+        with self._tx() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO knowledge_rules(
+                    rule_key, title, body, scope_json, state, provenance_json, privacy_class,
+                    owner, pinned, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(rule_key), str(title), str(body), self._knowledge_json(scope or {}, field_name="scope"),
+                    state, self._knowledge_json(provenance or {}, field_name="provenance"), privacy,
+                    str(owner), int(bool(pinned)), timestamp, timestamp,
+                ),
+            )
+            rule_id = int(cursor.lastrowid)
+            for item in evidence:
+                if isinstance(item, Mapping):
+                    observation_id = int(item["observation_id"])
+                    polarity = str(item.get("polarity", "support"))
+                else:
+                    observation_id, polarity = int(item[0]), str(item[1])
+                self._attach_rule_evidence(conn, rule_id, observation_id, polarity)
+            rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+            self._refresh_rule_evidence_counts(conn, rule_id)
+            rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+            self._sync_rule_fts(conn, rule)
+            self.log_event("knowledge", rule_id, "rule_proposed", operation="learn.propose",
+                           result_class="proposal", payload={"rule_key": str(rule_key), "privacy_class": privacy}, conn=conn)
+            return rule_id
+
+    def _attach_rule_evidence(self, conn: sqlite3.Connection, rule_id: int, observation_id: int, polarity: str) -> None:
+        if polarity not in {"support", "contradiction"}:
+            raise ValueError("evidence polarity must be support or contradiction")
+        observation = conn.execute("SELECT id FROM knowledge_observations WHERE id=?", (observation_id,)).fetchone()
+        if observation is None:
+            raise KeyError(f"observation {observation_id} not found")
+        conn.execute(
+            "INSERT OR IGNORE INTO knowledge_rule_evidence(rule_id, observation_id, polarity, independence_group, created_at) "
+            "SELECT ?, id, ?, evidence_group, ? FROM knowledge_observations WHERE id=?",
+            (rule_id, polarity, now_iso(), observation_id),
+        )
+
+    def attach_rule_evidence(self, rule_id: int, observation_id: int, polarity: str = "support") -> None:
+        """Add auditable evidence to a proposal without changing its lifecycle."""
+        with self._tx() as conn:
+            rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+            if rule is None:
+                raise KeyError(f"rule {rule_id} not found")
+            self._attach_rule_evidence(conn, rule_id, observation_id, polarity)
+            self._refresh_rule_evidence_counts(conn, rule_id)
+            self.log_event("knowledge", rule_id, "rule_evidence_attached", operation="learn.evidence",
+                           payload={"observation_id": observation_id, "polarity": polarity}, conn=conn)
+
+    def get_rule(self, rule_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for key in ("scope_json", "provenance_json", "evaluation_json"):
+            raw = result.get(key)
+            try:
+                result[key[:-5] if key.endswith("_json") else key] = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                result[key[:-5] if key.endswith("_json") else key] = {}
+        result["evidence"] = self.query(
+            """
+            SELECT e.*, o.claim, o.value_json, o.scope_json, o.evidence_group, o.privacy_class
+            FROM knowledge_rule_evidence e JOIN knowledge_observations o ON o.id=e.observation_id
+            WHERE e.rule_id=? ORDER BY e.created_at, e.observation_id
+            """, (rule_id,)
+        )
+        return result
+
+    def list_rules(self, *, state: str | None = None, privacy_class: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if state is not None:
+            if state not in KNOWLEDGE_RULE_STATES:
+                raise ValueError(f"unknown rule state: {state}")
+            clauses.append("state=?")
+            params.append(state)
+        if privacy_class is not None:
+            clauses.append("privacy_class=?")
+            params.append(self._knowledge_privacy(privacy_class))
+        return self.query("SELECT * FROM knowledge_rules WHERE " + " AND ".join(clauses) + " ORDER BY id", params)
+
+    def recall_knowledge(self, query: str, *, scope: Mapping[str, Any] | None = None,
+                         states: Iterable[str] = ("active", "pinned", "proposed"),
+                         max_privacy: str = "PRIVATE", limit: int = 20) -> list[dict[str, Any]]:
+        """FTS5-first recall with state/privacy filters and a structured scope check."""
+        if not str(query).strip():
+            return []
+        wanted_states = [str(value) for value in states]
+        max_rank = PRIVACY_RANK[self._knowledge_privacy(max_privacy)]
+        rows: list[dict[str, Any]] = []
+        if self.get_meta("knowledge_fts5") == "available":
+            try:
+                placeholders = ",".join("?" for _ in wanted_states)
+                rows = self.query(
+                    "SELECT r.* FROM knowledge_rules r JOIN knowledge_rules_fts f ON f.rule_id=r.id "
+                    f"WHERE knowledge_rules_fts MATCH ? AND r.state IN ({placeholders}) ORDER BY rank LIMIT ?",
+                    [query, *wanted_states, int(limit) * 4],
+                )
+            except sqlite3.OperationalError:
+                rows = []
+        if not rows:
+            like = f"%{query}%"
+            placeholders = ",".join("?" for _ in wanted_states)
+            rows = self.query(
+                f"SELECT * FROM knowledge_rules WHERE (title LIKE ? OR body LIKE ? OR rule_key LIKE ?) "
+                f"AND state IN ({placeholders}) ORDER BY updated_at DESC LIMIT ?",
+                [like, like, like, *wanted_states, int(limit) * 4],
+            )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if PRIVACY_RANK.get(str(row.get("privacy_class")), 99) > max_rank:
+                continue
+            try:
+                row_scope = json.loads(row.get("scope_json") or "{}")
+            except ValueError:
+                row_scope = {}
+            if scope and any(row_scope.get(key) not in (None, value) for key, value in scope.items()):
+                continue
+            result.append(row)
+            if len(result) >= limit:
+                break
+        return result
+
+    def evaluate_rule(self, rule_id: int, *, min_support: int = 2,
+                      min_independent_groups: int = 2, max_contradiction_ratio: float = 0.5) -> dict[str, Any]:
+        """Evaluate promotion readiness; this never promotes by itself."""
+        rule = self.get_rule(rule_id)
+        if rule is None:
+            raise KeyError(f"rule {rule_id} not found")
+        evidence = rule["evidence"]
+        support = [item for item in evidence if item["polarity"] == "support"]
+        contradiction = [item for item in evidence if item["polarity"] == "contradiction"]
+        support_groups = {str(item["independence_group"]) for item in support}
+        ratio = len(contradiction) / max(len(support), 1)
+        passed = (
+            len(support) >= int(min_support)
+            and len(support_groups) >= int(min_independent_groups)
+            and ratio <= float(max_contradiction_ratio)
+            and str(rule["privacy_class"]) in {"PUBLIC", "SANITIZED"}
+        )
+        evaluation = {
+            "passed": passed, "support": len(support), "contradiction": len(contradiction),
+            "independent_groups": len(support_groups), "contradiction_ratio": ratio,
+            "requirements": {"min_support": min_support, "min_independent_groups": min_independent_groups,
+                             "max_contradiction_ratio": max_contradiction_ratio},
+        }
+        timestamp = now_iso()
+        with self._tx() as conn:
+            conn.execute("UPDATE knowledge_rules SET evaluation_json=?, updated_at=? WHERE id=?",
+                         (json.dumps(evaluation, sort_keys=True), timestamp, rule_id))
+            self.log_event("knowledge", rule_id, "rule_evaluated", operation="learn.evaluate",
+                           result_class="pass" if passed else "hold", payload=evaluation, conn=conn)
+        return evaluation
+
+    def transition_rule(self, rule_id: int, target: str, *, expected_version: int | None = None,
+                        actor: str = "agent", force: bool = False) -> dict[str, Any]:
+        """Promote/reject/weaken/retire a rule with version and pinned-owner protection."""
+        if target not in KNOWLEDGE_RULE_STATES:
+            raise ValueError(f"unknown rule state: {target}")
+        timestamp = now_iso()
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"rule {rule_id} not found")
+            if expected_version is not None and int(row["version"]) != int(expected_version):
+                raise ValueError(f"rule version mismatch: expected {expected_version}, current {row['version']}")
+            if (bool(row["pinned"]) or row["owner"] != "agent") and not force and target != "pinned":
+                raise PermissionError("user-owned or pinned rules require force to change")
+            if target == "active" and not force:
+                evaluation = json.loads(row["evaluation_json"] or "{}")
+                if not evaluation.get("passed"):
+                    raise ValueError("rule has not passed its evaluation gate")
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE knowledge_rules SET state=?, version=?, updated_at=? WHERE id=?",
+                (target, version, timestamp, rule_id),
+            )
+            updated = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+            self._sync_rule_fts(conn, updated)
+            self.log_event("knowledge", rule_id, "rule_transitioned", operation="learn.transition",
+                           result_class=target, payload={"from": row["state"], "to": target, "version": version,
+                                                          "actor": actor}, conn=conn)
+            return dict(updated)
+
+    def upsert_knowledge_aggregate(self, *, aggregate_key: str, subject_type: str, subject_key: str,
+                                    scope: Mapping[str, Any] | None, metrics: Mapping[str, Any],
+                                    sample_count: int, privacy_class: str = "PRIVATE") -> None:
+        """Persist family/lineage aggregates without copying raw account-linked records."""
+        privacy = self._assert_knowledge_safe({"scope": scope or {}, "metrics": metrics}, privacy_class)
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO knowledge_aggregates(aggregate_key, subject_type, subject_key, scope_json,
+                       metrics_json, sample_count, privacy_class, updated_at) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(aggregate_key) DO UPDATE SET subject_type=excluded.subject_type,
+                       subject_key=excluded.subject_key, scope_json=excluded.scope_json,
+                       metrics_json=excluded.metrics_json, sample_count=excluded.sample_count,
+                       privacy_class=excluded.privacy_class, updated_at=excluded.updated_at
+                """,
+                (str(aggregate_key), str(subject_type), str(subject_key), self._knowledge_json(scope or {}, field_name="scope"),
+                 self._knowledge_json(metrics, field_name="metrics"), int(sample_count), privacy, now_iso()),
+            )
+
+    def materialize_event_observations(self, *, limit: int = 500) -> dict[str, int]:
+        """Turn simulation events into scoped evidence without proposing global rules.
+
+        This is the first half of ``events -> observations -> proposal``. Each observation
+        is private by default, tied to the originating event, and grouped by lineage so a
+        parameter grid cannot masquerade as independent evidence.
+        """
+        rows = self.query(
+            """
+            SELECT e.*, c.expression_hash, c.skeleton_hash, c.signal_family, c.parent_id,
+                   c.settings_json, c.sharpe, c.fitness, c.turnover
+            FROM events e LEFT JOIN candidates c
+              ON e.entity='simulation' AND CAST(e.entity_id AS INTEGER)=c.id
+            LEFT JOIN knowledge_observations o ON o.source_event_id=e.id
+            WHERE e.event='result' AND o.id IS NULL
+            ORDER BY e.id LIMIT ?
+            """, (max(int(limit), 0),)
+        )
+        created = 0
+        skipped = 0
+        for row in rows:
+            if not row.get("expression_hash") and not row.get("skeleton_hash"):
+                skipped += 1
+                continue
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            try:
+                settings = json.loads(row.get("settings_json") or "{}")
+            except (TypeError, ValueError):
+                settings = {}
+            scope = {
+                key: settings.get(key) for key in ("instrumentType", "region", "universe", "delay", "neutralization")
+                if settings.get(key) is not None
+            }
+            if row.get("signal_family"):
+                scope["signal_family"] = row["signal_family"]
+            root = row.get("parent_id") or row.get("entity_id") or row["id"]
+            value = {
+                "is_pass": payload.get("is_pass"),
+                "sharpe": payload.get("sharpe", row.get("sharpe")),
+                "fitness": payload.get("fitness", row.get("fitness")),
+                "turnover": payload.get("turnover", row.get("turnover")),
+                "result_class": payload.get("reason") or row.get("result_class"),
+            }
+            self.record_observation(
+                subject_type="signal_structure", subject_key=str(row.get("skeleton_hash") or row["expression_hash"]),
+                claim="simulation_outcome", value=value, scope=scope,
+                evidence_group=f"lineage:{root}",
+                provenance={"source": "events", "event_id": row["id"], "event": "simulation.result"},
+                source_event_id=int(row["id"]), candidate_id=int(row["entity_id"]) if row.get("entity_id") else None,
+                simulation_id=row.get("simulation_id"), privacy_class="PRIVATE",
+            )
+            created += 1
+        return {"created": created, "skipped": skipped, "scanned": len(rows)}
+
+    def record_skill_mutation(
+        self, *, operation: str, actor: str, expected_sha: str | None, before_sha: str,
+        after_sha: str, backup_sha: str, backup_path: str, rule_id: int | None,
+        privacy_class: str, version: int, result: str = "applied",
+    ) -> int:
+        """Record an atomic tracked-skill mutation in the same private audit store."""
+        privacy = self._knowledge_privacy(privacy_class)
+        timestamp = now_iso()
+        with self._tx() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO skill_mutations(operation, actor, expected_sha, before_sha, after_sha,
+                       backup_sha, backup_path, rule_id, privacy_class, version, result, created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (operation, actor, expected_sha, before_sha, after_sha, backup_sha, backup_path,
+                 rule_id, privacy, int(version), result, timestamp),
+            )
+            mutation_id = int(cursor.lastrowid)
+            self.log_event("skill", mutation_id, "mutation_recorded", operation=operation,
+                           result_class=result, payload={"rule_id": rule_id, "privacy_class": privacy}, conn=conn)
+            return mutation_id
+
+    def knowledge_status(self) -> dict[str, Any]:
+        """Counts/capabilities for the agent-agnostic knowledge interface."""
+        def grouped(table: str, column: str) -> dict[str, int]:
+            return {str(row["value"]): int(row["n"]) for row in self._conn.execute(
+                f"SELECT {column} AS value, COUNT(*) AS n FROM {table} GROUP BY {column}"
+            )}
+        return {
+            "fts5": self.get_meta("knowledge_fts5") == "available",
+            "observations": int(self._conn.execute("SELECT COUNT(*) AS n FROM knowledge_observations").fetchone()["n"]),
+            "rules": grouped("knowledge_rules", "state"),
+            "privacy": grouped("knowledge_rules", "privacy_class"),
+            "aggregates": int(self._conn.execute("SELECT COUNT(*) AS n FROM knowledge_aggregates").fetchone()["n"]),
+            "mutations": int(self._conn.execute("SELECT COUNT(*) AS n FROM skill_mutations").fetchone()["n"]),
+        }
+
     # -- meta (capabilities, schema facts) ---------------------------------
 
     def get_meta(self, key: str) -> str | None:
@@ -1910,9 +2591,39 @@ class ResearchDB:
         report.generated_per_hour = round(self._conn.execute(
             "SELECT COUNT(*) AS n FROM candidates WHERE created_at >= ?", (since,)
         ).fetchone()["n"] / hours, 3)
+        report.validated_per_hour = round(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE event='status' AND to_status='QUEUED' AND created_at >= ?",
+            (since,),
+        ).fetchone()["n"] / hours, 3)
         report.simulated_per_hour = round(self._conn.execute(
             "SELECT COUNT(*) AS n FROM simulations WHERE completed_at IS NOT NULL AND completed_at >= ?", (since,)
         ).fetchone()["n"] / hours, 3)
+        candidate_total = max(int(self._conn.execute("SELECT COUNT(*) AS n FROM candidates").fetchone()["n"]), 1)
+        simulation_total = max(int(self._conn.execute("SELECT COUNT(*) AS n FROM simulations").fetchone()["n"]), 1)
+        done_total = int(self._conn.execute("SELECT COUNT(*) AS n FROM simulations WHERE status='DONE'").fetchone()["n"])
+        pass_total = int(self._conn.execute("SELECT COUNT(*) AS n FROM simulations WHERE is_pass=1").fetchone()["n"])
+        corr_checked = int(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM candidates WHERE corr_status IS NOT NULL"
+        ).fetchone()["n"])
+        corr_pass = int(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM candidates WHERE corr_status IN ('ok','empty_book') "
+            "AND (self_corr IS NULL OR ABS(self_corr) < ?)", (CORRELATION_EXCEPTION_RATIO,)
+        ).fetchone()["n"])
+        submission_total = int(self._conn.execute("SELECT COUNT(*) AS n FROM submissions").fetchone()["n"])
+        active_submissions = int(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM submissions WHERE status='ACTIVE'"
+        ).fetchone()["n"])
+        report.cache_hit_rate = round(report.cache_hits / candidate_total, 4)
+        report.simulation_success_rate = round(done_total / simulation_total, 4)
+        report.is_pass_rate = round(pass_total / max(done_total, 1), 4)
+        report.correlation_pass_rate = round(corr_pass / max(corr_checked, 1), 4)
+        report.submission_success_rate = round(active_submissions / max(submission_total, 1), 4)
+        active_since = plus_seconds_iso(-7 * 24 * 3600.0)
+        report.active_alphas_per_week = float(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM active_alphas WHERE first_seen_at >= ?", (active_since,)
+        ).fetchone()["n"])
+        report.simulations_per_is_pass = round(done_total / pass_total, 4) if pass_total else None
+        report.simulations_per_active_alpha = round(done_total / max(len(self.active_alpha_ids()), 1), 4)
         return report
 
 

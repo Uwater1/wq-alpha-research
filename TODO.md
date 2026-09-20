@@ -9,7 +9,7 @@ submission, and learned knowledge restart-safe, private, auditable, and agent-ag
 
 Tracking issue: [#1 — Build agent-agnostic self-evolving knowledge + skill system](https://github.com/Uwater1/wq-alpha-research/issues/1)
 
-Status: pending. Replace direct lesson appends to `SKILL.md` with durable, scoped,
+Status: implemented in the local knowledge/skill-management slice. Replace direct lesson appends to `SKILL.md` with durable,
 evidence-backed knowledge and evaluated skill updates.
 
 ### Storage and compatibility
@@ -94,7 +94,7 @@ Acceptance:
 
 ## Priority 2 — Learned simulation surrogate
 
-Status: waiting for enough clean history.
+Status: pending; the ranking feature ledger is ready for training but no surrogate is allowed to hard-reject candidates yet.
 
 Train ranking models from structural features, fields/categories/coverage, windows and
 settings, signal family, lineage/mutation features, parent outcomes, and local
@@ -106,7 +106,7 @@ metric prediction. Do not hard-reject candidates solely from model prediction at
 
 ## Priority 3 — Complete observability
 
-Status: partial.
+Status: implementation underway; structured event fields and expanded local throughput counters are now present.
 
 Extend the existing event and status groundwork to record operation, timestamp,
 candidate/simulation/submission identifiers, HTTP status/category, retry count,
