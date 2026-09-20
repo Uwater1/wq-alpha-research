@@ -321,6 +321,16 @@ if high_corr:
 
 > **Do not correlate cumulative PnL series.** Cumulative curves carry a strong trend and will overstate similarity between unrelated signals.
 
+> **The Sharpe exception needs the book's Sharpe.** Judging "10% better" requires the Sharpe of the alpha
+> the candidate *correlates with* (`max_corr_alpha_id`) — not the book average, which would let a weak alpha
+> ride on someone else's strength. Fetch and store each ACTIVE alpha's IS metrics during the book sync, or
+> the exception can never fire and the gate degenerates into an unconditional 0.7 wall. An unknown Sharpe
+> for the correlated alpha is a **hold**, not a pass: the exception must be evidenced.
+>
+> `scripts/submission_worker.py --correlation-exception-ratio` (default `1.1`, `0` disables) makes the
+> policy explicit. The margin can be thin — a 2.05 Sharpe against a 1.85 counterpart clears 1.1x by 0.7% —
+> so compare the stored numbers, never a rounded display value.
+
 ### 7.3 Backtest
 
 ```python
@@ -1015,4 +1025,51 @@ The campaign ran in three batches (13, 14, 14 expressions) and ended with three 
 6. **Price-denominated, industry-neutral yield structures cut turnover too.** The winners landed at 6-13%
    turnover against 15-53% for the balance-sheet and sentiment forms, so they cost less slippage on top of
    the Fitness gain.
+
+### 2026-09-19 — Diverse-Dataset Campaign, Compressed Rules
+
+> A campaign aimed at *breadth*: options flow, news/social, implied-volatility term structure,
+> idiosyncratic and systematic risk, balance-sheet growth, `trade_when` regimes. ~55 new expressions ran.
+> Read the rules, not the rows.
+
+**The headline result is negative, and that is the useful part.** Of every candidate built from the
+price/fundamental/analyst pool, daily-return correlation against the 11-alpha ACTIVE book landed between
+**0.73 and 0.97** — including the ones whose standalone Sharpe reached 2.05-2.34. Only one alpha cleared
+both the IS gate and the correlation gate. The diverse-dataset families were mostly *worse*, not more
+orthogonal: they died on LOW_FITNESS (Fitness 0.12-0.86) before correlation ever mattered.
+
+| Family | Best Sharpe / Fitness | Outcome |
+|---|---:|---|
+| estimate-EBITDA+PT / price, `subindustry` | 2.05 / 1.61 | cleared IS **and** the correlation exception -> submitted |
+| estimate-EBITDA+PT / price, `industry`, decay 0 | 2.34 / 1.69 | cleared IS; held on turnover (21.2% vs the 20% ceiling) |
+| idiosyncratic risk (`unsystematic_risk_last_*`), sector | 1.62 / 1.28 | CONCENTRATED_WEIGHT only — the one family worth retrying |
+| options flow (`pcr_oi_*`, IV term structure) | 1.41 / 0.85 | LOW_FITNESS |
+| news / social (`news_short_interest`, sentiment) | 1.41 / 0.76 | LOW_FITNESS, or Sharpe ~0.3-0.6 |
+| balance-sheet growth, `trade_when` regimes | 1.44 / 0.84 | LOW_FITNESS |
+
+**Rules distilled:**
+
+1. **A "diverse dataset" is not automatically a diverse *signal*.** Switching dataset did not buy low
+   correlation; it mostly bought low Fitness. Treat an untouched dataset as an unexplored *Fitness* risk
+   first and an orthogonal-return opportunity second. The families worth a second pass are the ones that
+   failed on a *fixable* check (CONCENTRATED_WEIGHT), not on LOW_FITNESS.
+2. **Correlation is the binding constraint on this book, not Sharpe or Fitness.** The book is 11 yield/
+   risk-premium alphas; anything built from price, fundamentals or analyst estimates duplicates it no
+   matter how many variants are tried. Confirms §9: intra-pool "low correlation" means 0.3-0.6, and the
+   way past 0.7 is a different return *path*, not a different parameter.
+3. **§7.2's Sharpe exception is only usable if the book's Sharpe is known.** See §7.2 — the gate must hold
+   the IS metrics of every ACTIVE alpha, because the exception is judged against the alpha the candidate
+   *correlates with*, never against a book average. On that comparison a 2.05 candidate was allowed past a
+   1.85 counterpart (needs >= 1.1x) while a 1.84 candidate was correctly refused; the margin is thin, so
+   never round it.
+4. **Raising `decay` is the turnover lever, and it costs Sharpe.** A 21.2% turnover candidate at decay 0
+   drops toward the 10% range at decay 8; plan for the Sharpe loss when a candidate clears the IS gate but
+   misses the turnover ceiling.
+5. **A parameter grid is not an exploration strategy.** Six decay variants of one structure is one idea;
+   the halving gate defers the other five until the base proves itself. Spend the freed slots on a
+   *different structure*, not a different constant.
+6. **Validated expressions can be rejected for the wrong reason.** `ts_rank(winsorize(x, std=4), 120)` was
+   refused as a 1-argument call because the argument was judged keyword-ish by the presence of `=` anywhere
+   in it. A static validator must classify a keyword argument by its *own* leading `name =`, not by an `=`
+   nested inside a call.
 
