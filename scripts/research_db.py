@@ -380,7 +380,6 @@ SCHEMA: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id)",
-    "CREATE INDEX IF NOT EXISTS idx_events_operation ON events(operation, created_at)",
     """
     CREATE TABLE IF NOT EXISTS knowledge_observations (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -667,6 +666,9 @@ class ResearchDB:
             for statement in SCHEMA:
                 conn.execute(statement)
             self._ensure_columns(conn)
+            # This index references columns added by ADDED_COLUMNS; create it only after
+            # upgrading an older events table in place.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_operation ON events(operation, created_at)")
             try:
                 conn.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_rules_fts USING fts5("

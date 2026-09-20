@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import brain_api
 import research_db as rdb
@@ -33,6 +34,24 @@ def test_brain_client_exposes_non_sensitive_request_telemetry():
     assert client.last_request["retry_count"] == 0
     assert client.last_request["latency_ms"] >= 0
     assert "password" not in json.dumps(client.last_request).lower()
+
+
+def test_existing_pre_observability_events_table_is_upgraded_before_indexing(tmp_path):
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, "
+        "entity TEXT NOT NULL, entity_id TEXT, event TEXT NOT NULL, from_status TEXT, "
+        "to_status TEXT, payload_json TEXT)"
+    )
+    connection.commit()
+    connection.close()
+
+    with rdb.ResearchDB.open(path) as db:
+        columns = {row["name"] for row in db.query("PRAGMA table_info(events)")}
+        assert {"operation", "http_status", "latency_ms", "result_class"} <= columns
+        db.log_event("transport", "legacy", "http", operation="migration", result_class="ok")
+        assert db.query("SELECT operation FROM events WHERE entity_id='legacy'")[0]["operation"] == "migration"
 
 
 def test_events_store_transport_dimensions_and_stats_rates(tmp_path):
