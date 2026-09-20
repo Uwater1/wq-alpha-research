@@ -61,8 +61,9 @@ class FakeCorrelationBrain:
     """Stand-in for BrainClient covering the correlation and submission calls."""
 
     def __init__(self, *, active_ids=(), pnl=None, status="ACTIVE", submit_outcome="submitted",
-                 checks=None, book_error=None):
+                 checks=None, book_error=None, metrics=None):
         self.active_ids = [str(a) for a in active_ids]
+        self.metrics = dict(metrics or {})
         self.pnl = dict(pnl or {})
         self.status = status
         self.submit_outcome = submit_outcome
@@ -75,7 +76,10 @@ class FakeCorrelationBrain:
         self.book_calls += 1
         if self.book_error:
             raise brain_api.BrainAPIError(self.book_error)
-        return [{"id": alpha_id} for alpha_id in self.active_ids]
+        return [
+            {"id": alpha_id, "is": dict(self.metrics.get(alpha_id, {}))}
+            for alpha_id in self.active_ids
+        ]
 
     def get(self, url, **kwargs):
         alpha_id = str(url).split("/alphas/")[1].split("/")[0]
@@ -283,6 +287,56 @@ def test_gate_holds_when_correlation_is_missing_or_stale(db):
     assert not rdb.submission_gate(high, require_correlation=True, active_set_version=3)[0]
 
 
+def test_book_sync_persists_the_is_metrics_the_exception_needs(db):
+    """Membership alone cannot answer "is my Sharpe 10% better than *that* alpha's?"."""
+    dates, values = _series(_wave())
+    client = FakeCorrelationBrain(
+        active_ids=["OLD", "OLDER"],
+        pnl={"OLD": (dates, values), "OLDER": (dates, values)},
+        metrics={"OLD": {"sharpe": 1.8, "fitness": 1.5, "turnover": 0.11}},
+    )
+
+    _service(db, client).sync_active_book()
+
+    assert db.active_alpha_sharpes() == {"OLD": 1.8}
+    stored = {row["brain_alpha_id"]: row for row in db.query("SELECT * FROM active_alphas")}
+    assert stored["OLD"]["fitness"] == 1.5 and stored["OLD"]["turnover"] == 0.11
+
+
+def test_gate_allows_a_correlated_alpha_only_with_a_materially_better_sharpe(db):
+    """SKILL.md 7.2's exception: at least 10% better than the alpha it correlates with."""
+    book = {"OLD": 1.8}
+    high = {"brain_alpha_id": "A1", "self_corr": 0.84, "corr_status": "ok", "active_set_version": 3,
+            "max_corr_alpha_id": "OLD", "fitness": 1.6, "turnover": 0.09}
+
+    better = {**high, "sharpe": 2.05}
+    assert rdb.submission_gate(better, require_correlation=True, active_set_version=3,
+                               active_sharpes=book)[0] is True
+
+    # 1.9 is an improvement, but not the documented 10%: still held, with the reason readable.
+    marginal = {**high, "sharpe": 1.9}
+    allowed, reasons = rdb.submission_gate(marginal, require_correlation=True, active_set_version=3,
+                                           active_sharpes=book)
+    assert not allowed and any("below" in reason for reason in reasons)
+
+    # Disabling the exception restores the hard wall.
+    assert not rdb.submission_gate(better, require_correlation=True, active_set_version=3,
+                                   active_sharpes=book, correlation_exception_ratio=0)[0]
+
+
+def test_gate_never_assumes_the_exception_without_the_correlated_sharpe(db):
+    correlated = {"brain_alpha_id": "A1", "self_corr": 0.84, "corr_status": "ok",
+                  "active_set_version": 3, "max_corr_alpha_id": "UNKNOWN",
+                  "sharpe": 3.0, "fitness": 1.6, "turnover": 0.09}
+
+    allowed, reasons = rdb.submission_gate(correlated, require_correlation=True, active_set_version=3,
+                                           active_sharpes={"OLD": 1.8})
+    assert not allowed and any("unknown" in reason for reason in reasons)
+
+    # No book metrics at all is the old behaviour, unchanged.
+    assert not rdb.submission_gate(correlated, require_correlation=True, active_set_version=3)[0]
+
+
 def test_unavailable_and_incomplete_checks_are_explicit_holds(db):
     candidate = {"brain_alpha_id": "A1", "sharpe": 1.6, "fitness": 1.3, "turnover": 0.05,
                  "corr_status": "unavailable", "active_set_version": 1}
@@ -353,6 +407,22 @@ def test_worker_holds_a_redundant_candidate_without_posting(db):
     assert client.posts == []
     assert db.counts("submissions") == {"RETRY": 1}
     assert db.get_candidate(candidate["id"])["corr_status"] == corr.STATUS_OK
+    assert db.get_candidate(candidate["id"])["self_corr"] == pytest.approx(1.0)
+
+
+def test_worker_submits_through_the_sharpe_exception(db):
+    """The same shape as an ACTIVE alpha is still worth a slot when it is clearly stronger."""
+    dates, values = _series(_wave())
+    client = FakeCorrelationBrain(active_ids=["OLD"], pnl={"OLD": (dates, values)},
+                                  metrics={"OLD": {"sharpe": 1.0}})
+    candidate = _ready_candidate(db)
+    client.pnl[candidate["brain_alpha_id"]] = _series(_wave())  # shape-identical to OLD
+    assert candidate["sharpe"] >= 1.1 * 1.0
+
+    _worker(db, client, max_submissions=1).run()
+
+    assert client.posts == [candidate["brain_alpha_id"]]
+    assert db.counts("submissions") == {"ACTIVE": 1}
     assert db.get_candidate(candidate["id"])["self_corr"] == pytest.approx(1.0)
 
 

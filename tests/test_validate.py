@@ -79,6 +79,27 @@ def test_keyword_values_are_not_treated_as_fields():
     assert report.warnings == []
 
 
+def test_a_nested_keyword_argument_is_still_positional():
+    """`ts_rank(winsorize(x, std=4), 120)` is a 2-argument call, not a keyword one.
+
+    Testing for a bare '=' anywhere misread the enclosing call as passing a keyword, which
+    rejected a perfectly valid expression before it ever reached BRAIN.
+    """
+    report = v.validate("group_rank(ts_rank(winsorize(operating_income/equity, std=4), 120), sector)",
+                        {"region": "USA"})
+
+    assert report.ok, report.errors
+    assert report.errors == []
+    assert report.warnings == []
+
+
+def test_an_unknown_top_level_keyword_is_still_warned_about():
+    report = v.validate("ts_rank(close, 120, bogus_kw=3)", {"region": "USA"})
+
+    assert report.ok
+    assert any("bogus_kw" in warning for warning in report.warnings)
+
+
 # ---------------------------------------------------------------------------
 # Scope-aware field checks and soft warnings
 # ---------------------------------------------------------------------------

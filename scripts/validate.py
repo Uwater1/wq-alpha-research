@@ -68,6 +68,10 @@ GROUP_OPERATORS = frozenset({"group_rank", "group_neutralize", "group_zscore", "
 DEEP_DEPTH_WARNING = 8
 QUOTES = "\"'“”‘’"
 _CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\(")
+#: A keyword argument is ``name = value`` at the *top* of one argument. Testing for a bare
+#: '=' anywhere would misread `ts_rank(winsorize(x, std=4), 120)`: that argument merely
+#: contains a nested keyword, and is still the call's one positional argument.
+_KWARG_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"(?<![\w.])\d+(?:\.\d*)?(?:[eE][+-]?\d+)?(?![\w.])")
 
@@ -341,7 +345,7 @@ def validate(
             continue
         call_spans.append((open_index, close_index))
         arguments = _split_args(masked[open_index + 1 : close_index])
-        positional = [a.strip() for a in arguments if a.strip() and "=" not in a]
+        positional = [a.strip() for a in arguments if a.strip() and _KWARG_RE.match(a) is None]
         spec = operators.get(lower)
         if spec is None:
             report.errors.append(f"unknown operator {name!r}")
@@ -355,10 +359,9 @@ def validate(
                           "lookback", "k", "ignore", "hump", "range", "buckets", "skipBoth", "NaNGroup",
                           "useStd", "limit", "scale", "longscale", "shortscale", "group", "weight"}
         for argument in arguments:
-            if "=" in argument:
-                keyword = argument.split("=", 1)[0].strip()
-                if keyword and keyword not in known_keywords:
-                    report.warnings.append(f"unknown keyword argument {keyword!r} on {lower}()")
+            keyword = _KWARG_RE.match(argument)
+            if keyword is not None and keyword.group(1) not in known_keywords:
+                report.warnings.append(f"unknown keyword argument {keyword.group(1)!r} on {lower}()")
 
     # 3. fields: unknown names, vector misuse, group arguments
     called = {match.group(1).lower() for match in _CALL_RE.finditer(masked)}

@@ -73,6 +73,7 @@ class SubmissionWorker:
         max_submission_attempts: int = research_db.DEFAULT_SUBMISSION_MAX_ATTEMPTS,
         require_correlation: bool = False,
         correlation_limit: float = 0.7,
+        correlation_exception_ratio: float = research_db.CORRELATION_EXCEPTION_RATIO,
         thresholds: Mapping[str, float] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -88,6 +89,7 @@ class SubmissionWorker:
         self.max_submission_attempts = max(int(max_submission_attempts), 1)
         self.require_correlation = require_correlation
         self.correlation_limit = correlation_limit
+        self.correlation_exception_ratio = correlation_exception_ratio
         self.thresholds = dict(thresholds or {})
         self._clock = clock
         self._sleep = sleep
@@ -184,6 +186,10 @@ class SubmissionWorker:
             require_correlation=self.require_correlation,
             correlation_limit=self.correlation_limit,
             active_set_version=self.db.active_set_version() if self.require_correlation else None,
+            # The 7.2 exception compares against the alpha we correlate with, so the gate
+            # needs the book's Sharpes -- which the ACTIVE sync above just refreshed.
+            active_sharpes=self.db.active_alpha_sharpes() if self.require_correlation else None,
+            correlation_exception_ratio=self.correlation_exception_ratio,
             thresholds=self.thresholds or None,
         )
 
@@ -435,6 +441,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="demand a fresh local self-correlation before submitting")
     parser.add_argument("--correlation-limit", type=float, default=0.7,
                         help="reject a candidate whose |daily-return correlation| is at least this")
+    parser.add_argument("--correlation-exception-ratio", type=float,
+                        default=research_db.CORRELATION_EXCEPTION_RATIO,
+                        help="allow a correlated candidate whose Sharpe is at least this many times "
+                             "the correlated ACTIVE alpha's (SKILL.md 7.2); 0 disables the exception")
     parser.add_argument("--min-sharpe", type=float, default=research_db.IS_THRESHOLDS["sharpe"],
                         help="submission floor for Sharpe")
     parser.add_argument("--min-fitness", type=float, default=research_db.IS_THRESHOLDS["fitness"],
@@ -466,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
             max_submission_attempts=args.max_submission_attempts,
             require_correlation=args.require_correlation,
             correlation_limit=args.correlation_limit,
+            correlation_exception_ratio=args.correlation_exception_ratio,
             thresholds={
                 "sharpe": args.min_sharpe,
                 "fitness": args.min_fitness,

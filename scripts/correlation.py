@@ -345,9 +345,23 @@ class CorrelationService:
             _warn(f"ACTIVE book sync failed: {sync.error}")
             return sync
 
-        alpha_ids = [str(alpha.get("id")) for alpha in alphas if isinstance(alpha, Mapping) and alpha.get("id")]
+        # Keep the book's IS metrics, not just its membership: the gate applies SKILL.md
+        # 7.2's "materially better Sharpe" exception against the alpha we correlate with,
+        # which is unknowable from ids alone.
+        metrics: dict[str, dict[str, Any]] = {}
+        for alpha in alphas:
+            if not isinstance(alpha, Mapping) or not alpha.get("id"):
+                continue
+            payload = brain_api.alpha_metrics(alpha)
+            # Only real numbers are recorded: a payload without an ``is`` block must stay a
+            # membership-only entry, not a write of three NULLs on every sync.
+            metrics[str(alpha["id"])] = {
+                key: payload[key] for key in ("sharpe", "fitness", "turnover")
+                if payload.get(key) is not None
+            }
+        alpha_ids = sorted(metrics)
         sync.fetched = len(alpha_ids)
-        result = self.db.sync_active_set(alpha_ids)
+        result = self.db.sync_active_set(metrics)
         sync.added, sync.removed, sync.version = result["added"], result["removed"], result["version"]
         sync.stale_checks = self.db.mark_stale_correlations()
 

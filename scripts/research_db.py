@@ -1731,26 +1731,55 @@ class ResearchDB:
                 self.log_event("portfolio", "active_set", "version_bumped", payload={"version": version}, conn=owned)
         return version
 
-    def sync_active_set(self, alpha_ids: Iterable[str]) -> dict[str, int]:
+    def sync_active_set(
+        self, alphas: Mapping[str, Mapping[str, Any]] | Iterable[str]
+    ) -> dict[str, int]:
         """Reconcile the local snapshot with the platform ACTIVE book.
+
+        ``alphas`` maps each ACTIVE id to its platform IS metrics, or is a plain iterable of
+        ids when only membership is known. Metrics are stored for *every* entry, not just
+        new ones: SKILL.md 7.2 lets a materially better Sharpe justify a correlated alpha,
+        and that decision needs the Sharpe of the alpha the candidate correlates *with*, so
+        a membership-only sync would leave the exception permanently unevaluable.
 
         New ids are recorded and any membership change bumps the version, which is what
         makes every previously cached correlation check stale. Ids that disappeared from
         the platform are kept: their PnL is still a useful correlation reference.
         """
-        remote = {str(alpha_id) for alpha_id in alpha_ids if alpha_id}
+        if isinstance(alphas, Mapping):
+            records = {str(key): dict(value) for key, value in alphas.items() if key}
+        else:
+            records = {str(alpha_id): {} for alpha_id in alphas if alpha_id}
+        remote = set(records)
         timestamp = now_iso()
         with self._tx() as conn:
             local = {str(row["brain_alpha_id"]) for row in conn.execute("SELECT brain_alpha_id FROM active_alphas")}
             added = remote - local
             removed = local - remote
-            for alpha_id in sorted(added):
+            for alpha_id in sorted(remote):
+                metrics = records[alpha_id]
+                if alpha_id in local and not metrics:
+                    continue  # nothing new to record about an already-tracked id
                 self._upsert_active_alpha_row(
                     conn, alpha_id, canonical_key=None, expression_hash=None, settings_hash=None,
-                    sharpe=None, fitness=None, turnover=None, pnl_ref=None, timestamp=timestamp,
+                    sharpe=metrics.get("sharpe"), fitness=metrics.get("fitness"),
+                    turnover=metrics.get("turnover"), pnl_ref=None, timestamp=timestamp,
                 )
             version = self.bump_active_set_version(conn) if (added or removed) else self.active_set_version()
         return {"added": len(added), "removed": len(removed), "version": version, "total": len(remote)}
+
+    def active_alpha_sharpes(self) -> dict[str, float]:
+        """Sharpe per known ACTIVE alpha (ids with no recorded metric are omitted).
+
+        The local self-correlation gate compares a candidate's Sharpe against the alpha it
+        actually correlates with, so it needs this map rather than a book-wide average.
+        """
+        return {
+            str(row["brain_alpha_id"]): float(row["sharpe"])
+            for row in self._conn.execute(
+                "SELECT brain_alpha_id, sharpe FROM active_alphas WHERE sharpe IS NOT NULL"
+            )
+        }
 
     def cache_active_pnl(self, brain_alpha_id: str, dates: Sequence[str], values: Sequence[float]) -> None:
         """Cache an ACTIVE alpha's daily PnL series locally."""
@@ -1887,17 +1916,31 @@ class ResearchDB:
         return report
 
 
+#: SKILL.md 7.2: a correlated alpha may still be submitted when its Sharpe is at least
+#: this much better than the alpha it correlates with. A ratio of 0 disables the exception.
+CORRELATION_EXCEPTION_RATIO = 1.1
+
+
 def correlation_reasons(
     candidate: Mapping[str, Any],
     *,
     limit: float = 0.7,
     active_set_version: int | None = None,
+    active_sharpes: Mapping[str, float] | None = None,
+    exception_ratio: float = CORRELATION_EXCEPTION_RATIO,
 ) -> list[str]:
     """Why a candidate's local self-correlation does not clear the gate.
 
     A missing number is never treated as "low correlation": every unusable state names
     itself (unavailable, insufficient, degenerate, incomplete, stale) so the candidate is
     held explicitly and re-checked at submission time.
+
+    ``active_sharpes`` maps ACTIVE alpha ids to their Sharpe. Supplying it enables SKILL.md
+    7.2's exception, which compares the candidate against the alpha it actually correlates
+    with (``max_corr_alpha_id``) -- never against a book-wide average, which would let a
+    weak alpha ride on someone else's strength. Without the map a correlated candidate is
+    blocked exactly as before, and an unknown Sharpe for the correlated id is a block too:
+    the exception has to be *evidenced*, never assumed.
     """
     status = str(candidate.get("corr_status") or "")
     version = candidate.get("active_set_version")
@@ -1916,9 +1959,19 @@ def correlation_reasons(
             "stale": "the ACTIVE book changed since the check",
         }.get(status, "it has not been checked yet")
         return [f"local self-correlation is missing or unusable ({detail})"]
-    if abs(self_corr) >= limit:
-        return [f"self-correlation {self_corr:.2f} >= {limit}"]
-    return []
+    if abs(self_corr) < limit:
+        return []
+    if exception_ratio > 0 and active_sharpes is not None:
+        old_sharpe = active_sharpes.get(str(candidate.get("max_corr_alpha_id")))
+        new_sharpe = candidate.get("sharpe")
+        if isinstance(old_sharpe, (int, float)) and isinstance(new_sharpe, (int, float)):
+            if new_sharpe >= old_sharpe * exception_ratio:
+                return []  # materially better Sharpe; BRAIN's own check remains the confirmation
+            return [f"self-correlation {self_corr:.2f} >= {limit} and sharpe {new_sharpe:.2f} is below "
+                    f"{exception_ratio:.2f}x the correlated alpha's {old_sharpe:.2f}"]
+        return [f"self-correlation {self_corr:.2f} >= {limit} and the correlated alpha's sharpe is unknown"]
+    return [f"self-correlation {self_corr:.2f} >= {limit}"]
+
 
 
 def submission_gate(
@@ -1929,6 +1982,8 @@ def submission_gate(
     require_correlation: bool = False,
     correlation_limit: float = 0.7,
     active_set_version: int | None = None,
+    active_sharpes: Mapping[str, float] | None = None,
+    correlation_exception_ratio: float = CORRELATION_EXCEPTION_RATIO,
 ) -> tuple[bool, list[str]]:
     """Submission gates: metrics floors, no duplicate ACTIVE alpha, local corr."""
     limits = {**IS_THRESHOLDS, **(thresholds or {})}
@@ -1951,7 +2006,13 @@ def submission_gate(
             reasons.append("this alpha is already ACTIVE")
     if require_correlation:
         reasons.extend(
-            correlation_reasons(candidate, limit=correlation_limit, active_set_version=active_set_version)
+            correlation_reasons(
+                candidate,
+                limit=correlation_limit,
+                active_set_version=active_set_version,
+                active_sharpes=active_sharpes,
+                exception_ratio=correlation_exception_ratio,
+            )
         )
     return (not reasons), reasons
 
