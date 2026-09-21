@@ -497,9 +497,27 @@ class SimulationScheduler:
         try:
             metrics = self.client.alpha_metrics(alpha_id)
         except brain_api.SessionExpiredError:
+            self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                operation="simulation.alpha_metrics", result_class="session_expired")
             self.reauthenticate()
-            metrics = self.client.alpha_metrics(alpha_id)
+            try:
+                metrics = self.client.alpha_metrics(alpha_id)
+            except brain_api.BrainAPIError as exc:
+                self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                    operation="simulation.alpha_metrics", result_class="error")
+                self.failed += 1
+                self.db.record_simulation_result(
+                    candidate_id=candidate_id, status="ERROR", error=f"alpha_fetch_failed: {exc}",
+                    simulation_id=handle.simulation_id, brain_alpha_id=alpha_id,
+                    retry_delay_seconds=self.backoff_base,
+                )
+                return
+            else:
+                self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                    operation="simulation.alpha_metrics", result_class="ok")
         except brain_api.BrainAPIError as exc:
+            self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                operation="simulation.alpha_metrics", result_class="error")
             self.failed += 1
             self.db.record_simulation_result(
                 candidate_id=candidate_id, status="ERROR", error=f"alpha_fetch_failed: {exc}",
@@ -507,6 +525,9 @@ class SimulationScheduler:
                 retry_delay_seconds=self.backoff_base,
             )
             return
+        else:
+            self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                operation="simulation.alpha_metrics", result_class="ok")
 
         candidate = self.db.record_simulation_result(
             candidate_id=candidate_id,
