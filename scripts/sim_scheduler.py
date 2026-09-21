@@ -312,7 +312,8 @@ class SimulationScheduler:
         """
         attempts = []
         drain = getattr(self.client, "drain_attempts", None)
-        if callable(drain):
+        modern_buffer = callable(drain)
+        if modern_buffer:
             try:
                 attempts = drain() or []
             except Exception:
@@ -330,7 +331,11 @@ class SimulationScheduler:
                     result_class=result_class if entry.get("final") else "retry",
                 )
             return
+        if modern_buffer:
+            return
         request = getattr(self.client, "last_request", {}) or {}
+        if not request:
+            return
         self.db.log_event(
             "transport", candidate_id or simulation_id or submission_id, "http",
             operation=operation, candidate_id=candidate_id, simulation_id=simulation_id,
