@@ -404,7 +404,10 @@ class CorrelationService:
                 retry_count=int(entry.get("attempt") or 0),
                 latency_ms=entry.get("latency_ms"),
                 rate_limit_seconds=entry.get("rate_limit_seconds"),
-                result_class=result_class if entry.get("final", True) else "retry",
+                result_class=(
+                    "retry" if not entry.get("final", True)
+                    else str(entry.get("error_category") or result_class)
+                ),
             )
 
     # -- ACTIVE book -------------------------------------------------------
