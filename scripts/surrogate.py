@@ -116,7 +116,8 @@ def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, 
                     payload = dict(parent) if parent else {}
                     result_event = db.query(
                         "SELECT MIN(id) AS event_id FROM events "
-                        "WHERE entity='simulation' AND CAST(entity_id AS INTEGER)=? AND event='result'",
+                        "WHERE entity='simulation' AND CAST(entity_id AS INTEGER)=? "
+                        "AND event='result' AND to_status='DONE'",
                         (pid,),
                     )
                     payload["_outcome_event_id"] = (
@@ -163,6 +164,7 @@ def _rows(db: Any, *, training: bool) -> list[dict[str, Any]]:
                        WHERE e.entity='simulation'
                          AND CAST(e.entity_id AS INTEGER)=c.id
                          AND e.event='result'
+                         AND e.to_status='DONE'
                    ) AS outcome_event_id
             FROM candidates c
             JOIN simulations s ON s.canonical_key=c.canonical_key
