@@ -373,6 +373,43 @@ class CorrelationService:
         self._sleep = sleep
         self._log = log
 
+    def _flush_transport(self, *, operation: str, result_class: str,
+                         candidate_id: int | None = None) -> None:
+        """Persist and clear every HTTP attempt produced by one logical correlation operation."""
+        drain = getattr(self.client, "drain_attempts", None)
+        attempts = []
+        modern_buffer = callable(drain)
+        if modern_buffer:
+            try:
+                attempts = drain() or []
+            except Exception:
+                attempts = []
+        if not attempts and not modern_buffer:
+            request = getattr(self.client, "last_request", {}) or {}
+            if request:
+                attempts = [{
+                    "http_status": request.get("http_status"),
+                    "error_category": request.get("error_category"),
+                    "attempt": request.get("retry_count", 0),
+                    "latency_ms": request.get("latency_ms"),
+                    "rate_limit_seconds": request.get("rate_limit_seconds"),
+                    "final": True,
+                }]
+        for entry in attempts:
+            self.db.log_event(
+                "transport", candidate_id if candidate_id is not None else operation, "http",
+                operation=operation, candidate_id=candidate_id,
+                http_status=entry.get("http_status"),
+                error_category=entry.get("error_category"),
+                retry_count=int(entry.get("attempt") or 0),
+                latency_ms=entry.get("latency_ms"),
+                rate_limit_seconds=entry.get("rate_limit_seconds"),
+                result_class=(
+                    "retry" if not entry.get("final", True)
+                    else str(entry.get("error_category") or result_class)
+                ),
+            )
+
     # -- ACTIVE book -------------------------------------------------------
 
     def sync_active_book(self, *, force: bool = False) -> BookSync:
@@ -381,11 +418,14 @@ class CorrelationService:
         try:
             alphas = self.client.list_active_alphas(page_size=self.page_size)
         except brain_api.BrainAPIError as exc:
+            self._flush_transport(operation="correlation.active_book", result_class="error")
             # Refuse to proceed on a partial book: a truncated book would silently hide
             # the very alpha a candidate correlates with.
             sync.error = str(exc)[:300]
             _warn(f"ACTIVE book sync failed: {sync.error}")
             return sync
+        else:
+            self._flush_transport(operation="correlation.active_book", result_class="ok")
 
         # Keep the book's IS metrics, not just its membership: the gate applies SKILL.md
         # 7.2's "materially better Sharpe" exception against the alpha we correlate with,
@@ -412,14 +452,20 @@ class CorrelationService:
 
         cached = set(self.db.active_pnl_ids()) if not force else set()
         missing_ids = [alpha_id for alpha_id in alpha_ids if alpha_id not in cached]
-        fetched = fetch_pnl_batch(
-            self.client,
-            missing_ids,
-            tries=self.pnl_tries,
-            delay=self.pnl_delay,
-            sleep=self._sleep,
-            workers=self.pnl_workers,
-        )
+        try:
+            fetched = fetch_pnl_batch(
+                self.client,
+                missing_ids,
+                tries=self.pnl_tries,
+                delay=self.pnl_delay,
+                sleep=self._sleep,
+                workers=self.pnl_workers,
+            )
+        except Exception:
+            self._flush_transport(operation="correlation.active_pnl", result_class="error")
+            raise
+        else:
+            self._flush_transport(operation="correlation.active_pnl", result_class="ok")
         # Keep SQLite writes single-threaded and deterministic after the HTTP fan-out.
         for alpha_id, (dates, values) in fetched:
             if values:
@@ -470,9 +516,17 @@ class CorrelationService:
                 candidate_id, version,
                 CorrelationResult(STATUS_UNAVAILABLE, reason="candidate has no BRAIN alpha id"),
             )
-        dates, values = fetch_pnl_for_new_alpha(
-            self.client, str(alpha_id), tries=self.pnl_tries, delay=self.pnl_delay, sleep=self._sleep
-        )
+        try:
+            dates, values = fetch_pnl_for_new_alpha(
+                self.client, str(alpha_id), tries=self.pnl_tries, delay=self.pnl_delay, sleep=self._sleep
+            )
+        except Exception:
+            self._flush_transport(operation="correlation.candidate_pnl", result_class="error",
+                                  candidate_id=candidate_id)
+            raise
+        else:
+            self._flush_transport(operation="correlation.candidate_pnl", result_class="ok",
+                                  candidate_id=candidate_id)
         if not values:
             return self._record(
                 candidate_id, version,

@@ -155,6 +155,15 @@ class BrainClient:
         # Last-request telemetry is intentionally data-only; callers may persist it in
         # research.db without ever logging credentials or response bodies.
         self.last_request: dict[str, Any] = {}
+        # One entry per HTTP attempt (including 429 retries and transport errors),
+        # so a final success can never overwrite the rate-limit/retry record.
+        self.attempt_history: list[dict[str, Any]] = []
+
+    def drain_attempts(self) -> list[dict[str, Any]]:
+        """Take and clear the buffered per-attempt telemetry."""
+        attempts = list(self.attempt_history)
+        self.attempt_history = []
+        return attempts
 
     # -- session -----------------------------------------------------------
 
@@ -200,10 +209,16 @@ class BrainClient:
             return default
 
     def request(self, method: str, url: str, *, retries: int | None = None, **kwargs: Any) -> requests.Response:
-        """HTTP with Retry-After-aware 429 handling, backoff, and typed auth errors."""
+        """HTTP with Retry-After-aware 429 handling, backoff, and typed auth errors.
+
+        Every attempt appends one record to :attr:`attempt_history`
+        (operation/attempt/status/category/latency/retry-after/final flag);
+        :attr:`last_request` still mirrors the latest attempt for compatibility.
+        """
         attempts = self.retries if retries is None else retries
         kwargs.setdefault("timeout", (10, 60))
         last_retry_after = 5.0
+        operation = f"{method} {url}"
         for attempt in range(attempts + 1):
             started = time.monotonic()
             try:
@@ -215,6 +230,11 @@ class BrainClient:
                     "error_category": type(exc).__name__, "retry_count": attempt,
                     "latency_ms": round(self.last_latency * 1000.0, 3),
                 }
+                self.attempt_history.append(
+                    {"operation": operation, "attempt": attempt, "http_status": None,
+                     "error_category": type(exc).__name__,
+                     "latency_ms": round(self.last_latency * 1000.0, 3),
+                     "rate_limit_seconds": None, "final": attempt >= attempts})
                 if attempt >= attempts:
                     raise BrainAPIError(f"{method} {url} failed: {exc}") from exc
                 time.sleep(DEFAULT_BACKOFF_BASE * (2**attempt))
@@ -228,6 +248,10 @@ class BrainClient:
             if response.status_code == 429:
                 last_retry_after = self.retry_after_seconds(response)
                 self.last_request.update({"error_category": "rate_limit", "rate_limit_seconds": last_retry_after})
+                self.attempt_history.append(
+                    {"operation": operation, "attempt": attempt, "http_status": 429,
+                     "error_category": "rate_limit", "latency_ms": round(self.last_latency * 1000.0, 3),
+                     "rate_limit_seconds": last_retry_after, "final": attempt >= attempts})
                 if attempt >= attempts:
                     raise RateLimitError(f"{method} {url} rate-limited", last_retry_after)
                 time.sleep(min(last_retry_after, 30.0))
@@ -235,6 +259,10 @@ class BrainClient:
 
             if response.status_code in (401, 403):
                 self.last_request["error_category"] = "session_expired"
+                self.attempt_history.append(
+                    {"operation": operation, "attempt": attempt, "http_status": response.status_code,
+                     "error_category": "session_expired", "latency_ms": round(self.last_latency * 1000.0, 3),
+                     "rate_limit_seconds": None, "final": True})
                 raise SessionExpiredError(f"{method} {url} -> HTTP {response.status_code}", response.status_code)
 
             if response.status_code >= 400:
@@ -245,10 +273,22 @@ class BrainClient:
                     pass
                 if "credentials" in detail.lower():
                     self.last_request["error_category"] = "session_expired"
+                    self.attempt_history.append(
+                        {"operation": operation, "attempt": attempt, "http_status": response.status_code,
+                         "error_category": "session_expired", "latency_ms": round(self.last_latency * 1000.0, 3),
+                         "rate_limit_seconds": None, "final": True})
                     raise SessionExpiredError(f"BRAIN rejected the request: {detail}", response.status_code)
                 self.last_request["error_category"] = "http_error"
+                self.attempt_history.append(
+                    {"operation": operation, "attempt": attempt, "http_status": response.status_code,
+                     "error_category": "http_error", "latency_ms": round(self.last_latency * 1000.0, 3),
+                     "rate_limit_seconds": None, "final": True})
                 raise BrainAPIError(f"{method} {url} -> HTTP {response.status_code}: {detail}", response.status_code)
 
+            self.attempt_history.append(
+                {"operation": operation, "attempt": attempt, "http_status": response.status_code,
+                 "error_category": None, "latency_ms": round(self.last_latency * 1000.0, 3),
+                 "rate_limit_seconds": None, "final": True})
             return response
         raise RateLimitError(f"{method} {url} still rate-limited after {attempts} retries", last_retry_after)
 

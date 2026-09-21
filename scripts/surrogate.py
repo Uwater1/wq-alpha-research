@@ -28,7 +28,14 @@ TARGETS = ("is_pass", "sharpe", "fitness", "turnover")
 
 
 def _token_features(row: Mapping[str, Any]) -> dict[str, float]:
-    """Build stable sparse-ish features from a candidate without using account IDs."""
+    """Build stable sparse-ish features from a candidate without using account IDs.
+
+    Pre-simulation stage only: every feature here must be known *before* BRAIN
+    runs. Post-outcome columns (sharpe/fitness/turnover/self_corr/is_pass,
+    brain ids, checks) are deliberately NEVER featurized, so pre-simulation
+    ranking cannot leak the result it is trying to predict. Submission-stage
+    signals belong to a separate model, not this one.
+    """
     expression = str(row.get("normalized_expression") or row.get("expression") or "")
     features: dict[str, float] = {"bias": 1.0}
     import canonical
@@ -53,8 +60,23 @@ def _token_features(row: Mapping[str, Any]) -> dict[str, float]:
     family = str(row.get("signal_family") or "unknown")
     features[f"family:{family}"] = 1.0
     features["generation"] = float(row.get("generation") or 0)
-    features["attempt_count"] = float(row.get("attempt_count") or 0)
+    # attempt_count is intentionally excluded: the final retry count of a settled
+    # training row was not known at the equivalent pre-simulation prediction point.
     features["near_duplicate"] = 1.0 if row.get("near_duplicate_of") else 0.0
+    # Lineage / mutation signals known at queue time (pre-simulation).
+    mutation_type = row.get("mutation_type")
+    if mutation_type:
+        features[f"muttype:{mutation_type}"] = 1.0
+    features["has_parent"] = 1.0 if row.get("parent_id") else 0.0
+    for key in ("parent_is_pass", "parent_sharpe", "parent_fitness"):
+        value = row.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            features[key] = float(value)
+    # Ranking outputs known before simulation (quality/novelty/risk priors).
+    for key in ("expected_quality", "novelty_score", "failure_risk"):
+        value = row.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            features[f"rank:{key}"] = float(value)
     structural = row.get("structural_json")
     if structural:
         try:
@@ -68,13 +90,88 @@ def _token_features(row: Mapping[str, Any]) -> dict[str, float]:
     return features
 
 
+def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach only parent outcomes that existed before the child entered the queue.
+
+    Event IDs are the causal clock. Timestamps are second-granularity and can tie,
+    so current parent state alone must never retroactively enrich an older child.
+    """
+    enriched: list[dict[str, Any]] = []
+    parent_cache: dict[int, dict[str, Any]] = {}
+    child_queue_events: dict[int, int | None] = {}
+    for row in rows:
+        item = dict(row)
+        parent_id = row.get("parent_id")
+        if parent_id:
+            try:
+                pid = int(parent_id)
+            except (TypeError, ValueError):
+                pid = None
+            if pid is not None:
+                if pid not in parent_cache:
+                    try:
+                        parent = db.get_candidate(pid)
+                    except (AttributeError, KeyError):
+                        parent = None
+                    payload = dict(parent) if parent else {}
+                    result_event = db.query(
+                        "SELECT MIN(id) AS event_id FROM events "
+                        "WHERE entity='simulation' AND CAST(entity_id AS INTEGER)=? "
+                        "AND event='result' AND to_status='DONE'",
+                        (pid,),
+                    )
+                    payload["_outcome_event_id"] = (
+                        result_event[0].get("event_id") if result_event else None
+                    )
+                    parent_cache[pid] = payload
+                parent = parent_cache[pid]
+
+                child_id = int(row.get("id") or 0)
+                if child_id not in child_queue_events:
+                    queued = db.query(
+                        "SELECT MIN(id) AS event_id FROM events "
+                        "WHERE entity='candidate' AND CAST(entity_id AS INTEGER)=? AND event='queued'",
+                        (child_id,),
+                    )
+                    child_queue_events[child_id] = queued[0].get("event_id") if queued else None
+                parent_event = parent.get("_outcome_event_id")
+                child_event = child_queue_events[child_id]
+                available_at_queue = (
+                    isinstance(parent_event, int)
+                    and isinstance(child_event, int)
+                    and parent_event < child_event
+                )
+                if parent and available_at_queue:
+                    is_pass = parent.get("is_pass")
+                    if isinstance(is_pass, bool):
+                        item["parent_is_pass"] = float(is_pass)
+                    elif isinstance(is_pass, (int, float)):
+                        item["parent_is_pass"] = float(is_pass)
+                    for key in ("sharpe", "fitness"):
+                        value = parent.get(key)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            item[f"parent_{key}"] = float(value)
+        enriched.append(item)
+    return enriched
+
+
 def _rows(db: Any, *, training: bool) -> list[dict[str, Any]]:
     if training:
         query = """
-            SELECT * FROM candidates
-            WHERE status IN ('IS_PASS','CORR_PASS','SUBMISSION_READY','SUBMITTING','ACTIVE','REJECTED')
-              AND attempt_count > 0
-            ORDER BY id
+            SELECT c.*, s.completed_at AS outcome_at,
+                   (
+                       SELECT MIN(e.id) FROM events e
+                       WHERE e.entity='simulation'
+                         AND CAST(e.entity_id AS INTEGER)=c.id
+                         AND e.event='result'
+                         AND e.to_status='DONE'
+                   ) AS outcome_event_id
+            FROM candidates c
+            JOIN simulations s ON s.canonical_key=c.canonical_key
+            WHERE c.status IN ('IS_PASS','CORR_PASS','SUBMISSION_READY','SUBMITTING','ACTIVE','REJECTED')
+              AND c.attempt_count > 0
+              AND s.completed_at IS NOT NULL
+            ORDER BY s.completed_at, outcome_event_id, c.id
         """
     else:
         query = "SELECT * FROM candidates WHERE status IN ('QUEUED','RETRY','SIMULATING') ORDER BY id"
@@ -93,11 +190,16 @@ def _matrix(rows: list[Mapping[str, Any]], feature_names: list[str] | None = Non
     return matrix, names
 
 
-def _ridge_fit(x: np.ndarray, y: np.ndarray, penalty: float) -> list[float]:
+def _ridge_fit(x: np.ndarray, y: np.ndarray, penalty: float,
+               feature_names: list[str] | None = None) -> list[float]:
     if len(x) == 0:
         return []
     identity = np.eye(x.shape[1], dtype=float)
-    identity[0, 0] = 0.0  # do not penalize the bias
+    # Leave the bias term unpenalized: locate it by name instead of assuming
+    # it is column 0 (feature names are sorted, so bias can sit anywhere).
+    bias_idx = feature_names.index("bias") if feature_names and "bias" in feature_names else 0
+    if 0 <= bias_idx < identity.shape[0]:
+        identity[bias_idx, bias_idx] = 0.0
     try:
         weights = np.linalg.solve(x.T @ x + penalty * identity, x.T @ y)
     except np.linalg.LinAlgError:
@@ -117,7 +219,7 @@ def _target(row: Mapping[str, Any], target: str) -> float | None:
 
 def fit(db: Any, *, penalty: float = 1.0, min_samples: int = 5) -> dict[str, Any]:
     """Train all targets and persist coefficients plus quality diagnostics."""
-    rows = _rows(db, training=True)
+    rows = _enrich_with_parents(db, _rows(db, training=True))
     if len(rows) < min_samples:
         raise ValueError(f"need at least {min_samples} settled candidates, found {len(rows)}")
     x, feature_names = _matrix(rows)
@@ -130,7 +232,7 @@ def fit(db: Any, *, penalty: float = 1.0, min_samples: int = 5) -> dict[str, Any
             continue
         indexes = [index for index, _ in usable]
         y = np.asarray([value for _, value in usable], dtype=float)
-        weights = _ridge_fit(x[indexes], y, penalty)
+        weights = _ridge_fit(x[indexes], y, penalty, feature_names)
         predictions = x[indexes] @ np.asarray(weights)
         if target == "is_pass":
             predictions = np.clip(predictions, 0.0, 1.0)
@@ -175,7 +277,7 @@ def predict(model: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, float
 
 def rank_advisory(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
     model = load(db)
-    rows = _rows(db, training=False)
+    rows = _enrich_with_parents(db, _rows(db, training=False))
     if model is None:
         return [{"id": row["id"], "prediction": None, "priority": row.get("priority", 0.0)} for row in rows[:limit]]
     scored = []
@@ -189,22 +291,62 @@ def rank_advisory(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
     return scored[:limit]
 
 
-def evaluate(db: Any, *, top_k: int = 10) -> dict[str, Any]:
-    model = load(db)
-    rows = _rows(db, training=True)
-    if model is None or not rows:
-        return {"available": False, "samples": len(rows)}
-    scored = []
-    for row in rows:
-        prediction = predict(model, row)
-        scored.append((prediction.get("is_pass", 0.0), bool(row.get("is_pass"))))
-    scored.sort(reverse=True, key=lambda item: item[0])
-    top = scored[:top_k]
+def evaluate(db: Any, *, top_k: int = 10, penalty: float = 1.0) -> dict[str, Any]:
+    """Deterministic chronological out-of-sample evaluation.
+
+    The settled rows are split time-aware (earliest 70% train, latest 30%
+    test); a temporary model is refit on train only and scored on the held-out
+    test slice. Small samples report ``insufficient_oos_data`` instead of a
+    misleading in-sample metric. Split boundaries persist with the report.
+    """
+    rows = sorted(
+        _enrich_with_parents(db, _rows(db, training=True)),
+        key=lambda r: (
+            str(r.get("outcome_at") or ""),
+            int(r.get("outcome_event_id") or 0),
+            int(r.get("id") or 0),
+        ),
+    )
+    total = len(rows)
+    if not rows or load(db) is None:
+        return {"available": False, "samples": total}
+    if total < 8:
+        return {"available": False, "reason": "insufficient_oos_data", "samples": total,
+                "min_samples_for_oos": 8}
+    split_idx = min(max(5, int(total * 0.7)), total - 2)
+    train_rows, test_rows = rows[:split_idx], rows[split_idx:]
+    train_x, feature_names = _matrix(train_rows)
+    test_x, _ = _matrix(test_rows, feature_names)
+    # Refit is_pass on train only so the test slice is truly held out.
+    usable = [(index, _target(row, "is_pass")) for index, row in enumerate(train_rows)]
+    usable = [(index, value) for index, value in usable if value is not None and math.isfinite(value)]
+    if not usable:
+        return {"available": False, "reason": "insufficient_oos_data", "samples": total,
+                "train_samples": len(train_rows), "test_samples": len(test_rows)}
+    train_indexes = [index for index, _ in usable]
+    y_train = np.asarray([value for _, value in usable], dtype=float)
+    weights = np.asarray(_ridge_fit(train_x[train_indexes], y_train, penalty, feature_names), dtype=float)
+    test_actual = [bool(row.get("is_pass")) for row in test_rows]
+    test_pred = np.clip(test_x @ weights, 0.0, 1.0) if len(weights) == test_x.shape[1] else np.zeros(len(test_rows))
+    order = sorted(range(len(test_rows)), key=lambda i: test_pred[i], reverse=True)
+    top = order[:min(top_k, len(test_rows))]
     return {
-        "available": True, "samples": len(rows), "top_k": min(top_k, len(scored)),
-        "top_pass_recall": round(sum(actual for _, actual in top) / max(sum(actual for _, actual in scored), 1), 6),
-        "top_pass_rate": round(sum(actual for _, actual in top) / max(len(top), 1), 6),
-        "model": model.get("diagnostics", {}),
+        "available": True, "oos": True, "samples": total,
+        "train_samples": len(train_rows), "test_samples": len(test_rows),
+        "split": {
+            "train_ids": [int(r["id"]) for r in train_rows],
+            "test_ids": [int(r["id"]) for r in test_rows],
+            "train_max_completed_at": train_rows[-1].get("outcome_at"),
+            "test_min_completed_at": test_rows[0].get("outcome_at"),
+            "train_max_outcome_event_id": int(train_rows[-1].get("outcome_event_id") or 0),
+            "test_min_outcome_event_id": int(test_rows[0].get("outcome_event_id") or 0),
+            "train_last_id": int(train_rows[-1]["id"]),
+            "test_first_id": int(test_rows[0]["id"]),
+        },
+        "top_k": len(top),
+        "top_pass_recall": round(sum(1 for i in top if test_actual[i]) / max(sum(1 for v in test_actual if v), 1), 6),
+        "top_pass_rate": round(sum(1 for i in top if test_actual[i]) / max(len(top), 1), 6),
+        "model": (load(db) or {}).get("diagnostics", {}),
     }
 
 
