@@ -232,6 +232,7 @@ def test_surrogate_oos_report_has_split_boundaries(db):
     assert report["available"] is True and report["oos"] is True
     assert report["train_samples"] + report["test_samples"] == 8
     assert report["split"]["train_max_completed_at"] <= report["split"]["test_min_completed_at"]
+    assert report["split"]["train_max_outcome_event_id"] < report["split"]["test_min_outcome_event_id"]
 
 
 def test_brain_client_keeps_retry_attempt_history():
