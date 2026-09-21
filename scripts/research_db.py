@@ -2929,8 +2929,8 @@ class ResearchDB:
             if row.get("signal_family"):
                 scope["signal_family"] = row["signal_family"]
             subject_key = str(row.get("skeleton_hash") or row.get("expression_hash")
-                              or f"candidate:{row.get('entity_id')}")
-            root = row.get("parent_id") or row.get("entity_id") or row["id"]
+                              or f"candidate:{row.get('candidate_row_id')}")
+            root = row.get("parent_id") or row.get("candidate_row_id") or row["id"]
             self.record_observation(
                 subject_type="signal_structure", subject_key=subject_key,
                 claim="submission_outcome",
