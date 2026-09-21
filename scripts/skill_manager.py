@@ -28,6 +28,7 @@ SECRET_RE = re.compile(
     r"(?i)(wq[_-]?brain[_-]?(?:username|password)|credential\.(?:txt|key)|password\s*=|secret\s*=|authorization\s*:|/alphas/[A-Za-z0-9_-]{6,})"
 )
 TRACKED_PRIVACY = frozenset({"PUBLIC", "SANITIZED"})
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 #: States a DB rule must be in before its prose may enter the tracked skill file.
 EVALUATED_RULE_STATES = frozenset({"active", "pinned"})
 #: Actors allowed to write arbitrary (non-rule) prose. Autonomous agents must go
@@ -216,6 +217,7 @@ def _prepare_mutation(path: Path, expected_sha: str | None, backup_dir: str | Pa
 
 def _load_evaluated_rule(
     db: research_db.ResearchDB, rule_id: int, *, expected_rule_version: int | None = None,
+    conn: Any | None = None,
 ) -> dict[str, Any]:
     """Load a DB rule and prove it may enter tracked skill text.
 
@@ -223,7 +225,8 @@ def _load_evaluated_rule(
     a passing evaluation, and PUBLIC/SANITIZED privacy. The rendered prose comes
     from this DB row — never from a caller-supplied mapping.
     """
-    row = db._conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (int(rule_id),)).fetchone()
+    connection = conn if conn is not None else db._conn
+    row = connection.execute("SELECT * FROM knowledge_rules WHERE id=?", (int(rule_id),)).fetchone()
     if row is None:
         raise KeyError(f"rule {rule_id} not found")
     rule = dict(row)
@@ -253,6 +256,62 @@ def _load_evaluated_rule(
             "body": str(rule.get("body") or ""), "scope": scope if isinstance(scope, dict) else {},
             "privacy_class": str(rule.get("privacy_class") or "").upper(),
             "version": int(rule["version"]), "state": str(rule["state"])}
+
+
+def _commit_evaluated_rule_locked(
+    db: research_db.ResearchDB,
+    path: Path,
+    *,
+    rule_id: int,
+    expected_rule_version: int | None,
+    expected_sha: str | None,
+    actor: str,
+    backup_dir: str | Path | None,
+) -> dict[str, Any]:
+    """Validate rule + write skill + ledger under one SQLite IMMEDIATE transaction.
+
+    The skill file lock is held by the caller. BEGIN IMMEDIATE prevents a concurrent
+    rule transition/version change after validation but before the mutation ledger
+    commits. If file or DB persistence fails, the captured file state is restored.
+    """
+    before, before_sha, backup_path = _prepare_mutation(path, expected_sha, backup_dir)
+    file_written = False
+    try:
+        with db._tx() as conn:
+            evaluated = _load_evaluated_rule(
+                db, int(rule_id), expected_rule_version=expected_rule_version, conn=conn,
+            )
+            rendered = render_rule(evaluated)
+            after = before + ("\n" if before and not before.endswith("\n") else "") + rendered
+            after_sha = sha256_text(after)
+            _atomic_write(path, after)
+            file_written = True
+            outcome = db._record_skill_mutation_in_tx(
+                conn,
+                operation="skill.apply",
+                actor=actor,
+                expected_sha=expected_sha,
+                before_sha=before_sha,
+                after_sha=after_sha,
+                backup_sha=before_sha,
+                backup_path=str(backup_path),
+                rule_id=evaluated["id"],
+                privacy_class=evaluated["privacy_class"],
+            )
+        return {
+            "mutation_id": outcome["mutation_id"],
+            "before_sha": before_sha,
+            "after_sha": after_sha,
+            "backup_sha": before_sha,
+            "version": outcome["version"],
+        }
+    except BaseException:
+        if file_written:
+            try:
+                _atomic_write(path, before)
+            except BaseException:
+                pass
+        raise
 
 
 def apply_snippet(
@@ -296,14 +355,7 @@ def apply_rule(
     backup_dir: str | Path | None = None,
     expected_rule_version: int | None = None,
 ) -> dict[str, Any]:
-    """Append a rule through the guarded mutation path.
-
-    When the mapping carries an ``id``, the rule is loaded from ``research.db``
-    inside the mutation lock and must prove it exists, matches the expected
-    version, has passed evaluation, and is ``active``/``pinned`` with
-    PUBLIC/SANITIZED privacy. Mappings without an id are manual/user-only prose.
-    Prefer :func:`apply_evaluated_rule` for autonomous writes.
-    """
+    """Append a DB-backed evaluated rule, or manual user prose without a DB id."""
     path = Path(skill_path)
     rule_id = rule.get("id")
     if rule_id is not None and str(actor) not in MANUAL_SNIPPET_ACTORS:
@@ -313,28 +365,24 @@ def apply_rule(
             raise ValueError("autonomous rule application requires expected_sha")
     with _skill_lock(path):
         if rule_id is not None:
-            evaluated = _load_evaluated_rule(
-                db, int(rule_id), expected_rule_version=expected_rule_version,
+            return _commit_evaluated_rule_locked(
+                db, path, rule_id=int(rule_id),
+                expected_rule_version=expected_rule_version,
+                expected_sha=expected_sha, actor=actor, backup_dir=backup_dir,
             )
-            rendered = render_rule(evaluated)
-            evaluated_privacy = evaluated["privacy_class"]
-            evaluated_id = evaluated["id"]
-        else:
-            if str(actor) not in MANUAL_SNIPPET_ACTORS:
-                raise PermissionError(
-                    "rule mappings without a DB id are manual/user-only: "
-                    "autonomous writes must use apply_evaluated_rule(rule_id)"
-                )
-            _assert_public(rule)
-            rendered = render_rule(rule)
-            evaluated_privacy = str(rule["privacy_class"]).upper()
-            evaluated_id = None
+        if str(actor) not in MANUAL_SNIPPET_ACTORS:
+            raise PermissionError(
+                "rule mappings without a DB id are manual/user-only: "
+                "autonomous writes must use apply_evaluated_rule(rule_id)"
+            )
+        _assert_public(rule)
         before, actual_sha, backup_path = _prepare_mutation(path, expected_sha, backup_dir)
+        rendered = render_rule(rule)
         after = before + ("\n" if before and not before.endswith("\n") else "") + rendered
         return _commit_locked(
             db, path, operation="skill.apply", actor=actor, expected_sha=expected_sha,
             before=before, before_sha=actual_sha, backup_path=backup_path, after=after,
-            rule_id=evaluated_id, privacy_class=evaluated_privacy,
+            rule_id=None, privacy_class=str(rule["privacy_class"]).upper(),
         )
 
 
@@ -348,55 +396,52 @@ def apply_evaluated_rule(
     actor: str = "agent",
     backup_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Autonomous mutation path: render the DB rule inside the mutation lock.
-
-    Both CAS inputs are mandatory: agents must prove the rule version and tracked
-    skill SHA they reviewed before a write can commit.
-    """
+    """Autonomous mutation path with mandatory rule-version and file-SHA CAS."""
     if expected_rule_version is None:
         raise ValueError("autonomous rule application requires expected_rule_version")
     if expected_sha is None:
         raise ValueError("autonomous rule application requires expected_sha")
     path = Path(skill_path)
     with _skill_lock(path):
-        evaluated = _load_evaluated_rule(
-            db, int(rule_id), expected_rule_version=expected_rule_version,
-        )
-        rendered = render_rule(evaluated)
-        before, actual_sha, backup_path = _prepare_mutation(path, expected_sha, backup_dir)
-        after = before + ("\n" if before and not before.endswith("\n") else "") + rendered
-        return _commit_locked(
-            db, path, operation="skill.apply", actor=actor, expected_sha=expected_sha,
-            before=before, before_sha=actual_sha, backup_path=backup_path, after=after,
-            rule_id=evaluated["id"], privacy_class=evaluated["privacy_class"],
+        return _commit_evaluated_rule_locked(
+            db, path, rule_id=int(rule_id),
+            expected_rule_version=expected_rule_version,
+            expected_sha=expected_sha, actor=actor, backup_dir=backup_dir,
         )
 
 
 def rollback(db: research_db.ResearchDB, skill_path: str | Path, backup_sha: str,
              *, expected_sha: str | None = None, actor: str = "agent",
              backup_dir: str | Path | None = None) -> dict[str, Any]:
-    """Restore a content-addressed backup, also guarded and ledgered.
-
-    The state being left is first captured as its own content-addressed backup,
-    so ``B -> rollback to A`` never makes B unrecoverable: a later rollback can
-    restore B. File+ledger persistence is failure-compensated like other writes.
-    """
+    """Restore a verified content-addressed backup, capturing the state being left."""
+    backup_sha = str(backup_sha)
+    if not SHA256_HEX_RE.fullmatch(backup_sha):
+        raise ValueError("backup_sha must be a lowercase 64-character SHA-256 digest")
     path = Path(skill_path)
-    backup_root = Path(backup_dir) if backup_dir else path.parent / ".skill-history"
+    backup_root = (Path(backup_dir) if backup_dir else path.parent / ".skill-history")
     backup_root.mkdir(parents=True, exist_ok=True)
+    backup_root = backup_root.resolve()
     with _skill_lock(path):
         current, actual_sha = read_skill(path)
         if expected_sha is not None and expected_sha != actual_sha:
             raise ValueError(f"skill SHA mismatch: expected {expected_sha}, current {actual_sha}")
-        # Fail closed: capture the state being left before it can be destroyed.
-        current_backup = backup_root / f"{actual_sha}.md"
+        current_backup = (backup_root / f"{actual_sha}.md").resolve()
+        if current_backup.parent != backup_root:
+            raise ValueError("current backup path escaped the skill history directory")
         if not current_backup.exists():
             _atomic_write(current_backup, current)
-        backup_path = backup_root / f"{backup_sha}.md"
+
+        backup_path = (backup_root / f"{backup_sha}.md").resolve()
+        if backup_path.parent != backup_root:
+            raise ValueError("backup path escaped the skill history directory")
         if not backup_path.exists():
             raise FileNotFoundError(f"skill backup not found: {backup_sha}")
         restored = backup_path.read_text(encoding="utf-8")
         restored_sha = sha256_text(restored)
+        if restored_sha != backup_sha:
+            raise ValueError(
+                f"skill backup hash mismatch: requested {backup_sha}, content hashes to {restored_sha}"
+            )
         _atomic_write(path, restored)
         try:
             return _record_mutation(
