@@ -266,6 +266,8 @@ class SimulationScheduler:
         try:
             handle = self._submit_with_reauth(expression, settings, candidate_id)
         except brain_api.RateLimitError as exc:
+            self._log_transport(candidate_id=candidate_id, operation="simulation.submit",
+                                result_class="rate_limited")
             self.rate_limited += 1
             self.released += 1
             self.blocked_until = self._clock() + max(exc.retry_after, self.backoff_base)
@@ -277,9 +279,13 @@ class SimulationScheduler:
             return False
         except brain_api.SessionExpiredError as exc:
             # Already retried with a fresh session inside _submit_with_reauth.
+            self._log_transport(candidate_id=candidate_id, operation="simulation.submit",
+                                result_class="session_expired")
             self._retire(candidate_id, f"session_expired: {exc}")
             return False
         except brain_api.BrainAPIError as exc:
+            self._log_transport(candidate_id=candidate_id, operation="simulation.submit",
+                                result_class="error")
             self._retire(candidate_id, str(exc))
             return False
 
@@ -421,15 +427,21 @@ class SimulationScheduler:
                 self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
                                     operation="simulation.poll", result_class=state.status.lower())
             except brain_api.RateLimitError as exc:
+                self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                    operation="simulation.poll", result_class="rate_limited")
                 self.rate_limited += 1
                 handle.next_poll_at = self._clock() + max(exc.retry_after, self.poll_interval)
                 wait = min(wait, max(exc.retry_after, self.poll_interval))
                 continue
             except brain_api.SessionExpiredError:
+                self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                    operation="simulation.poll", result_class="session_expired")
                 self.reauthenticate()
                 handle.next_poll_at = self._clock() + self.poll_interval
                 continue
             except brain_api.BrainAPIError as exc:
+                self._log_transport(candidate_id=candidate_id, simulation_id=handle.simulation_id,
+                                    operation="simulation.poll", result_class="error")
                 failures = self._poll_failures[candidate_id] = self._poll_failures.get(candidate_id, 0) + 1
                 if failures > MAX_POLL_FAILURES:
                     self._finish(candidate_id, error=f"poll_failed: {exc}")
