@@ -933,7 +933,9 @@ class ResearchDB:
                 )
                 if is_new:
                     self.log_event(
-                        "candidate", candidate_id, "validation_passed", to_status="SIMULATED",
+                        "candidate", candidate_id,
+                        "validation_passed" if validate else "validation_skipped",
+                        to_status="SIMULATED",
                         payload={"canonical_key": key, "source": source}, conn=conn,
                     )
                 self.log_event(
@@ -976,10 +978,12 @@ class ResearchDB:
                 )
                 from_status = None
                 # Dedicated idempotent validation signal: exactly one per candidate
-                # lifecycle, so throughput counts successful validation (not retries
-                # or status transitions).
+                # lifecycle. Calls that explicitly bypass validation are tracked
+                # separately so validated_per_hour counts only checks that ran.
                 self.log_event(
-                    "candidate", candidate_id, "validation_passed", to_status="QUEUED",
+                    "candidate", candidate_id,
+                    "validation_passed" if validate else "validation_skipped",
+                    to_status="QUEUED",
                     payload={"canonical_key": key, "source": source}, conn=conn,
                 )
             else:
@@ -3060,43 +3064,54 @@ class ResearchDB:
                            result_class=result, payload={"rule_id": rule_id, "privacy_class": privacy}, conn=conn)
             return mutation_id
 
+    def _record_skill_mutation_in_tx(
+        self, conn: sqlite3.Connection, *, operation: str, actor: str,
+        expected_sha: str | None, before_sha: str, after_sha: str,
+        backup_sha: str, backup_path: str, rule_id: int | None,
+        privacy_class: str, result: str = "applied",
+    ) -> dict[str, Any]:
+        """Bump skill_version and append the ledger using an already-open write transaction."""
+        privacy = self._knowledge_privacy(privacy_class)
+        timestamp = now_iso()
+        row = conn.execute("SELECT value FROM meta WHERE key='skill_version'").fetchone()
+        try:
+            version = int(row["value"]) + 1 if row is not None else 1
+        except (TypeError, ValueError):
+            version = 1
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('skill_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(version),),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO skill_mutations(operation, actor, expected_sha, before_sha, after_sha,
+                   backup_sha, backup_path, rule_id, privacy_class, version, result, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (operation, actor, expected_sha, before_sha, after_sha, backup_sha, backup_path,
+             rule_id, privacy, int(version), result, timestamp),
+        )
+        mutation_id = int(cursor.lastrowid)
+        self.log_event(
+            "skill", mutation_id, "mutation_recorded", operation=operation,
+            result_class=result, payload={"rule_id": rule_id, "privacy_class": privacy}, conn=conn,
+        )
+        return {"mutation_id": mutation_id, "version": version}
+
     def record_skill_mutation_atomic(
         self, *, operation: str, actor: str, expected_sha: str | None, before_sha: str,
         after_sha: str, backup_sha: str, backup_path: str, rule_id: int | None,
         privacy_class: str, result: str = "applied",
     ) -> dict[str, Any]:
-        """Bump ``skill_version`` and insert the mutation ledger row in one transaction.
-
-        The file replace itself cannot join this SQLite transaction, so callers
-        (``skill_manager``) hold the inter-process skill lock across file+DB and
-        restore the captured before-state when this method raises.
-        """
-        privacy = self._knowledge_privacy(privacy_class)
-        timestamp = now_iso()
+        """Bump skill_version and insert the mutation ledger row in one IMMEDIATE transaction."""
         with self._tx() as conn:
-            row = conn.execute("SELECT value FROM meta WHERE key='skill_version'").fetchone()
-            try:
-                version = int(row["value"]) + 1 if row is not None else 1
-            except (TypeError, ValueError):
-                version = 1
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES('skill_version', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(version),),
+            return self._record_skill_mutation_in_tx(
+                conn, operation=operation, actor=actor, expected_sha=expected_sha,
+                before_sha=before_sha, after_sha=after_sha, backup_sha=backup_sha,
+                backup_path=backup_path, rule_id=rule_id, privacy_class=privacy_class,
+                result=result,
             )
-            cursor = conn.execute(
-                """
-                INSERT INTO skill_mutations(operation, actor, expected_sha, before_sha, after_sha,
-                       backup_sha, backup_path, rule_id, privacy_class, version, result, created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (operation, actor, expected_sha, before_sha, after_sha, backup_sha, backup_path,
-                 rule_id, privacy, int(version), result, timestamp),
-            )
-            mutation_id = int(cursor.lastrowid)
-            self.log_event("skill", mutation_id, "mutation_recorded", operation=operation,
-                           result_class=result, payload={"rule_id": rule_id, "privacy_class": privacy}, conn=conn)
-            return {"mutation_id": mutation_id, "version": version}
 
     def knowledge_status(self) -> dict[str, Any]:
         """Counts/capabilities for the agent-agnostic knowledge interface."""
