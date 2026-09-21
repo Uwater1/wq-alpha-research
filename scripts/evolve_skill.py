@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import sys
@@ -219,6 +220,46 @@ def fetch_user_alphas(session: requests.Session, limit: int = 100) -> list[dict]
     return all_alphas
 
 
+def fetch_pnl_with_empty_retry(
+    session: requests.Session,
+    alpha_id: str,
+    *,
+    tries: int = 2,
+    delay: float = 1.0,
+) -> tuple[list[str], list[float]]:
+    """Retry only empty PnL responses; successful requests pay no extra delay."""
+    for attempt in range(max(1, int(tries))):
+        dates, values = fetch_pnl_series(session, alpha_id)
+        if values:
+            return dates, values
+        if attempt + 1 < max(1, int(tries)):
+            time.sleep(delay)
+    return [], []
+
+
+def fetch_pnl_batch(
+    session: requests.Session,
+    alpha_ids: list[str],
+    *,
+    fetcher: Any = fetch_pnl_series,
+    workers: int = 1,
+) -> list[tuple[str, tuple[list[str], list[float]]]]:
+    """Fetch independent PnL recordsets concurrently while preserving input order.
+
+    This is deliberately a bounded thread pool: the work is HTTP I/O, not CPU, and BRAIN
+    still controls simulation concurrency separately. ``workers=1`` retains the legacy
+    sequential behavior for conservative environments or rate-limit troubleshooting.
+    """
+    ids = [str(alpha_id) for alpha_id in alpha_ids]
+    if not ids:
+        return []
+    if int(workers) <= 1:
+        return [(alpha_id, fetcher(session, alpha_id)) for alpha_id in ids]
+    with ThreadPoolExecutor(max_workers=max(1, min(int(workers), 8))) as executor:
+        futures = [executor.submit(fetcher, session, alpha_id) for alpha_id in ids]
+        return [(alpha_id, future.result()) for alpha_id, future in zip(ids, futures)]
+
+
 def fetch_pnl_for_new_alpha(session: requests.Session, alpha_id: str, tries: int = 3,
                             delay: float = 5.0) -> tuple[list[str], list[float]]:
     """Fetch a fresh alpha's PnL, waiting out the window where BRAIN still computes it.
@@ -308,6 +349,9 @@ def correlation_with_existing(
         if corr is None:
             continue
         results.append({"alpha_id": old_id, "corr": corr, "sharpe": old.get("sharpe"), "fitness": old.get("fitness")})
+        # A perfect match is already the maximum possible absolute correlation.
+        if abs(corr) >= 1.0:
+            break
     results.sort(key=lambda x: abs(x["corr"]), reverse=True)
     return results
 
@@ -481,6 +525,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Evolve WQ Alpha Research SKILL with new empirical data.")
     parser.add_argument("--apply", action="store_true", help="Automatically append the generated snippet to SKILL.md")
     parser.add_argument(
+        "--pnl-workers", type=int, default=4,
+        help="bounded concurrent PnL fetches for self-evolution (1 disables parallel I/O)",
+    )
+    parser.add_argument(
         "--raw",
         action="store_true",
         help="Write real alpha IDs and expressions into SKILL.md (local-only; breaks the sanitized-record policy)",
@@ -525,14 +573,17 @@ def main() -> int:
         active_correlations: dict[str, list[dict[str, Any]]] = {}
 
         preview_db = {"alphas": {}}
-        for idx, alpha in enumerate(all_alphas):
-            aid = alpha.get("id")
-            fp = compute_alpha_fingerprint(alpha)
-            dates, pnl = fetch_pnl_series(session, aid)
+        alpha_rows = [(alpha, compute_alpha_fingerprint(alpha)) for alpha in all_alphas if alpha.get("id")]
+        fetched = fetch_pnl_batch(
+            session, [alpha["id"] for alpha, _ in alpha_rows],
+            fetcher=fetch_pnl_with_empty_retry, workers=args.pnl_workers,
+        )
+        for idx, ((aid, (dates, pnl)), (alpha, fp)) in enumerate(zip(fetched, alpha_rows), start=1):
             preview_db["alphas"][aid] = {**fp, "pnl": pnl, "pnl_dates": dates}
-            if idx % 10 == 0:
-                print(f"  fetched {idx + 1}/{len(all_alphas)} PnLs", flush=True)
-            time.sleep(0.3)
+            if idx % 10 == 0 or idx == 1:
+                print(f"  fetched {idx}/{len(alpha_rows)} PnLs", flush=True)
+            if args.pnl_workers <= 1:
+                time.sleep(0.3)
 
         active_ids = [a.get("id") for a in active_alphas if a.get("id")]
         for aid in active_ids:
@@ -552,11 +603,12 @@ def main() -> int:
         print(f"incremental: {len(new_alphas)} new, {len(changed_alphas)} changed", flush=True)
         entries: list[dict[str, Any]] = []
 
-        for alpha in new_alphas:
-            aid = alpha.get("id")
+        fetched = fetch_pnl_batch(
+            session, [alpha.get("id") for alpha in new_alphas if alpha.get("id")],
+            fetcher=fetch_pnl_for_new_alpha, workers=args.pnl_workers,
+        )
+        for alpha, (aid, (dates, pnl)) in zip(new_alphas, fetched):
             fp = compute_alpha_fingerprint(alpha)
-            dates, pnl = fetch_pnl_for_new_alpha(session, aid)
-
             top_corr = correlation_with_existing(dates, pnl, db)
             lesson = generate_lesson(fp, top_corr, sanitize=sanitize, pnl_available=bool(pnl))
             entries.append(
@@ -576,7 +628,8 @@ def main() -> int:
             if args.apply:
                 db["alphas"][aid] = {**fp, "pnl": pnl, "pnl_dates": dates}
             print(f"  new: {aid} | sharpe={fp['sharpe']} | fitness={fp['fitness']} | to={fp['turnover']}")
-            time.sleep(0.3)
+            if args.pnl_workers <= 1:
+                time.sleep(0.3)
 
         for old, new in changed_alphas:
             aid = new["alpha_id"]

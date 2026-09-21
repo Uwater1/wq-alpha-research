@@ -29,6 +29,7 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -70,20 +71,27 @@ def _warn(message: str) -> None:
 
 
 def daily_returns(cum_pnl: Sequence[float]) -> list[float]:
-    return [cum_pnl[i + 1] - cum_pnl[i] for i in range(len(cum_pnl) - 1)]
+    """Return first differences using NumPy's vectorized subtraction."""
+    values = np.asarray(cum_pnl, dtype=float)
+    if values.size < 2:
+        return []
+    return np.diff(values).tolist()
 
 
 def safe_corrcoef(a: Any, b: Any) -> float | None:
-    """Pearson correlation, or None when a side is constant, mis-sized, or non-finite."""
+    """Pearson correlation without the allocation-heavy ``np.corrcoef`` matrix."""
     x = np.asarray(a, dtype=float)
     y = np.asarray(b, dtype=float)
-    if len(x) != len(y) or len(x) < 2:
+    if x.shape != y.shape or x.size < 2:
         return None
     if not (np.isfinite(x).all() and np.isfinite(y).all()):
         return None
-    if x.std() == 0 or y.std() == 0:
+    x_centered = x - x.mean()
+    y_centered = y - y.mean()
+    denominator = float(np.linalg.norm(x_centered) * np.linalg.norm(y_centered))
+    if denominator == 0.0:
         return None
-    return float(np.corrcoef(x, y)[0, 1])
+    return float(np.dot(x_centered, y_centered) / denominator)
 
 
 def aligned_daily_returns(
@@ -206,6 +214,35 @@ def fetch_pnl_for_new_alpha(
     return [], []
 
 
+def fetch_pnl_batch(
+    client: Any,
+    alpha_ids: Sequence[str],
+    *,
+    tries: int = 3,
+    delay: float = 5.0,
+    sleep: Any = time.sleep,
+    workers: int = 1,
+) -> list[tuple[str, tuple[list[str], list[float]]]]:
+    """Fetch independent PnL recordsets concurrently, preserving input order.
+
+    Retrieval is I/O-bound, so a small bounded pool reduces wall time for a large ACTIVE
+    book without creating unbounded pressure on BRAIN. The default remains sequential for
+    callers that need conservative troubleshooting; production sync passes a bounded pool.
+    """
+    ids = [str(alpha_id) for alpha_id in alpha_ids]
+    if not ids:
+        return []
+    fetch = lambda alpha_id: fetch_pnl_for_new_alpha(  # noqa: E731 - keeps executor call explicit
+        client, alpha_id, tries=tries, delay=delay, sleep=sleep
+    )
+    if int(workers) <= 1:
+        return [(alpha_id, fetch(alpha_id)) for alpha_id in ids]
+    max_workers = max(1, min(int(workers), 8, len(ids)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # executor.map keeps deterministic input ordering while requests run concurrently.
+        return list(zip(ids, executor.map(fetch, ids)))
+
+
 # ---------------------------------------------------------------------------
 # Correlation against the ACTIVE book
 # ---------------------------------------------------------------------------
@@ -276,6 +313,9 @@ def correlate_against_book(
         compared += 1
         if best_corr is None or abs(corr) > abs(best_corr):
             best_id, best_corr = str(alpha_id), corr
+            # A perfect match cannot be improved; avoid scanning the rest of a large book.
+            if abs(corr) >= 1.0:
+                break
 
     if compared == 0:
         if degenerate:
@@ -319,6 +359,7 @@ class CorrelationService:
         min_records: int = MIN_RECORDS,
         pnl_tries: int = 2,
         pnl_delay: float = 2.0,
+        pnl_workers: int = 4,
         sleep: Any = time.sleep,
         log: Any = print,
     ) -> None:
@@ -328,6 +369,7 @@ class CorrelationService:
         self.min_records = int(min_records)
         self.pnl_tries = int(pnl_tries)
         self.pnl_delay = float(pnl_delay)
+        self.pnl_workers = max(1, min(int(pnl_workers), 8))
         self._sleep = sleep
         self._log = log
 
@@ -352,12 +394,15 @@ class CorrelationService:
         for alpha in alphas:
             if not isinstance(alpha, Mapping) or not alpha.get("id"):
                 continue
-            payload = brain_api.alpha_metrics(alpha)
+            # `/users/self/alphas` already embeds the IS block. Extract it directly:
+            # do not issue one `/alphas/{id}` request per book member (or even rebuild a
+            # second metrics payload locally). This keeps a 12-alpha book at one HTTP GET.
+            is_block = alpha.get("is") if isinstance(alpha.get("is"), Mapping) else {}
             # Only real numbers are recorded: a payload without an ``is`` block must stay a
             # membership-only entry, not a write of three NULLs on every sync.
             metrics[str(alpha["id"])] = {
-                key: payload[key] for key in ("sharpe", "fitness", "turnover")
-                if payload.get(key) is not None
+                key: is_block[key] for key in ("sharpe", "fitness", "turnover")
+                if is_block.get(key) is not None
             }
         alpha_ids = sorted(metrics)
         sync.fetched = len(alpha_ids)
@@ -366,12 +411,17 @@ class CorrelationService:
         sync.stale_checks = self.db.mark_stale_correlations()
 
         cached = set(self.db.active_pnl_ids()) if not force else set()
-        for alpha_id in alpha_ids:
-            if alpha_id in cached:
-                continue
-            dates, values = fetch_pnl_for_new_alpha(
-                self.client, alpha_id, tries=self.pnl_tries, delay=self.pnl_delay, sleep=self._sleep
-            )
+        missing_ids = [alpha_id for alpha_id in alpha_ids if alpha_id not in cached]
+        fetched = fetch_pnl_batch(
+            self.client,
+            missing_ids,
+            tries=self.pnl_tries,
+            delay=self.pnl_delay,
+            sleep=self._sleep,
+            workers=self.pnl_workers,
+        )
+        # Keep SQLite writes single-threaded and deterministic after the HTTP fan-out.
+        for alpha_id, (dates, values) in fetched:
             if values:
                 self.db.cache_active_pnl(alpha_id, dates, values)
                 sync.pnl_cached += 1
@@ -457,7 +507,7 @@ class CorrelationService:
 
 def _service(args: argparse.Namespace) -> CorrelationService:
     db = research_db.ResearchDB.open(args.db)
-    return CorrelationService(db, brain_api.BrainClient())
+    return CorrelationService(db, brain_api.BrainClient(), pnl_workers=args.pnl_workers)
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -496,6 +546,10 @@ def cmd_check(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--db", help=f"path to research.db (default: ${research_db.DB_ENV_VAR} or repo root)")
+    parser.add_argument(
+        "--pnl-workers", type=int, default=4,
+        help="bounded concurrent ACTIVE-alpha PnL fetches (1 disables parallel I/O; max 8)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sync = sub.add_parser("sync", help="refresh the ACTIVE book and cache missing PnL")

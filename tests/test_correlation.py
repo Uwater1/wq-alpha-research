@@ -8,6 +8,8 @@ survives a portfolio change.
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -153,6 +155,50 @@ def test_correlate_reports_unavailable_short_and_degenerate_instead_of_zero():
 def test_correlate_reports_an_empty_book_explicitly():
     dates, values = _series(_wave())
     assert corr.correlate_against_book(dates, values, []).status == corr.STATUS_EMPTY_BOOK
+
+
+def test_fetch_pnl_batch_runs_bounded_requests_concurrently(monkeypatch):
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fetch(_client, alpha_id, **_kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return ([alpha_id], [1.0])
+
+    monkeypatch.setattr(corr, "fetch_pnl_for_new_alpha", fetch)
+    result = corr.fetch_pnl_batch(object(), ["A", "B", "C", "D"], workers=3)
+
+    assert [alpha_id for alpha_id, _ in result] == ["A", "B", "C", "D"]
+    assert peak == 3
+
+
+def test_fetch_pnl_batch_caps_worker_count(monkeypatch):
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fetch(_client, alpha_id, **_kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return ([alpha_id], [1.0])
+
+    monkeypatch.setattr(corr, "fetch_pnl_for_new_alpha", fetch)
+    result = corr.fetch_pnl_batch(object(), [str(i) for i in range(12)], workers=99)
+
+    assert [alpha_id for alpha_id, _ in result] == [str(i) for i in range(12)]
+    assert peak == 8
 
 
 # ---------------------------------------------------------------------------

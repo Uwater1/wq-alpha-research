@@ -329,6 +329,45 @@ def test_correlation_with_existing_uses_active_alphas_only():
     assert results[0]["corr"] == pytest.approx(1.0)
 
 
+def test_fetch_pnl_with_empty_retry_does_not_delay_successful_fetch(monkeypatch):
+    monkeypatch.setattr(es, "fetch_pnl_series", lambda _session, _alpha_id: (["d"], [1.0]))
+    slept = []
+    monkeypatch.setattr(es.time, "sleep", lambda seconds: slept.append(seconds))
+
+    assert es.fetch_pnl_with_empty_retry(object(), "A1") == (["d"], [1.0])
+    assert slept == []
+
+
+def test_fetch_pnl_with_empty_retry_recovers_transient_empty_response(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky(_session, _alpha_id):
+        calls["n"] += 1
+        return ([], []) if calls["n"] == 1 else (["d"], [1.0])
+
+    monkeypatch.setattr(es, "fetch_pnl_series", flaky)
+    slept = []
+    monkeypatch.setattr(es.time, "sleep", lambda seconds: slept.append(seconds))
+
+    assert es.fetch_pnl_with_empty_retry(object(), "A1", delay=0.25) == (["d"], [1.0])
+    assert calls["n"] == 2
+    assert slept == [0.25]
+
+
+def test_fetch_pnl_batch_preserves_order_with_bounded_workers():
+    calls = []
+
+    def fetch(_session, alpha_id):
+        calls.append(alpha_id)
+        return ([alpha_id], [float(len(alpha_id))])
+
+    result = es.fetch_pnl_batch(object(), ["A", "BBBB", "CC"], fetcher=fetch, workers=3)
+
+    assert [alpha_id for alpha_id, _ in result] == ["A", "BBBB", "CC"]
+    assert [values for _, (_, values) in result] == [[1.0], [4.0], [2.0]]
+    assert sorted(calls) == ["A", "BBBB", "CC"]
+
+
 def test_fetch_pnl_series_warns_instead_of_silently_returning_nothing(monkeypatch, capsys):
     def boom(*_args, **_kwargs):
         raise RuntimeError("GET ... failed after 4 retries")
