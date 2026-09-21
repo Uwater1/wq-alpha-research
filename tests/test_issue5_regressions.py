@@ -543,6 +543,7 @@ def test_surrogate_oos_orders_by_completion_time_not_candidate_id(db):
     report = surrogate.evaluate(db)
     assert report["available"] is True
     assert report["split"]["train_max_completed_at"] <= report["split"]["test_min_completed_at"]
+    assert report["split"]["train_max_outcome_event_id"] < report["split"]["test_min_outcome_event_id"]
     # Reverse settlement means an ID-only split would put the wrong side first.
     assert report["split"]["train_last_id"] > report["split"]["test_first_id"]
 
