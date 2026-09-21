@@ -231,7 +231,7 @@ def test_surrogate_oos_report_has_split_boundaries(db):
     report = surrogate.evaluate(db)
     assert report["available"] is True and report["oos"] is True
     assert report["train_samples"] + report["test_samples"] == 8
-    assert report["split"]["train_max_id"] < report["split"]["test_min_id"]
+    assert report["split"]["train_max_completed_at"] <= report["split"]["test_min_completed_at"]
 
 
 def test_brain_client_keeps_retry_attempt_history():
@@ -470,3 +470,132 @@ def test_scheduler_persists_terminal_rate_limit_attempt(db):
     assert events[0]["http_status"] == 429
     assert events[0]["error_category"] == "rate_limit"
     assert events[0]["operation"] == "simulation.submit"
+
+
+def test_validation_skipped_does_not_count_as_passed(db):
+    outcome = db.queue_candidate("rank(close) + 12345", {"decay": 6}, validate=False)
+    assert outcome.action == "queued"
+    passed = db.query(
+        "SELECT * FROM events WHERE entity='candidate' AND entity_id=? AND event='validation_passed'",
+        (outcome.candidate_id,),
+    )
+    skipped = db.query(
+        "SELECT * FROM events WHERE entity='candidate' AND entity_id=? AND event='validation_skipped'",
+        (outcome.candidate_id,),
+    )
+    assert passed == []
+    assert len(skipped) == 1
+
+
+def test_rollback_rejects_traversal_and_tampered_backup(tmp_path, db):
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("# Router\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256"):
+        skill_manager.rollback(db, skill, "../outside")
+
+    history = tmp_path / "history"
+    history.mkdir()
+    fake_sha = "a" * 64
+    (history / f"{fake_sha}.md").write_text("tampered", encoding="utf-8")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        skill_manager.rollback(db, skill, fake_sha, backup_dir=history)
+
+
+def test_parent_features_require_parent_outcome_before_child_queue(db):
+    parent = db.queue_candidate("rank(close) + 501", {"decay": 6})
+    child_early = db.queue_candidate(
+        "rank(open) + 502", {"decay": 6}, parent_id=parent.candidate_id, generation=1,
+    )
+
+    claimed_parent = db.claim_simulation("parent", candidate_id=parent.candidate_id)
+    db.record_simulation_result(
+        candidate_id=claimed_parent["id"], status="DONE",
+        metrics={"sharpe": 1.7, "fitness": 1.3, "turnover": 0.05},
+        checks=[{"name": "LOW_SHARPE", "result": "PASS"}], brain_alpha_id="PARENT501",
+    )
+
+    child_late = db.queue_candidate(
+        "rank(high) + 503", {"decay": 6}, parent_id=parent.candidate_id, generation=1,
+    )
+    rows = [db.get_candidate(child_early.candidate_id), db.get_candidate(child_late.candidate_id)]
+    enriched = surrogate._enrich_with_parents(db, [dict(row) for row in rows if row])
+    by_id = {int(row["id"]): row for row in enriched}
+    assert "parent_sharpe" not in by_id[child_early.candidate_id]
+    assert by_id[child_late.candidate_id]["parent_sharpe"] == pytest.approx(1.7)
+
+
+def test_surrogate_oos_orders_by_completion_time_not_candidate_id(db):
+    queued = [db.queue_candidate(f"rank(close) + {700 + i}", {"decay": 6}) for i in range(8)]
+    # Settle in reverse insertion order so candidate IDs and outcome chronology disagree.
+    for i, outcome in enumerate(reversed(queued)):
+        row = db.claim_simulation("reverse", candidate_id=outcome.candidate_id)
+        passed = i % 2 == 0
+        db.record_simulation_result(
+            candidate_id=row["id"], status="DONE",
+            metrics={"sharpe": 1.6 if passed else 0.3,
+                     "fitness": 1.3 if passed else 0.2,
+                     "turnover": 0.05 if passed else 0.35},
+            checks=[{"name": "LOW_SHARPE", "result": "PASS" if passed else "FAIL"}],
+            brain_alpha_id=f"REV{row['id']}",
+        )
+    surrogate.fit(db, min_samples=5)
+    report = surrogate.evaluate(db)
+    assert report["available"] is True
+    assert report["split"]["train_max_completed_at"] <= report["split"]["test_min_completed_at"]
+    # Reverse settlement means an ID-only split would put the wrong side first.
+    assert report["split"]["train_last_id"] > report["split"]["test_first_id"]
+
+
+def _transition_worker(db_path, rule_id, ready, queue):
+    ready.wait(10)
+    try:
+        with rdb.ResearchDB.open(db_path) as store:
+            updated = store.transition_rule(rule_id, "weakened")
+        queue.put(("ok", int(updated["version"])))
+    except Exception as exc:  # noqa: BLE001 - test transport
+        queue.put(("error", type(exc).__name__))
+
+
+def test_rule_transition_cannot_interleave_with_skill_commit(tmp_path, monkeypatch):
+    db_path = tmp_path / "research.db"
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("# Router\n", encoding="utf-8")
+    with rdb.ResearchDB.open(db_path) as store:
+        rule_id = _evaluated_rule(store)
+        version = int(store.get_rule(rule_id)["version"])
+    sha = skill_manager.read_skill(skill)[1]
+    history = tmp_path / "history"
+    history.mkdir()
+    # Avoid signalling on the pre-transaction backup write.
+    (history / f"{sha}.md").write_text("# Router\n", encoding="utf-8")
+
+    ready = mp.Event()
+    queue = mp.Queue()
+    original_write = skill_manager._atomic_write
+
+    def slow_skill_write(path, content):
+        original_write(path, content)
+        if str(path) == str(skill):
+            ready.set()
+            time.sleep(0.25)
+
+    monkeypatch.setattr(skill_manager, "_atomic_write", slow_skill_write)
+    proc = mp.Process(target=_transition_worker, args=(str(db_path), rule_id, ready, queue))
+    proc.start()
+    with rdb.ResearchDB.open(db_path) as store:
+        result = skill_manager.apply_evaluated_rule(
+            store, skill, rule_id, expected_rule_version=version,
+            expected_sha=sha, backup_dir=history,
+        )
+    proc.join(10)
+    assert proc.exitcode == 0
+    assert queue.get(timeout=2)[0] == "ok"
+
+    with rdb.ResearchDB.open(db_path) as store:
+        events = store.query(
+            "SELECT event FROM events WHERE entity IN ('skill','knowledge') "
+            "AND event IN ('mutation_recorded','rule_transitioned') ORDER BY id"
+        )
+        assert [row["event"] for row in events][-2:] == ["mutation_recorded", "rule_transitioned"]
+        assert store.get_rule(rule_id)["state"] == "weakened"
+    assert result["after_sha"] == skill_manager.read_skill(skill)[1]
