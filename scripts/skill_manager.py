@@ -306,6 +306,11 @@ def apply_rule(
     """
     path = Path(skill_path)
     rule_id = rule.get("id")
+    if rule_id is not None and str(actor) not in MANUAL_SNIPPET_ACTORS:
+        if expected_rule_version is None:
+            raise ValueError("autonomous rule application requires expected_rule_version")
+        if expected_sha is None:
+            raise ValueError("autonomous rule application requires expected_sha")
     with _skill_lock(path):
         if rule_id is not None:
             evaluated = _load_evaluated_rule(
@@ -343,7 +348,15 @@ def apply_evaluated_rule(
     actor: str = "agent",
     backup_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Autonomous mutation path: render the DB rule inside the mutation lock."""
+    """Autonomous mutation path: render the DB rule inside the mutation lock.
+
+    Both CAS inputs are mandatory: agents must prove the rule version and tracked
+    skill SHA they reviewed before a write can commit.
+    """
+    if expected_rule_version is None:
+        raise ValueError("autonomous rule application requires expected_rule_version")
+    if expected_sha is None:
+        raise ValueError("autonomous rule application requires expected_sha")
     path = Path(skill_path)
     with _skill_lock(path):
         evaluated = _load_evaluated_rule(
