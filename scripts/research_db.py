@@ -494,6 +494,20 @@ def _structural_payload(report: Any) -> str | None:
     return json.dumps(report.as_dict(), sort_keys=True, default=str)
 
 
+def _scopes_compatible(rule_scope: Mapping[str, Any], obs_scope: Mapping[str, Any]) -> bool:
+    """Every scope dimension present on both sides must agree.
+
+    A generic (missing) dimension is allowed; an explicit conflict (e.g. rule
+    USA/TOP3000 vs observation CHN) rejects the attachment so one universe
+    cannot silently support another's rule.
+    """
+    for key, rule_value in rule_scope.items():
+        if key in obs_scope and obs_scope[key] is not None and rule_value is not None:
+            if str(obs_scope[key]) != str(rule_value):
+                return False
+    return True
+
+
 def settings_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Build canonical settings from a CSV row (blank/absent cells fall back to defaults)."""
     return canonical.normalize_settings({column: row[column] for column in SETTINGS_COLUMNS if column in row})
@@ -819,6 +833,7 @@ class ResearchDB:
             candidate = conn.execute("SELECT * FROM candidates WHERE canonical_key=?", (key,)).fetchone()
 
             if simulation is not None and simulation["status"] == "DONE":
+                is_new = candidate is None
                 candidate_id = candidate["id"] if candidate else self._insert_candidate(
                     conn,
                     key,
@@ -836,6 +851,11 @@ class ResearchDB:
                     status="SIMULATED",
                     structural_json=_structural_payload(report),
                 )
+                if is_new:
+                    self.log_event(
+                        "candidate", candidate_id, "validation_passed", to_status="SIMULATED",
+                        payload={"canonical_key": key, "source": source}, conn=conn,
+                    )
                 self.log_event(
                     "candidate", candidate_id, "cache_hit", to_status=candidate["status"] if candidate else "SIMULATED",
                     payload={"canonical_key": key}, conn=conn,
@@ -875,6 +895,13 @@ class ResearchDB:
                     structural_json=_structural_payload(report),
                 )
                 from_status = None
+                # Dedicated idempotent validation signal: exactly one per candidate
+                # lifecycle, so throughput counts successful validation (not retries
+                # or status transitions).
+                self.log_event(
+                    "candidate", candidate_id, "validation_passed", to_status="QUEUED",
+                    payload={"canonical_key": key, "source": source}, conn=conn,
+                )
             else:
                 candidate_id = candidate["id"]
                 from_status = candidate["status"]
@@ -888,6 +915,13 @@ class ResearchDB:
             self.log_event(
                 "candidate", candidate_id, "queued", from_status=from_status, to_status="QUEUED",
                 payload={"source": source, "canonical_key": key}, conn=conn,
+            )
+            # One cache-decision event per lookup: hits are logged as cache_hit
+            # above, misses as cache_miss here, so the hit rate is
+            # hits / (hits + misses) in identical units.
+            self.log_event(
+                "candidate", candidate_id, "cache_miss", to_status="QUEUED",
+                payload={"canonical_key": key}, conn=conn,
             )
             action = "requeued" if from_status == "RETRY" or requeue else "queued"
             return QueueOutcome(action, key, candidate_id, "QUEUED")
@@ -2244,42 +2278,84 @@ class ResearchDB:
                 f"{title}\\x1f{body}\\x1f{self._knowledge_json(scope or {}, field_name='scope')}".encode("utf-8")
             ).hexdigest()[:24]
         timestamp = now_iso()
-        with self._tx() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO knowledge_rules(
-                    rule_key, title, body, scope_json, state, provenance_json, privacy_class,
-                    owner, pinned, created_at, updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    str(rule_key), str(title), str(body), self._knowledge_json(scope or {}, field_name="scope"),
-                    state, self._knowledge_json(provenance or {}, field_name="provenance"), privacy,
-                    str(owner), int(bool(pinned)), timestamp, timestamp,
-                ),
-            )
-            rule_id = int(cursor.lastrowid)
-            for item in evidence:
-                if isinstance(item, Mapping):
-                    observation_id = int(item["observation_id"])
-                    polarity = str(item.get("polarity", "support"))
-                else:
-                    observation_id, polarity = int(item[0]), str(item[1])
-                self._attach_rule_evidence(conn, rule_id, observation_id, polarity)
-            rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
-            self._refresh_rule_evidence_counts(conn, rule_id)
-            rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
-            self._sync_rule_fts(conn, rule)
-            self.log_event("knowledge", rule_id, "rule_proposed", operation="learn.propose",
-                           result_class="proposal", payload={"rule_key": str(rule_key), "privacy_class": privacy}, conn=conn)
-            return rule_id
+        try:
+            with self._tx() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO knowledge_rules(
+                        rule_key, title, body, scope_json, state, provenance_json, privacy_class,
+                        owner, pinned, created_at, updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        str(rule_key), str(title), str(body), self._knowledge_json(scope or {}, field_name="scope"),
+                        state, self._knowledge_json(provenance or {}, field_name="provenance"), privacy,
+                        str(owner), int(bool(pinned)), timestamp, timestamp,
+                    ),
+                )
+                rule_id = int(cursor.lastrowid)
+                for item in evidence:
+                    if isinstance(item, Mapping):
+                        observation_id = int(item["observation_id"])
+                        polarity = str(item.get("polarity", "support"))
+                    else:
+                        observation_id, polarity = int(item[0]), str(item[1])
+                    self._attach_rule_evidence(conn, rule_id, observation_id, polarity)
+                rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+                self._refresh_rule_evidence_counts(conn, rule_id)
+                rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+                self._sync_rule_fts(conn, rule)
+                self.log_event("knowledge", rule_id, "rule_proposed", operation="learn.propose",
+                               result_class="proposal", payload={"rule_key": str(rule_key), "privacy_class": privacy}, conn=conn)
+                return rule_id
+        except ValueError as exc:
+            if "incompatible" in str(exc):
+                self.log_event("knowledge", rule_key, "rule_evidence_rejected", operation="learn.propose",
+                               payload={"reason": "scope_incompatible", "rule_key": str(rule_key)})
+            raise
+
+    def _rule_evidence_rows(self, conn: sqlite3.Connection, rule_id: int, *,
+                            only_active: bool = True) -> list[dict[str, Any]]:
+        """Central lifecycle-aware evidence resolution for one rule.
+
+        Evaluation and durable recall use only ``active`` observations by default;
+        retracted/superseded rows stay inspectable via ``only_active=False``.
+        """
+        sql = (
+            "SELECT e.*, o.claim, o.value_json, o.scope_json, o.evidence_group, o.privacy_class,"
+            " o.lifecycle_state FROM knowledge_rule_evidence e "
+            "JOIN knowledge_observations o ON o.id=e.observation_id WHERE e.rule_id=?"
+        )
+        params: list[Any] = [int(rule_id)]
+        if only_active:
+            sql += " AND o.lifecycle_state='active'"
+        sql += " ORDER BY e.created_at, e.observation_id"
+        return [dict(row) for row in conn.execute(sql, params)]
 
     def _attach_rule_evidence(self, conn: sqlite3.Connection, rule_id: int, observation_id: int, polarity: str) -> None:
         if polarity not in {"support", "contradiction"}:
             raise ValueError("evidence polarity must be support or contradiction")
-        observation = conn.execute("SELECT id FROM knowledge_observations WHERE id=?", (observation_id,)).fetchone()
+        observation = conn.execute("SELECT * FROM knowledge_observations WHERE id=?", (observation_id,)).fetchone()
         if observation is None:
             raise KeyError(f"observation {observation_id} not found")
+        rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+        if rule is None:
+            raise KeyError(f"rule {rule_id} not found")
+        try:
+            rule_scope = json.loads(rule["scope_json"] or "{}")
+        except ValueError:
+            rule_scope = {}
+        try:
+            obs_scope = json.loads(observation["scope_json"] or "{}")
+        except ValueError:
+            obs_scope = {}
+        if not _scopes_compatible(rule_scope if isinstance(rule_scope, dict) else {},
+                                  obs_scope if isinstance(obs_scope, dict) else {}):
+            # No in-transaction audit here: the caller logs the rejection in its
+            # own transaction so the record survives the rollback of this attempt.
+            raise ValueError(
+                f"observation {observation_id} scope is incompatible with rule {rule_id} scope"
+            )
         conn.execute(
             "INSERT OR IGNORE INTO knowledge_rule_evidence(rule_id, observation_id, polarity, independence_group, created_at) "
             "SELECT ?, id, ?, evidence_group, ? FROM knowledge_observations WHERE id=?",
@@ -2288,14 +2364,22 @@ class ResearchDB:
 
     def attach_rule_evidence(self, rule_id: int, observation_id: int, polarity: str = "support") -> None:
         """Add auditable evidence to a proposal without changing its lifecycle."""
-        with self._tx() as conn:
-            rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
-            if rule is None:
-                raise KeyError(f"rule {rule_id} not found")
-            self._attach_rule_evidence(conn, rule_id, observation_id, polarity)
-            self._refresh_rule_evidence_counts(conn, rule_id)
-            self.log_event("knowledge", rule_id, "rule_evidence_attached", operation="learn.evidence",
-                           payload={"observation_id": observation_id, "polarity": polarity}, conn=conn)
+        try:
+            with self._tx() as conn:
+                rule = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
+                if rule is None:
+                    raise KeyError(f"rule {rule_id} not found")
+                self._attach_rule_evidence(conn, rule_id, observation_id, polarity)
+                self._refresh_rule_evidence_counts(conn, rule_id)
+                self.log_event("knowledge", rule_id, "rule_evidence_attached", operation="learn.evidence",
+                               payload={"observation_id": observation_id, "polarity": polarity}, conn=conn)
+        except ValueError as exc:
+            # Scope rejections must stay auditable even though the attempt rolls back.
+            if "incompatible" in str(exc):
+                self.log_event("knowledge", rule_id, "rule_evidence_rejected", operation="learn.evidence",
+                               payload={"observation_id": observation_id, "polarity": polarity,
+                                        "reason": "scope_incompatible"})
+            raise
 
     def get_rule(self, rule_id: int) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
@@ -2310,7 +2394,8 @@ class ResearchDB:
                 result[key[:-5] if key.endswith("_json") else key] = {}
         result["evidence"] = self.query(
             """
-            SELECT e.*, o.claim, o.value_json, o.scope_json, o.evidence_group, o.privacy_class
+            SELECT e.*, o.claim, o.value_json, o.scope_json, o.evidence_group, o.privacy_class,
+                   o.lifecycle_state
             FROM knowledge_rule_evidence e JOIN knowledge_observations o ON o.id=e.observation_id
             WHERE e.rule_id=? ORDER BY e.created_at, e.observation_id
             """, (rule_id,)
@@ -2331,12 +2416,20 @@ class ResearchDB:
         return self.query("SELECT * FROM knowledge_rules WHERE " + " AND ".join(clauses) + " ORDER BY id", params)
 
     def recall_knowledge(self, query: str, *, scope: Mapping[str, Any] | None = None,
-                         states: Iterable[str] = ("active", "pinned", "proposed"),
-                         max_privacy: str = "PRIVATE", limit: int = 20) -> list[dict[str, Any]]:
-        """FTS5-first recall with state/privacy filters and a structured scope check."""
+                         states: Iterable[str] = ("active", "pinned"),
+                         max_privacy: str = "PRIVATE", limit: int = 20,
+                         include_proposed: bool = False) -> list[dict[str, Any]]:
+        """FTS5-first recall with state/privacy filters and a structured scope check.
+
+        Only durable ``active``/``pinned`` guidance is returned by default;
+        ``proposed`` hypotheses require explicit opt-in via ``include_proposed``
+        or an explicit ``states`` override (research/review workflows).
+        """
         if not str(query).strip():
             return []
         wanted_states = [str(value) for value in states]
+        if include_proposed and "proposed" not in wanted_states:
+            wanted_states = [*wanted_states, "proposed"]
         max_rank = PRIVACY_RANK[self._knowledge_privacy(max_privacy)]
         rows: list[dict[str, Any]] = []
         if self.get_meta("knowledge_fts5") == "available":
@@ -2374,13 +2467,21 @@ class ResearchDB:
 
     def evaluate_rule(self, rule_id: int, *, min_support: int = 2,
                       min_independent_groups: int = 2, max_contradiction_ratio: float = 0.5) -> dict[str, Any]:
-        """Evaluate promotion readiness; this never promotes by itself."""
+        """Evaluate promotion readiness; this never promotes by itself.
+
+        Evidence sufficiency (support/contradiction/privacy over ``active``
+        observations only) is the executable gate. The historical behavioral
+        replay gate is recorded alongside it: free-text rules are advisory-only
+        (no executable effect to replay), while structured effects record the
+        replay dataset/version, metrics, baseline, and evaluator version.
+        """
         rule = self.get_rule(rule_id)
         if rule is None:
             raise KeyError(f"rule {rule_id} not found")
-        evidence = rule["evidence"]
-        support = [item for item in evidence if item["polarity"] == "support"]
-        contradiction = [item for item in evidence if item["polarity"] == "contradiction"]
+        active_evidence = [item for item in rule["evidence"]
+                           if str(item.get("lifecycle_state") or "active") == "active"]
+        support = [item for item in active_evidence if item["polarity"] == "support"]
+        contradiction = [item for item in active_evidence if item["polarity"] == "contradiction"]
         support_groups = {str(item["independence_group"]) for item in support}
         ratio = len(contradiction) / max(len(support), 1)
         passed = (
@@ -2389,11 +2490,33 @@ class ResearchDB:
             and ratio <= float(max_contradiction_ratio)
             and str(rule["privacy_class"]) in {"PUBLIC", "SANITIZED"}
         )
+        provenance = rule.get("provenance") or {}
+        effect = provenance.get("effect") if isinstance(provenance, dict) else None
+        settled = self.query(
+            "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM candidates WHERE attempt_count > 0"
+        )[0]
+        replay: dict[str, Any]
+        if not isinstance(effect, dict) or not effect:
+            replay = {"status": "advisory_only",
+                      "reason": "free-text rule carries no executable effect to replay",
+                      "evaluator": "replay-v1", "dataset": None, "baseline": None,
+                      "metrics": None, "result": None}
+        else:
+            replay = {"status": "insufficient_data",
+                      "reason": "structured replay requires a frozen historical candidate/event set",
+                      "evaluator": "replay-v1",
+                      "dataset": {"settled_candidates": int(settled.get("n") or 0),
+                                  "max_candidate_id": settled.get("max_id")},
+                      "baseline": None, "metrics": None, "result": None,
+                      "effect_kind": str(effect.get("kind") or "unknown")}
         evaluation = {
             "passed": passed, "support": len(support), "contradiction": len(contradiction),
             "independent_groups": len(support_groups), "contradiction_ratio": ratio,
+            "active_evidence": len(active_evidence),
+            "ignored_non_active_evidence": len(rule["evidence"]) - len(active_evidence),
             "requirements": {"min_support": min_support, "min_independent_groups": min_independent_groups,
                              "max_contradiction_ratio": max_contradiction_ratio},
+            "replay": replay,
         }
         timestamp = now_iso()
         with self._tx() as conn:
@@ -2405,7 +2528,12 @@ class ResearchDB:
 
     def transition_rule(self, rule_id: int, target: str, *, expected_version: int | None = None,
                         actor: str = "agent", force: bool = False) -> dict[str, Any]:
-        """Promote/reject/weaken/retire a rule with version and pinned-owner protection."""
+        """Promote/reject/weaken/retire a rule with version and pinned-owner protection.
+
+        State/flag invariant: entering ``pinned`` always sets ``pinned=1``;
+        leaving ``pinned`` requires explicit ``force`` and clears the flag, so a
+        rule in the pinned state is always protected.
+        """
         if target not in KNOWLEDGE_RULE_STATES:
             raise ValueError(f"unknown rule state: {target}")
         timestamp = now_iso()
@@ -2421,10 +2549,17 @@ class ResearchDB:
                 evaluation = json.loads(row["evaluation_json"] or "{}")
                 if not evaluation.get("passed"):
                     raise ValueError("rule has not passed its evaluation gate")
+            if target == "pinned" and not force:
+                evaluation = json.loads(row["evaluation_json"] or "{}")
+                if not evaluation.get("passed"):
+                    raise ValueError("rule has not passed its evaluation gate")
             version = int(row["version"]) + 1
+            pinned_flag = 1 if target == "pinned" else 0
+            if target != "pinned" and bool(row["pinned"]) and not force:
+                raise PermissionError("leaving pinned state requires force")
             conn.execute(
-                "UPDATE knowledge_rules SET state=?, version=?, updated_at=? WHERE id=?",
-                (target, version, timestamp, rule_id),
+                "UPDATE knowledge_rules SET state=?, pinned=?, version=?, updated_at=? WHERE id=?",
+                (target, pinned_flag, version, timestamp, rule_id),
             )
             updated = conn.execute("SELECT * FROM knowledge_rules WHERE id=?", (rule_id,)).fetchone()
             self._sync_rule_fts(conn, updated)
@@ -2451,6 +2586,58 @@ class ResearchDB:
                 (str(aggregate_key), str(subject_type), str(subject_key), self._knowledge_json(scope or {}, field_name="scope"),
                  self._knowledge_json(metrics, field_name="metrics"), int(sample_count), privacy, now_iso()),
             )
+
+    def review_contradicted_rules(self, *, max_contradiction_ratio: float = 0.5) -> list[dict[str, Any]]:
+        """Weaken active rules whose new active evidence materially invalidates them.
+
+        Never deletes evidence or rules: ``active -> weakened`` requires later
+        review/evaluation before reactivation, and repeatedly contradicted
+        weakened rules retire. Idempotent.
+        """
+        weakened: list[dict[str, Any]] = []
+        for row in self.query("SELECT * FROM knowledge_rules WHERE state IN ('active','weakened') ORDER BY id"):
+            rule_id = int(row["id"])
+            full = self.get_rule(rule_id)
+            if full is None:
+                continue
+            active_evidence = [item for item in full["evidence"]
+                               if str(item.get("lifecycle_state") or "active") == "active"]
+            support = sum(1 for item in active_evidence if item["polarity"] == "support")
+            contradiction = sum(1 for item in active_evidence if item["polarity"] == "contradiction")
+            ratio = contradiction / max(support, 1)
+            target: str | None = None
+            if full["state"] == "active" and ratio > float(max_contradiction_ratio):
+                target = "weakened"
+            elif full["state"] == "weakened" and contradiction >= 3 and ratio > 1.0:
+                target = "retired"
+            if target is None:
+                continue
+            try:
+                updated = self.transition_rule(rule_id, target, actor="review-worker")
+            except (ValueError, PermissionError, KeyError):
+                continue
+            weakened.append({"rule_id": rule_id, "from": full["state"], "to": target,
+                             "support": support, "contradiction": contradiction,
+                             "ratio": ratio, "version": updated.get("version")})
+        return weakened
+
+    def review_knowledge(self, *, min_support: int = 2, min_groups: int = 2,
+                         limit: int = 500) -> dict[str, Any]:
+        """Idempotent review worker: events -> PRIVATE observations -> proposals.
+
+        Materializes new simulation/submission observations, refreshes
+        family aggregates/dirty scopes, generates proposal candidates for
+        well-supported subjects, and flags contradicted rules. Autonomous
+        proposal generation never promotes: promotion stays behind explicit
+        evaluation + transition.
+        """
+        materialized = self.materialize_event_observations(limit=limit)
+        submission_materialized = self.materialize_submission_observations(limit=limit)
+        aggregates = self.refresh_knowledge_aggregates()
+        proposals = self.generate_proposal_candidates(min_support=min_support, min_groups=min_groups)
+        flagged = self.review_contradicted_rules()
+        return {"materialized_simulation": materialized, "materialized_submission": submission_materialized,
+                "aggregates": aggregates, "proposals": proposals, "flagged": flagged}
 
     def materialize_event_observations(self, *, limit: int = 500) -> dict[str, int]:
         """Turn simulation events into scoped evidence without proposing global rules.
@@ -2509,6 +2696,145 @@ class ResearchDB:
             created += 1
         return {"created": created, "skipped": skipped, "scanned": len(rows)}
 
+    def materialize_submission_observations(self, *, limit: int = 500) -> dict[str, int]:
+        """Turn submission-result events into scoped PRIVATE observations.
+
+        Covers submission outcomes, ACTIVE portfolio changes, and other
+        pipeline verdicts the simulation-only path misses. Idempotent per event.
+        """
+        rows = self.query(
+            """
+            SELECT e.*, c.signal_family, c.settings_json, c.sharpe, c.fitness, c.turnover,
+                   c.skeleton_hash, c.expression_hash, c.parent_id
+            FROM events e LEFT JOIN candidates c
+              ON e.entity IN ('submission','candidate') AND CAST(e.entity_id AS INTEGER)=c.id
+            LEFT JOIN knowledge_observations o ON o.source_event_id=e.id
+            WHERE e.event IN ('result','status') AND o.id IS NULL
+            ORDER BY e.id LIMIT ?
+            """, (max(int(limit), 0),)
+        )
+        created = 0
+        skipped = 0
+        for row in rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            to_status = str(row.get("to_status") or payload.get("status") or "")
+            if to_status not in ("ACTIVE", "REJECTED", "SELF_CORR_FAIL", "PLATFORM_REJECTED",
+                                 "SUBMISSION_READY", "EXHAUSTED"):
+                skipped += 1
+                continue
+            try:
+                settings = json.loads(row.get("settings_json") or "{}")
+            except (TypeError, ValueError):
+                settings = {}
+            scope = {key: settings.get(key) for key in ("region", "universe", "delay")
+                     if settings.get(key) is not None}
+            if row.get("signal_family"):
+                scope["signal_family"] = row["signal_family"]
+            subject_key = str(row.get("skeleton_hash") or row.get("expression_hash")
+                              or f"candidate:{row.get('entity_id')}")
+            root = row.get("parent_id") or row.get("entity_id") or row["id"]
+            self.record_observation(
+                subject_type="signal_structure", subject_key=subject_key,
+                claim="submission_outcome",
+                value={"status": to_status, "sharpe": row.get("sharpe"),
+                       "fitness": row.get("fitness"), "turnover": row.get("turnover"),
+                       "reason": payload.get("message") or payload.get("reason")},
+                scope=scope, evidence_group=f"lineage:{root}",
+                provenance={"source": "events", "event_id": row["id"], "event": row.get("event")},
+                source_event_id=int(row["id"]),
+                candidate_id=int(row["entity_id"]) if str(row.get("entity_id") or "").isdigit() else None,
+                submission_id=row.get("submission_id"), privacy_class="PRIVATE",
+            )
+            created += 1
+        return {"created": created, "skipped": skipped, "scanned": len(rows)}
+
+    def refresh_knowledge_aggregates(self) -> dict[str, int]:
+        """Rebuild per-subject family/lineage aggregates from active observations."""
+        rows = self.query(
+            "SELECT subject_type, subject_key, scope_json, value_json FROM knowledge_observations "
+            "WHERE lifecycle_state='active'"
+        )
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                scope = json.loads(row.get("scope_json") or "{}")
+            except ValueError:
+                scope = {}
+            try:
+                value = json.loads(row.get("value_json") or "{}")
+            except ValueError:
+                value = {}
+            key = (str(row["subject_type"]), str(row["subject_key"]))
+            grouped.setdefault(key, []).append({"scope": scope, "value": value})
+        updated = 0
+        for (subject_type, subject_key), items in grouped.items():
+            passes = sum(1 for item in items if item["value"].get("is_pass") is True
+                         or str(item["value"].get("status") or "") == "ACTIVE")
+            scope: dict[str, Any] = {}
+            for item in items:
+                for key, value in (item["scope"] or {}).items():
+                    scope.setdefault(key, value)
+            self.upsert_knowledge_aggregate(
+                aggregate_key=f"{subject_type}:{subject_key}", subject_type=subject_type,
+                subject_key=subject_key, scope=scope,
+                metrics={"samples": len(items), "passes": passes,
+                         "pass_rate": round(passes / max(len(items), 1), 4)},
+                sample_count=len(items), privacy_class="PRIVATE",
+            )
+            updated += 1
+        return {"aggregates": updated, "observations": len(rows)}
+
+    def generate_proposal_candidates(self, *, min_support: int = 2, min_groups: int = 2) -> list[dict[str, Any]]:
+        """Propose (never promote) rules for well-supported subjects. Idempotent."""
+        rows = self.query(
+            "SELECT * FROM knowledge_observations WHERE lifecycle_state='active' ORDER BY id"
+        )
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                scope = json.loads(row.get("scope_json") or "{}")
+            except ValueError:
+                scope = {}
+            try:
+                value = json.loads(row.get("value_json") or "{}")
+            except ValueError:
+                value = {}
+            if value.get("is_pass") is not True and str(value.get("status") or "") != "ACTIVE":
+                continue
+            key = (str(row["subject_type"]), str(row["subject_key"]), json.dumps(scope, sort_keys=True))
+            grouped.setdefault(key, []).append(row)
+        created: list[dict[str, Any]] = []
+        for (subject_type, subject_key, scope_raw), items in grouped.items():
+            groups = {str(item["evidence_group"]) for item in items}
+            if len(items) < min_support or len(groups) < min_groups:
+                continue
+            try:
+                scope = json.loads(scope_raw)
+            except ValueError:
+                scope = {}
+            rule_key = "auto-" + hashlib.sha256(
+                f"{subject_type}\x1f{subject_key}\x1f{scope_raw}".encode("utf-8")).hexdigest()[:24]
+            if self.query("SELECT id FROM knowledge_rules WHERE rule_key=?", (rule_key,)):
+                continue
+            title = f"Supporting evidence for {subject_key}"
+            body = (f"Independent observations ({len(items)} across {len(groups)} lineage groups) "
+                    f"support retaining {subject_key} for further review. Advisory only until evaluated.")
+            try:
+                rule_id = self.propose_rule(
+                    rule_key=rule_key, title=title, body=body, scope=scope,
+                    evidence=[(int(item["id"]), "support") for item in items],
+                    provenance={"source": "review-worker", "subject_type": subject_type,
+                                "subject_key": subject_key}, privacy_class="SANITIZED",
+                )
+            except (ValueError, KeyError):
+                continue
+            created.append({"rule_id": rule_id, "subject_key": subject_key,
+                            "support": len(items), "groups": len(groups)})
+        return created
+
     def record_skill_mutation(
         self, *, operation: str, actor: str, expected_sha: str | None, before_sha: str,
         after_sha: str, backup_sha: str, backup_path: str, rule_id: int | None,
@@ -2531,6 +2857,44 @@ class ResearchDB:
             self.log_event("skill", mutation_id, "mutation_recorded", operation=operation,
                            result_class=result, payload={"rule_id": rule_id, "privacy_class": privacy}, conn=conn)
             return mutation_id
+
+    def record_skill_mutation_atomic(
+        self, *, operation: str, actor: str, expected_sha: str | None, before_sha: str,
+        after_sha: str, backup_sha: str, backup_path: str, rule_id: int | None,
+        privacy_class: str, result: str = "applied",
+    ) -> dict[str, Any]:
+        """Bump ``skill_version`` and insert the mutation ledger row in one transaction.
+
+        The file replace itself cannot join this SQLite transaction, so callers
+        (``skill_manager``) hold the inter-process skill lock across file+DB and
+        restore the captured before-state when this method raises.
+        """
+        privacy = self._knowledge_privacy(privacy_class)
+        timestamp = now_iso()
+        with self._tx() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key='skill_version'").fetchone()
+            try:
+                version = int(row["value"]) + 1 if row is not None else 1
+            except (TypeError, ValueError):
+                version = 1
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('skill_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(version),),
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO skill_mutations(operation, actor, expected_sha, before_sha, after_sha,
+                       backup_sha, backup_path, rule_id, privacy_class, version, result, created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (operation, actor, expected_sha, before_sha, after_sha, backup_sha, backup_path,
+                 rule_id, privacy, int(version), result, timestamp),
+            )
+            mutation_id = int(cursor.lastrowid)
+            self.log_event("skill", mutation_id, "mutation_recorded", operation=operation,
+                           result_class=result, payload={"rule_id": rule_id, "privacy_class": privacy}, conn=conn)
+            return {"mutation_id": mutation_id, "version": version}
 
     def knowledge_status(self) -> dict[str, Any]:
         """Counts/capabilities for the agent-agnostic knowledge interface."""
@@ -2594,13 +2958,15 @@ class ResearchDB:
             "SELECT COUNT(*) AS n FROM candidates WHERE created_at >= ?", (since,)
         ).fetchone()["n"] / hours, 3)
         report.validated_per_hour = round(self._conn.execute(
-            "SELECT COUNT(*) AS n FROM events WHERE event='status' AND to_status='QUEUED' AND created_at >= ?",
+            "SELECT COUNT(*) AS n FROM events WHERE event='validation_passed' AND created_at >= ?",
             (since,),
         ).fetchone()["n"] / hours, 3)
         report.simulated_per_hour = round(self._conn.execute(
             "SELECT COUNT(*) AS n FROM simulations WHERE completed_at IS NOT NULL AND completed_at >= ?", (since,)
         ).fetchone()["n"] / hours, 3)
-        candidate_total = max(int(self._conn.execute("SELECT COUNT(*) AS n FROM candidates").fetchone()["n"]), 1)
+        cache_misses = int(self._conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE event='cache_miss'"
+        ).fetchone()["n"])
         simulation_total = max(int(self._conn.execute("SELECT COUNT(*) AS n FROM simulations").fetchone()["n"]), 1)
         done_total = int(self._conn.execute("SELECT COUNT(*) AS n FROM simulations WHERE status='DONE'").fetchone()["n"])
         pass_total = int(self._conn.execute("SELECT COUNT(*) AS n FROM simulations WHERE is_pass=1").fetchone()["n"])
@@ -2615,7 +2981,8 @@ class ResearchDB:
         active_submissions = int(self._conn.execute(
             "SELECT COUNT(*) AS n FROM submissions WHERE status='ACTIVE'"
         ).fetchone()["n"])
-        report.cache_hit_rate = round(report.cache_hits / candidate_total, 4)
+        report.cache_hit_rate = round(
+            report.cache_hits / max(report.cache_hits + cache_misses, 1), 4)
         report.simulation_success_rate = round(done_total / simulation_total, 4)
         report.is_pass_rate = round(pass_total / max(done_total, 1), 4)
         report.correlation_pass_rate = round(corr_pass / max(corr_checked, 1), 4)
@@ -2625,7 +2992,10 @@ class ResearchDB:
             "SELECT COUNT(*) AS n FROM active_alphas WHERE first_seen_at >= ?", (active_since,)
         ).fetchone()["n"])
         report.simulations_per_is_pass = round(done_total / pass_total, 4) if pass_total else None
-        report.simulations_per_active_alpha = round(done_total / max(len(self.active_alpha_ids()), 1), 4)
+        active_count = len(self.active_alpha_ids())
+        report.simulations_per_active_alpha = (
+            round(done_total / active_count, 4) if active_count else None
+        )
         return report
 
 

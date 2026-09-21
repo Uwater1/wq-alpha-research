@@ -94,36 +94,64 @@ def test_rule_lifecycle_protects_user_owned_rules_and_supports_retirement(db):
 
 def test_fts_recall_respects_scope_state_and_privacy(db):
     obs = _observation(db, "campaign-a")
+    second = _observation(db, "campaign-b")
     private_rule = db.propose_rule(
         title="Private cash-flow note", body="Cash-flow evidence is useful in USA TOP3000.",
         scope={"region": "USA"}, evidence=[(obs, "support")], privacy_class="PRIVATE",
     )
     public_rule = db.propose_rule(
         title="Public cash-flow rule", body="Cash-flow evidence is useful in USA TOP3000.",
-        scope={"region": "USA"}, evidence=[(obs, "support")], privacy_class="SANITIZED",
+        scope={"region": "USA"}, evidence=[(obs, "support"), (second, "support")],
+        privacy_class="SANITIZED",
     )
 
+    # Proposed hypotheses are excluded from durable recall by default.
+    assert db.recall_knowledge("cash-flow", scope={"region": "USA"}, max_privacy="SANITIZED") == []
+    recalled_proposed = db.recall_knowledge(
+        "cash-flow", scope={"region": "USA"}, max_privacy="SANITIZED", include_proposed=True)
+    assert [row["id"] for row in recalled_proposed] == [public_rule]
+    assert db.recall_knowledge("cash-flow", scope={"region": "CHN"}, max_privacy="PRIVATE",
+                               include_proposed=True) == []
+    assert private_rule not in [row["id"] for row in recalled_proposed]
+
+    # After evaluation + promotion the durable rule is recalled by default.
+    db.evaluate_rule(public_rule, min_support=2, min_independent_groups=2)
+    db.transition_rule(public_rule, "active", expected_version=1)
     recalled = db.recall_knowledge("cash-flow", scope={"region": "USA"}, max_privacy="SANITIZED")
     assert [row["id"] for row in recalled] == [public_rule]
-    assert db.recall_knowledge("cash-flow", scope={"region": "CHN"}, max_privacy="PRIVATE") == []
-    assert private_rule not in [row["id"] for row in recalled]
+
+
+def _evaluated_rule_id(db):
+    first = _observation(db, "campaign-a")
+    second = _observation(db, "campaign-b")
+    rule_id = db.propose_rule(
+        title="General rule", body="Use evidence before promotion.",
+        scope={"region": "USA"}, evidence=[(first, "support"), (second, "support")],
+        provenance={"source": "offline-test"}, privacy_class="SANITIZED",
+    )
+    db.evaluate_rule(rule_id)
+    return db.transition_rule(rule_id, "active", expected_version=1)["id"]
 
 
 def test_skill_manager_uses_expected_sha_atomic_backup_and_rollback(tmp_path, db):
     skill = tmp_path / "SKILL.md"
     skill.write_text("# Router\n", encoding="utf-8")
     before = skill_manager.read_skill(skill)[1]
-    rule = {"id": 7, "title": "General rule", "body": "Use evidence before promotion.",
-            "scope": {"region": "USA"}, "privacy_class": "SANITIZED"}
+    rule_id = _evaluated_rule_id(db)
+    version = int(db.get_rule(rule_id)["version"])
 
-    result = skill_manager.apply_rule(db, skill, rule, expected_sha=before, backup_dir=tmp_path / "history")
+    result = skill_manager.apply_evaluated_rule(
+        db, skill, rule_id, expected_rule_version=version,
+        expected_sha=before, backup_dir=tmp_path / "history")
     assert result["before_sha"] == before
     assert skill_manager.read_skill(skill)[1] == result["after_sha"]
     assert (tmp_path / "history" / f"{before}.md").read_text(encoding="utf-8") == "# Router\n"
     assert db.knowledge_status()["mutations"] == 1
 
     with pytest.raises(ValueError, match="SHA mismatch"):
-        skill_manager.apply_rule(db, skill, rule, expected_sha=before)
+        skill_manager.apply_evaluated_rule(
+            db, skill, rule_id, expected_rule_version=version,
+            expected_sha=before, backup_dir=tmp_path / "history")
 
     current, current_sha = skill_manager.read_skill(skill)
     rolled_back = skill_manager.rollback(
@@ -132,6 +160,8 @@ def test_skill_manager_uses_expected_sha_atomic_backup_and_rollback(tmp_path, db
     )
     assert rolled_back["after_sha"] == before
     assert skill_manager.read_skill(skill)[1] == before
+    # Rollback captured the state it left, so a redo can restore it.
+    assert (tmp_path / "history" / f"{current_sha}.md").exists()
 
 
 def test_skill_manager_applies_sanitized_snippets_through_the_same_ledger(tmp_path, db):
@@ -140,6 +170,7 @@ def test_skill_manager_applies_sanitized_snippets_through_the_same_ledger(tmp_pa
     before = skill_manager.read_skill(skill)[1]
     result = skill_manager.apply_snippet(
         db, skill, "### General lesson\n\nPrefer independent evidence.", expected_sha=before,
+        actor="user",
     )
     assert result["version"] == 1
     assert "Prefer independent evidence" in skill.read_text(encoding="utf-8")
@@ -150,11 +181,12 @@ def test_skill_manager_refuses_private_rules_and_secret_text(tmp_path, db):
     skill = tmp_path / "SKILL.md"
     skill.write_text("# Router\n", encoding="utf-8")
     with pytest.raises(ValueError, match="PUBLIC or SANITIZED"):
-        skill_manager.apply_rule(db, skill, {"title": "x", "body": "y", "privacy_class": "PRIVATE"})
+        skill_manager.apply_rule(db, skill, {"title": "x", "body": "y", "privacy_class": "PRIVATE"},
+                                 actor="user")
     with pytest.raises(ValueError, match="private identifiers"):
         skill_manager.apply_rule(db, skill, {
             "title": "x", "body": "Never use password = value.", "privacy_class": "SANITIZED"
-        })
+        }, actor="user")
 
 
 def test_materialize_event_observations_keeps_one_event_one_observation(db):

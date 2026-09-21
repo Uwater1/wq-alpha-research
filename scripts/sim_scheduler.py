@@ -299,7 +299,31 @@ class SimulationScheduler:
 
     def _log_transport(self, *, candidate_id: int | None = None, simulation_id: str | None = None,
                        submission_id: int | None = None, operation: str, result_class: str) -> None:
-        """Persist non-sensitive HTTP telemetry when the client exposes it."""
+        """Persist non-sensitive HTTP telemetry when the client exposes it.
+
+        Drains the client's per-attempt history so 429/retry attempts survive a
+        later success; falls back to ``last_request`` for clients without it.
+        """
+        attempts = []
+        drain = getattr(self.client, "drain_attempts", None)
+        if callable(drain):
+            try:
+                attempts = drain() or []
+            except Exception:
+                attempts = []
+        if attempts:
+            for entry in attempts:
+                self.db.log_event(
+                    "transport", candidate_id or simulation_id or submission_id, "http",
+                    operation=operation, candidate_id=candidate_id, simulation_id=simulation_id,
+                    submission_id=submission_id, http_status=entry.get("http_status"),
+                    error_category=entry.get("error_category"),
+                    retry_count=int(entry.get("attempt") or 0),
+                    latency_ms=entry.get("latency_ms"),
+                    rate_limit_seconds=entry.get("rate_limit_seconds"),
+                    result_class=result_class if entry.get("final") else "retry",
+                )
+            return
         request = getattr(self.client, "last_request", {}) or {}
         self.db.log_event(
             "transport", candidate_id or simulation_id or submission_id, "http",

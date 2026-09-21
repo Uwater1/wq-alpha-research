@@ -26,15 +26,18 @@ def _settle(db, expression, passed, family):
 
 
 def test_fit_persists_structural_model_and_diagnostics(db):
-    for index in range(6):
+    for index in range(8):
         _settle(db, f"group_rank(ts_rank(operating_income, {20 + index}), subindustry)", index % 2 == 0,
                 "fundamental")
     model = surrogate.fit(db, min_samples=5)
-    assert model["samples"] == 6
+    assert model["samples"] == 8
     assert "field:operating_income" in model["features"]
     assert "is_pass" in model["targets"]
     assert surrogate.load(db)["version"] == 1
-    assert surrogate.evaluate(db)["available"] is True
+    evaluated = surrogate.evaluate(db)
+    assert evaluated["available"] is True
+    assert evaluated["oos"] is True
+    assert evaluated["train_samples"] + evaluated["test_samples"] == 8
 
 
 def test_predict_and_advisory_ranking_keep_candidates_in_play(db):

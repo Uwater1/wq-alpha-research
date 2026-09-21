@@ -505,7 +505,11 @@ def build_incremental_report(entries: list[dict[str, Any]], sanitize: bool = Tru
 
 
 def append_to_skill(snippet: str, *, expected_sha: str | None = None) -> dict[str, Any]:
-    """Append reviewed sanitized prose through the shared guarded skill manager."""
+    """Legacy manual helper: append reviewed sanitized prose (user-only, local use).
+
+    Autonomous learning must not call this: durable writes now require an evaluated
+    active/pinned rule id via ``skill_manager.apply_evaluated_rule``.
+    """
     if not SKILL_PATH.exists():
         raise FileNotFoundError(f"SKILL.md not found at {SKILL_PATH}")
     from skill_manager import apply_snippet, read_skill
@@ -516,7 +520,7 @@ def append_to_skill(snippet: str, *, expected_sha: str | None = None) -> dict[st
         return apply_snippet(
             knowledge_db, SKILL_PATH, snippet,
             expected_sha=expected_sha or actual_sha,
-            actor="evolve_skill",
+            actor="user",
             privacy_class="SANITIZED",
         )
 
@@ -535,8 +539,18 @@ def main() -> int:
     )
     args = parser.parse_args()
     sanitize = not args.raw
+    if args.raw and args.apply:
+        parser.error("--raw --apply is forbidden: raw reports may contain account-linked "
+                     "identifiers/expressions and must never enter tracked skill text")
+    if args.apply:
+        print("ERROR: legacy --apply is disabled. Durable learning now flows through structured "
+              "PRIVATE observations -> evaluated rules (scripts/knowledge_cli.py propose/evaluate/"
+              "transition) and tracked-skill writes require an evaluated active/pinned rule id "
+              "via skill_manager.apply_evaluated_rule. Raw reports stay local only.",
+              file=sys.stderr, flush=True)
+        return 2
     if args.raw:
-        print("WARNING: --raw writes real alpha IDs/expressions into SKILL.md; never publish that file.", flush=True)
+        print("WARNING: --raw writes real alpha IDs/expressions into stdout; never publish that output.", flush=True)
 
     session = create_session()
     print("auth ok", flush=True)
