@@ -1,228 +1,171 @@
-# AGENTS.md — Working Guide for This WQ Alpha Research Repo
+# AGENTS.md — Repository Operating Guide
 
-Project root: `wq-alpha-research/` (contains `SKILL.md`, `scripts/`, `references/`).
-This is the only directory that matters for this project.
+This repository is an agent-agnostic WorldQuant BRAIN research system.
 
-## 1. Environment
+Use the files by role:
 
-- Python venv at `.venv/` (already created). Always use it:
+- `AGENTS.md` — how to operate, test, and change the repository.
+- `SKILL.md` — the compact alpha-research playbook and decision gates.
+- `research.db` — local operational state, observations, evidence, rules, and audit history.
+- `references/` — machine-readable field/operator snapshots and other detailed reference data.
 
-  ```bash
-  ./.venv/bin/python <script.py>
-  ```
+Do not duplicate the full research playbook in this file, and do not turn `SKILL.md` into an experiment log.
 
-- Dependencies (`requests`, `numpy`) are already installed in the venv.
+## 1. Environment and secrets
 
-## 2. Credentials (never commit)
-
-Resolved by `scripts/evolve_skill.py` and `legacy/wq_brain/wq_session.py` in order:
-
-1. Env vars: `WQ_BRAIN_USERNAME` / `WQ_BRAIN_PASSWORD`
-2. Root `credential.txt` encrypted with `credential.key` (or plaintext JSON array `["your_username", "your_password"]`)
-3. `legacy/wq_brain/credentials.json` (JSON object, legacy format)
+Use the repository virtual environment:
 
 ```bash
-./.venv/bin/python scripts/credential_crypto.py --status   # check, reveals nothing
-./.venv/bin/python scripts/credential_crypto.py --encrypt  # encrypt in-place, creates credential.key (0600) if missing
+./.venv/bin/python <script.py>
 ```
 
-Session/submit scripts decrypt in memory. **Agents must never view or print
-`credential.txt` / `credential.key` — treat as opaque secrets.**
+Canonical BRAIN credential sources are:
 
+1. `WQ_BRAIN_USERNAME` / `WQ_BRAIN_PASSWORD`;
+2. local encrypted `credential.txt` + `credential.key`.
 
-## 3. How to Run Things
-
-- Agent-agnostic knowledge and safe skill management:
-
-  ```bash
-  ./.venv/bin/python scripts/knowledge_cli.py status
-  ./.venv/bin/python scripts/knowledge_cli.py recall "cash flow" --max-privacy SANITIZED
-  ./.venv/bin/python scripts/knowledge_cli.py observe --subject-type signal_structure --subject-key STRUCTURE \\
-      --claim simulation_outcome --value '{"is_pass":true}' --evidence-group campaign-1
-  ./.venv/bin/python scripts/knowledge_cli.py propose --title "General rule" --body "Sanitized rule text" \\
-      --evidence OBS_ID:support
-  ./.venv/bin/python scripts/knowledge_cli.py evaluate RULE_ID
-  ./.venv/bin/python scripts/knowledge_cli.py transition RULE_ID active --expected-version 1
-  ```
-
-  Observations are scoped and private by default. Rules require independent evidence and
-  evaluation before promotion; `skill_manager.py` enforces SHA compare-and-swap, atomic
-  content-addressed backups, rollback, and PUBLIC/SANITIZED-only tracked mutations.
-
-- Preview skill evolution (does NOT modify files):
-
-  ```bash
-  ./.venv/bin/python scripts/evolve_skill.py
-  ```
-
-- Apply (writes to `SKILL.md` Section 12 + `alpha_db.json`):
-
-  ```bash
-  ./.venv/bin/python scripts/evolve_skill.py --apply
-  ```
-
-- Local research state store (`research.db`, git-ignored):
-
-  ```bash
-  ./.venv/bin/python scripts/research_db.py init                     # create/upgrade schema
-  ./.venv/bin/python scripts/research_db.py status                   # queue + cache counters as JSON
-  ./.venv/bin/python scripts/research_db.py queue legacy/wq_brain/data/input.csv
-  ./.venv/bin/python scripts/research_db.py cache "rank(close)" --decay 6
-  ```
-
-  `WQ_RESEARCH_DB` overrides the default `<repo root>/research.db`. Candidates are
-  keyed by `SHA256(normalized_expression + settings)` (see `scripts/canonical.py`), so
-  an identical request is never sent to BRAIN twice; `batch_simulate.py` uses the
-  store by default (`--no-db` for the legacy CSV-only behavior).
-
-- Learned simulation surrogate (advisory only):
-
-  ```bash
-  ./.venv/bin/python scripts/surrogate.py status
-  ./.venv/bin/python scripts/surrogate.py train --min-samples 5
-  ./.venv/bin/python scripts/surrogate.py evaluate
-  ./.venv/bin/python scripts/surrogate.py rank --limit 20
-  ```
-
-  It learns from settled local candidates using structural fields/operators, settings,
-  signal family, lineage, and outcomes. It only reorders candidates; it never rejects a
-  candidate solely from model prediction.
-
-- Persistent 3-slot simulation dispatcher. Queue work first, then run it:
-
-  ```bash
-  ./.venv/bin/python scripts/sim_scheduler.py --dry-run         # rank the queue, no BRAIN calls
-  ./.venv/bin/python scripts/sim_scheduler.py --max-runtime 30  # bounded run in minutes
-  ./.venv/bin/python scripts/sim_scheduler.py --once            # one fill+poll pass (cron style)
-  ```
-
-  It keeps 3 simulations in flight, polls separately from submitting, honours
-  `Retry-After`, backs off, re-authenticates on session expiry, adopts simulations
-  orphaned by a killed process, and persists every transition. Priority comes from
-  `scripts/ranking.py` (quality/novelty/diversity/risk, components stored per
-  candidate). Multi-simulation is **not** available on this platform — check with
-  `./.venv/bin/python scripts/multi_sim.py --status`.
-
-- Pre-screening, variant gate, submission queue:
-
-  ```bash
-  ./.venv/bin/python scripts/research_db.py queue data/input.csv   # validates + dedups first
-  ./.venv/bin/python scripts/successive_halving.py --status        # what is deferred and why
-  ./.venv/bin/python scripts/staged_search.py --status             # per-structure search budgets
-  ./.venv/bin/python scripts/submission_worker.py --dry-run        # submission queue order
-  ./.venv/bin/python scripts/submission_worker.py --max-submissions 1
-  ```
-
-  `scripts/validate.py` rejects malformed expressions, unknown operators/fields (within
-  the USA/TOP3000/delay 1 catalog scope) and impossible settings before a slot is spent;
-  warnings only lower priority. `scripts/successive_halving.py` admits one representative
-  variant per structure and defers the rest until it passes (or the horizon elapses).
-  `scripts/staged_search.py` additionally budgets each structure once the queue passes
-  `--staged-threshold`, so a parameter grid holds one slot until its base proves useful,
-  expands when it does, and stops when its marginal pass rate goes bad. Passing candidates
-  land in the submission queue automatically; the worker leases one, re-checks the gates,
-  submits, polls and continues.
-
-- Offline end-to-end regression coverage is in `tests/test_pipeline_e2e.py` and uses only fakes.
-  Run `./.venv/bin/python -m pytest -q` before any live probe. Live BRAIN probes are explicit,
-  bounded, and never part of the default test suite.
-
-- Local self-correlation + submission recovery:
-
-  ```bash
-  ./.venv/bin/python scripts/correlation.py sync    # paginated ACTIVE book + cached daily PnL
-  ./.venv/bin/python scripts/correlation.py status  # book version, cached PnL, check counts
-  ./.venv/bin/python scripts/submission_worker.py --require-correlation --max-submissions 1
-  ```
-
-  `research.db` events also retain operation, HTTP status/category, retry count, latency,
-  rate-limit/backoff seconds, and result class without response bodies or credentials;
-  `research_db.py status` reports throughput and pass-rate metrics.
-
-  `--require-correlation` is a real gate: the worker syncs and versions the ACTIVE book,
-  fetches the candidate's PnL, correlates aligned **daily returns** (never cumulative
-  curves) and refuses anything at or above `--correlation-limit`. Unusable inputs (missing
-  or short PnL, a flat series, an incompletely cached book) become explicit holds, not low
-  correlations; a book change invalidates every cached check. Submission rows recover
-  themselves: an expired lease returns to `READY` only when the POST never left the
-  process, otherwise it becomes `CHECK_PENDING` and is reconciled against BRAIN before any
-  retry. Ambiguous transport/server submit outcomes also become `CHECK_PENDING`; only
-  definite pre-submit errors use `RETRY`. A failed ACTIVE-book refresh holds the whole
-  correlation-enabled run rather than trusting an old cached check. Transient failures
-  back off and retire as `EXHAUSTED` after `--max-submission-attempts`. BRAIN's own
-  SELF_CORRELATION check remains the confirmation.
-
-- Load the local field catalog (4,367 USA TOP3000 delay=1 fields):
-
-  ```python
-  import json
-  from pathlib import Path
-  data = json.loads(Path("references/wq_usa_top3000_delay1_data_fields.json").read_text(encoding="utf-8"))
-  # f["id"], f["category"]["id"], f["dataset"]["name"], f["coverage"], f["alphaCount"]
-  ```
-
-- Load the operator reference (66 ops, `GET /operators` snapshot):
-
-  ```python
-  ops = json.loads(Path("references/wq_operators.json").read_text(encoding="utf-8"))
-  # o["name"], o["category"], o["scope"], o["definition"], o["description"]
-  ```
-
-  Refresh it rarely (operators barely change):
-
-  ```bash
-  ./.venv/bin/python scripts/fetch_operators.py
-  ```
-
-## 4. Workflow (from SKILL.md — read it before doing alpha research)
-
-1. Search/verify a field locally (`references/*.json`) before using it in an
-   expression; test with a simple `rank(field)` simulation first.
-2. Build candidate expressions from `SKILL.md` Section 4 (templates: `group_rank
-   + ts_rank`, SUBINDUSTRY neutralization is the default baseline).
-3. Simulate on BRAIN (`POST /simulations`), check IS metrics against Section 5
-   thresholds: Sharpe >= 1.25, Fitness >= 1.1, Turnover 1–20%, DD < 15%.
-4. Compute **daily-return** correlation vs. existing ACTIVE alphas (not cumulative
-   PnL); abs(corr) >= 0.7 → discard or rebuild.
-5. Submit, then re-verify `status == ACTIVE` (a 201 response is not success).
-6. After any BRAIN interaction, run `evolve_skill.py` (preview → review → `--apply`)
-   to distill lessons back into `SKILL.md`.
-
-## 5. Legacy WQ-Brain tooling (`legacy/wq_brain/`)
-
-The old WQ-Brain project (AbnerTeng/WorldQuant-Brain, 2023) is merged here with
-fixed bugs — see `legacy/wq_brain/README.md`. Shared session in
-`legacy/wq_brain/wq_session.py` resolves credentials from (in order):
-env vars `WQ_BRAIN_USERNAME`/`WQ_BRAIN_PASSWORD` → root `credential.txt`
-(JSON array) → `legacy/wq_brain/credentials.json` (JSON object, old format).
-All three are git-ignored.
+Useful checks:
 
 ```bash
-# Self-test credential resolution + login
-./.venv/bin/python legacy/wq_brain/wq_session.py
-
-# Batch-simulate expressions from CSV (results stream to data/results_*.csv)
-./.venv/bin/python legacy/wq_brain/batch_simulate.py [input.csv] [--workers 3]
-
-# Scrape UNSUBMITTED alphas that pass all IS checks -> data/scrape_*.csv
-./.venv/bin/python legacy/wq_brain/scrape_submittable.py [--min-sharpe 1.3]
-
-# Submit scraped alphas sharpe-first; stops at first SELF_CORRELATION PASS
-./.venv/bin/python legacy/wq_brain/submit_from_csv.py data/scrape_<ts>.csv
+./.venv/bin/python scripts/credential_crypto.py --status
+./.venv/bin/python scripts/credential_crypto.py --encrypt
 ```
 
-`commands.py` still generates expression batches (101 arxiv alphas, etc.);
-run from `legacy/wq_brain/` with the venv python and `sys.path.insert(0, '.')`.
-Everything `legacy/wq_brain/data/` produces (CSVs, logs) is git-ignored and
-account-linked — never commit or publish it.
+Never print, inspect, commit, or copy credential material into prompts, logs, tests, `research.db`, tracked Markdown, or issue/PR text. Treat `credential.txt` and `credential.key` as opaque secrets. Legacy credential formats exist only for `legacy/wq_brain/` compatibility.
 
-## 6. Files That Stay Local (git-ignored)
+## 2. Sources of truth
 
-- `credential.txt` — BRAIN credentials (encrypted)
-- `credential.key` — BRAIN encryption key
-- `alpha_db.json` — local alpha snapshot / PnL store
-- `batch_submit_results.json` — submission results
-- `research.db` (+ `-wal`/`-shm`) — candidate queue, simulation cache, submissions
+`research.db` is the durable local source of truth for candidates, simulations, submissions, ACTIVE-book state, transport events, and learned knowledge. It is git-ignored and may contain account-linked/private research state.
 
-Never commit these. Never publish raw alpha IDs, PnL series, or account-linked
-records; only sanitized general rules go into `SKILL.md`.
+Candidate identity is the canonical hash of normalized expression + settings (`scripts/canonical.py`). Reuse the database/cache instead of re-sending identical work to BRAIN.
+
+`alpha_db.json` and `scripts/evolve_skill.py` are legacy compatibility/reporting paths. They are not the canonical learning system.
+
+Tracked `SKILL.md` is reviewed public/SANITIZED guidance. Runtime research events must not be appended to it automatically. If `SKILL.md` itself needs a durable rule change, make that as a reviewed Git change/PR after the rule is evidenced and approved.
+
+## 3. Standard research workflow
+
+Start with local state and learned guidance:
+
+```bash
+./.venv/bin/python scripts/research_db.py status
+./.venv/bin/python scripts/knowledge_cli.py status
+./.venv/bin/python scripts/knowledge_cli.py recall "cash flow" --max-privacy SANITIZED
+```
+
+Queue validated candidates and inspect ranking before spending BRAIN capacity:
+
+```bash
+./.venv/bin/python scripts/research_db.py queue PATH.csv
+./.venv/bin/python scripts/sim_scheduler.py --dry-run
+./.venv/bin/python scripts/sim_scheduler.py --max-runtime 30
+```
+
+The scheduler uses the persistent queue/cache, bounded leases, retry/backoff, staged search, successive halving, and advisory ranking/surrogate signals. It keeps ordinary simulation work restart-safe. `scripts/multi_sim.py --status` reports whether multi-simulation is available; do not assume it is.
+
+Before submission, sync the complete ACTIVE book and require a fresh local correlation gate:
+
+```bash
+./.venv/bin/python scripts/correlation.py sync
+./.venv/bin/python scripts/correlation.py status
+./.venv/bin/python scripts/submission_worker.py --dry-run
+./.venv/bin/python scripts/submission_worker.py --require-correlation --max-submissions 1
+```
+
+Submission invariants:
+
+- local correlation uses aligned **daily returns**, never cumulative PnL;
+- the ACTIVE list must be fully paginated and fresh;
+- missing/short/flat/incomplete/stale correlation data is a hold, not a pass;
+- an ambiguous non-idempotent submission POST must reconcile against BRAIN before another POST;
+- `201`/accepted is not success; only `status == ACTIVE` is final success;
+- BRAIN `SELF_CORRELATION` remains the platform confirmation.
+
+## 4. Knowledge and learning
+
+The canonical learning path is:
+
+```text
+events -> scoped observations -> evidence-backed rule proposal
+       -> evaluation -> active/pinned rule
+```
+
+Use the agent-agnostic CLI:
+
+```bash
+./.venv/bin/python scripts/knowledge_cli.py rules --state active
+./.venv/bin/python scripts/knowledge_cli.py recall "analyst turnover" --max-privacy SANITIZED
+
+./.venv/bin/python scripts/knowledge_cli.py observe \
+  --subject-type signal_structure --subject-key STRUCTURE \
+  --claim simulation_outcome --value '{"is_pass":true}' \
+  --scope '{"region":"USA","universe":"TOP3000","delay":1}' \
+  --evidence-group CAMPAIGN_OR_LINEAGE
+
+./.venv/bin/python scripts/knowledge_cli.py propose \
+  --title "Scoped rule" --body "General sanitized guidance" \
+  --scope '{"region":"USA","universe":"TOP3000","delay":1}' \
+  --evidence OBS_ID:support
+
+./.venv/bin/python scripts/knowledge_cli.py evaluate RULE_ID
+./.venv/bin/python scripts/knowledge_cli.py transition RULE_ID active --expected-version VERSION
+```
+
+Rules:
+
+- observations are PRIVATE by default;
+- evidence must be scoped and grouped by an independence boundary so parameter clones do not manufacture confidence;
+- one simulation is not a global rule;
+- contradiction is first-class evidence;
+- `recall` may surface proposed rules; treat them as hypotheses. `active`/`pinned` rules are durable guidance;
+- user-owned/pinned guidance must not be autonomously rewritten;
+- credentials/SECRET data never enter the learning store;
+- only PUBLIC/SANITIZED material may enter tracked documentation.
+
+`scripts/evolve_skill.py` may be used only as legacy preview/reporting when needed. Do **not** use `evolve_skill.py --apply` as the learning workflow, and never use `--raw` to write tracked files.
+
+Do not rely on agent-specific memory, MCP, Codex, Pi, OpenCode, Hermes, or another runtime for correctness. The stable interface is files + SQLite + shell commands.
+
+## 5. Validation, ranking, and surrogate
+
+`scripts/validate.py` rejects malformed expressions, invalid settings, and unknown fields/operators within the local catalog scope before a simulation slot is spent. Warnings should lower priority rather than silently change semantics.
+
+`scripts/ranking.py` ranks candidates using interpretable quality/novelty/diversity/risk components. `scripts/surrogate.py` is advisory only:
+
+```bash
+./.venv/bin/python scripts/surrogate.py status
+./.venv/bin/python scripts/surrogate.py train --min-samples 5
+./.venv/bin/python scripts/surrogate.py evaluate
+./.venv/bin/python scripts/surrogate.py rank --limit 20
+```
+
+A model prediction may reorder candidates; it must not be the sole reason to reject one.
+
+## 6. Tests and changes
+
+Run the default offline suite before merging repository changes:
+
+```bash
+./.venv/bin/python -m pytest -q
+```
+
+Default tests must remain credential-free and network-free. Live BRAIN probes are explicit, bounded, manual operations.
+
+For tracked code/docs, use normal Git branches/PRs. Do not allow multiple agents to concurrently mutate the same tracked skill file outside Git review.
+
+## 7. Local/private files
+
+Never commit or publish:
+
+- `credential.txt`, `credential.key`, `.env`;
+- `research.db`, `research.db-wal`, `research.db-shm`;
+- `alpha_db.json`, `batch_submit_results.json`;
+- `.skill-history/`;
+- `legacy/wq_brain/data/*` generated account-linked outputs;
+- raw alpha IDs, exact private expressions, PnL series, or submission history.
+
+## 8. Legacy tooling
+
+`legacy/wq_brain/` is retained for compatibility and historical utilities. New queue/simulation/submission work should use the modern `scripts/` pipeline unless a legacy tool is specifically required.
+
+When touching legacy behavior, preserve its credential privacy and generated-output ignore rules, and run the relevant offline tests before using it live.
