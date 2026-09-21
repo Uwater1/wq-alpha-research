@@ -508,6 +508,86 @@ def _scopes_compatible(rule_scope: Mapping[str, Any], obs_scope: Mapping[str, An
     return True
 
 
+REPLAYABLE_CANDIDATE_FIELDS = frozenset({
+    "status", "is_pass", "sharpe", "fitness", "turnover", "self_corr",
+    "signal_family", "generation", "attempt_count", "expected_quality",
+    "novelty_score", "failure_risk", "mutation_type",
+})
+REPLAY_CONDITION_OPS = frozenset({
+    "eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "abs_lt", "abs_lte",
+})
+
+
+def _replay_condition_matches(row: Mapping[str, Any], condition: Mapping[str, Any]) -> bool:
+    """Evaluate one declarative candidate-filter condition for historical replay."""
+    field = str(condition.get("field") or "")
+    op = str(condition.get("op") or "")
+    if field not in REPLAYABLE_CANDIDATE_FIELDS:
+        raise ValueError(f"unsupported replay field: {field}")
+    if op not in REPLAY_CONDITION_OPS:
+        raise ValueError(f"unsupported replay operator: {op}")
+    actual = row.get(field)
+    expected = condition.get("value")
+    if op in {"in", "not_in"}:
+        if not isinstance(expected, (list, tuple, set)):
+            raise ValueError(f"replay operator {op} requires a list value")
+        matched = actual in expected
+        return matched if op == "in" else not matched
+    if op in {"eq", "ne"}:
+        matched = actual == expected
+        return matched if op == "eq" else not matched
+    if actual is None or expected is None:
+        return False
+    try:
+        left = float(actual)
+        right = float(expected)
+    except (TypeError, ValueError):
+        return False
+    if op == "lt":
+        return left < right
+    if op == "lte":
+        return left <= right
+    if op == "gt":
+        return left > right
+    if op == "gte":
+        return left >= right
+    if op == "abs_lt":
+        return abs(left) < right
+    if op == "abs_lte":
+        return abs(left) <= right
+    return False
+
+
+def _replay_metrics(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Compact quality/waste/diversity/turnover/correlation metrics for replay."""
+    items = list(rows)
+    count = len(items)
+    passes = sum(1 for row in items if bool(row.get("is_pass")))
+    families = {str(row.get("signal_family")) for row in items if row.get("signal_family")}
+
+    def mean_of(field: str, *, absolute: bool = False) -> float | None:
+        values: list[float] = []
+        for row in items:
+            value = row.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                values.append(abs(float(value)) if absolute else float(value))
+        return round(sum(values) / len(values), 6) if values else None
+
+    pass_rate = passes / count if count else 0.0
+    return {
+        "count": count,
+        "passes": passes,
+        "pass_rate": round(pass_rate, 6),
+        "wasted_rate": round(1.0 - pass_rate, 6) if count else None,
+        "distinct_families": len(families),
+        "diversity_ratio": round(len(families) / count, 6) if count else 0.0,
+        "mean_sharpe": mean_of("sharpe"),
+        "mean_fitness": mean_of("fitness"),
+        "mean_turnover": mean_of("turnover"),
+        "mean_abs_corr": mean_of("self_corr", absolute=True),
+    }
+
+
 def settings_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Build canonical settings from a CSV row (blank/absent cells fall back to defaults)."""
     return canonical.normalize_settings({column: row[column] for column in SETTINGS_COLUMNS if column in row})
@@ -2467,13 +2547,14 @@ class ResearchDB:
 
     def evaluate_rule(self, rule_id: int, *, min_support: int = 2,
                       min_independent_groups: int = 2, max_contradiction_ratio: float = 0.5) -> dict[str, Any]:
-        """Evaluate promotion readiness; this never promotes by itself.
+        """Evaluate promotion readiness without promoting.
 
-        Evidence sufficiency (support/contradiction/privacy over ``active``
-        observations only) is the executable gate. The historical behavioral
-        replay gate is recorded alongside it: free-text rules are advisory-only
-        (no executable effect to replay), while structured effects record the
-        replay dataset/version, metrics, baseline, and evaluator version.
+        Advisory free-text rules use the evidence/privacy gate only. Rules that
+        declare a structured provenance.effect are executable policy and must
+        also pass deterministic historical replay before they may become active.
+        Supported replay effects currently use kind=candidate_filter with
+        declarative conditions over stored candidate fields plus explicit
+        acceptance thresholds.
         """
         rule = self.get_rule(rule_id)
         if rule is None:
@@ -2484,33 +2565,137 @@ class ResearchDB:
         contradiction = [item for item in active_evidence if item["polarity"] == "contradiction"]
         support_groups = {str(item["independence_group"]) for item in support}
         ratio = len(contradiction) / max(len(support), 1)
-        passed = (
+        evidence_passed = (
             len(support) >= int(min_support)
             and len(support_groups) >= int(min_independent_groups)
             and ratio <= float(max_contradiction_ratio)
             and str(rule["privacy_class"]) in {"PUBLIC", "SANITIZED"}
         )
+
         provenance = rule.get("provenance") or {}
         effect = provenance.get("effect") if isinstance(provenance, dict) else None
-        settled = self.query(
-            "SELECT COUNT(*) AS n, MAX(id) AS max_id FROM candidates WHERE attempt_count > 0"
-        )[0]
+        rule_mode = "executable" if isinstance(effect, dict) and effect else "advisory"
         replay: dict[str, Any]
-        if not isinstance(effect, dict) or not effect:
-            replay = {"status": "advisory_only",
-                      "reason": "free-text rule carries no executable effect to replay",
-                      "evaluator": "replay-v1", "dataset": None, "baseline": None,
-                      "metrics": None, "result": None}
+        replay_passed = True
+
+        if rule_mode == "advisory":
+            replay = {
+                "status": "not_required",
+                "reason": "advisory rule has no executable effect",
+                "evaluator": "candidate-filter-replay-v1",
+                "dataset": None, "baseline": None, "metrics": None, "checks": None,
+                "result": None,
+            }
+        elif str(effect.get("kind") or "") != "candidate_filter":
+            replay_passed = False
+            replay = {
+                "status": "unsupported_effect",
+                "reason": f"unsupported executable effect kind: {effect.get('kind')!r}",
+                "evaluator": "candidate-filter-replay-v1",
+                "dataset": None, "baseline": None, "metrics": None, "checks": None,
+                "result": False,
+            }
         else:
-            replay = {"status": "insufficient_data",
-                      "reason": "structured replay requires a frozen historical candidate/event set",
-                      "evaluator": "replay-v1",
-                      "dataset": {"settled_candidates": int(settled.get("n") or 0),
-                                  "max_candidate_id": settled.get("max_id")},
-                      "baseline": None, "metrics": None, "result": None,
-                      "effect_kind": str(effect.get("kind") or "unknown")}
+            conditions = effect.get("conditions")
+            acceptance = effect.get("acceptance")
+            if not isinstance(conditions, list) or not conditions or not isinstance(acceptance, dict) or not acceptance:
+                replay_passed = False
+                replay = {
+                    "status": "invalid_spec",
+                    "reason": "candidate_filter requires non-empty conditions and acceptance",
+                    "evaluator": "candidate-filter-replay-v1",
+                    "dataset": None, "baseline": None, "metrics": None, "checks": None,
+                    "result": False,
+                }
+            else:
+                historical = self.query(
+                    """
+                    SELECT id, status, is_pass, sharpe, fitness, turnover, self_corr,
+                           signal_family, generation, attempt_count, expected_quality,
+                           novelty_score, failure_risk, mutation_type
+                    FROM candidates
+                    WHERE attempt_count > 0
+                      AND status NOT IN ('QUEUED','RETRY','SIMULATING')
+                    ORDER BY id
+                    """
+                )
+                try:
+                    if not all(isinstance(condition, Mapping) for condition in conditions):
+                        raise ValueError("every replay condition must be an object")
+                    selected = [
+                        row for row in historical
+                        if all(_replay_condition_matches(row, condition) for condition in conditions)
+                    ]
+                except ValueError as exc:
+                    replay_passed = False
+                    replay = {
+                        "status": "invalid_spec", "reason": str(exc),
+                        "evaluator": "candidate-filter-replay-v1",
+                        "dataset": {"count": len(historical),
+                                    "max_candidate_id": max((int(r["id"]) for r in historical), default=None)},
+                        "baseline": _replay_metrics(historical), "metrics": None,
+                        "checks": None, "result": False,
+                    }
+                else:
+                    baseline = _replay_metrics(historical)
+                    metrics = _replay_metrics(selected)
+                    checks: dict[str, bool] = {}
+
+                    def delta(metric: str) -> float | None:
+                        a, b = metrics.get(metric), baseline.get(metric)
+                        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+                            return None
+                        return float(a) - float(b)
+
+                    if "min_selected" in acceptance:
+                        checks["min_selected"] = metrics["count"] >= int(acceptance["min_selected"])
+                    if "min_pass_rate_delta" in acceptance:
+                        value = delta("pass_rate")
+                        checks["min_pass_rate_delta"] = value is not None and value >= float(acceptance["min_pass_rate_delta"])
+                    if "max_wasted_rate_delta" in acceptance:
+                        value = delta("wasted_rate")
+                        checks["max_wasted_rate_delta"] = value is not None and value <= float(acceptance["max_wasted_rate_delta"])
+                    if "min_diversity_ratio" in acceptance:
+                        checks["min_diversity_ratio"] = (
+                            float(metrics["diversity_ratio"]) >= float(acceptance["min_diversity_ratio"])
+                        )
+                    if "min_diversity_delta" in acceptance:
+                        value = delta("diversity_ratio")
+                        checks["min_diversity_delta"] = value is not None and value >= float(acceptance["min_diversity_delta"])
+                    if "max_mean_turnover_delta" in acceptance:
+                        value = delta("mean_turnover")
+                        checks["max_mean_turnover_delta"] = value is not None and value <= float(acceptance["max_mean_turnover_delta"])
+                    if "max_mean_abs_corr_delta" in acceptance:
+                        value = delta("mean_abs_corr")
+                        checks["max_mean_abs_corr_delta"] = value is not None and value <= float(acceptance["max_mean_abs_corr_delta"])
+                    if "min_mean_sharpe_delta" in acceptance:
+                        value = delta("mean_sharpe")
+                        checks["min_mean_sharpe_delta"] = value is not None and value >= float(acceptance["min_mean_sharpe_delta"])
+                    if "min_mean_fitness_delta" in acceptance:
+                        value = delta("mean_fitness")
+                        checks["min_mean_fitness_delta"] = value is not None and value >= float(acceptance["min_mean_fitness_delta"])
+
+                    replay_passed = bool(historical) and bool(selected) and bool(checks) and all(checks.values())
+                    replay = {
+                        "status": "passed" if replay_passed else "failed",
+                        "evaluator": "candidate-filter-replay-v1",
+                        "dataset": {
+                            "count": len(historical),
+                            "max_candidate_id": max((int(r["id"]) for r in historical), default=None),
+                        },
+                        "baseline": baseline,
+                        "metrics": metrics,
+                        "checks": checks,
+                        "result": replay_passed,
+                        "effect": effect,
+                    }
+
+        passed = evidence_passed and replay_passed
         evaluation = {
-            "passed": passed, "support": len(support), "contradiction": len(contradiction),
+            "passed": passed,
+            "rule_mode": rule_mode,
+            "evidence_passed": evidence_passed,
+            "support": len(support), "contradiction": len(contradiction),
             "independent_groups": len(support_groups), "contradiction_ratio": ratio,
             "active_evidence": len(active_evidence),
             "ignored_non_active_evidence": len(rule["evidence"]) - len(active_evidence),
@@ -2704,12 +2889,21 @@ class ResearchDB:
         """
         rows = self.query(
             """
-            SELECT e.*, c.signal_family, c.settings_json, c.sharpe, c.fitness, c.turnover,
+            SELECT e.*, c.id AS candidate_row_id, s.id AS submission_row_id,
+                   c.signal_family, c.settings_json, c.sharpe, c.fitness, c.turnover,
                    c.skeleton_hash, c.expression_hash, c.parent_id
-            FROM events e LEFT JOIN candidates c
-              ON e.entity IN ('submission','candidate') AND CAST(e.entity_id AS INTEGER)=c.id
+            FROM events e
+            LEFT JOIN submissions s
+              ON e.entity='submission' AND CAST(e.entity_id AS INTEGER)=s.id
+            LEFT JOIN candidates c
+              ON c.id = CASE
+                  WHEN e.entity='submission' THEN s.candidate_id
+                  WHEN e.entity='candidate' THEN CAST(e.entity_id AS INTEGER)
+                  ELSE NULL
+              END
             LEFT JOIN knowledge_observations o ON o.source_event_id=e.id
-            WHERE e.event IN ('result','status') AND o.id IS NULL
+            WHERE e.entity IN ('submission','candidate')
+              AND e.event IN ('result','status') AND o.id IS NULL
             ORDER BY e.id LIMIT ?
             """, (max(int(limit), 0),)
         )
@@ -2745,41 +2939,48 @@ class ResearchDB:
                 scope=scope, evidence_group=f"lineage:{root}",
                 provenance={"source": "events", "event_id": row["id"], "event": row.get("event")},
                 source_event_id=int(row["id"]),
-                candidate_id=int(row["entity_id"]) if str(row.get("entity_id") or "").isdigit() else None,
-                submission_id=row.get("submission_id"), privacy_class="PRIVATE",
+                candidate_id=int(row["candidate_row_id"]) if row.get("candidate_row_id") is not None else None,
+                submission_id=(
+                    int(row["submission_row_id"]) if row.get("submission_row_id") is not None
+                    else row.get("submission_id")
+                ),
+                privacy_class="PRIVATE",
             )
             created += 1
         return {"created": created, "skipped": skipped, "scanned": len(rows)}
 
     def refresh_knowledge_aggregates(self) -> dict[str, int]:
-        """Rebuild per-subject family/lineage aggregates from active observations."""
+        """Rebuild aggregates without mixing observations from different scopes."""
         rows = self.query(
             "SELECT subject_type, subject_key, scope_json, value_json FROM knowledge_observations "
             "WHERE lifecycle_state='active'"
         )
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
             try:
                 scope = json.loads(row.get("scope_json") or "{}")
             except ValueError:
                 scope = {}
+            if not isinstance(scope, dict):
+                scope = {}
             try:
                 value = json.loads(row.get("value_json") or "{}")
             except ValueError:
                 value = {}
-            key = (str(row["subject_type"]), str(row["subject_key"]))
+            if not isinstance(value, dict):
+                value = {}
+            scope_raw = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+            key = (str(row["subject_type"]), str(row["subject_key"]), scope_raw)
             grouped.setdefault(key, []).append({"scope": scope, "value": value})
         updated = 0
-        for (subject_type, subject_key), items in grouped.items():
+        for (subject_type, subject_key, scope_raw), items in grouped.items():
             passes = sum(1 for item in items if item["value"].get("is_pass") is True
                          or str(item["value"].get("status") or "") == "ACTIVE")
-            scope: dict[str, Any] = {}
-            for item in items:
-                for key, value in (item["scope"] or {}).items():
-                    scope.setdefault(key, value)
+            scope = json.loads(scope_raw)
+            scope_token = hashlib.sha256(scope_raw.encode("utf-8")).hexdigest()[:16]
             self.upsert_knowledge_aggregate(
-                aggregate_key=f"{subject_type}:{subject_key}", subject_type=subject_type,
-                subject_key=subject_key, scope=scope,
+                aggregate_key=f"{subject_type}:{subject_key}:{scope_token}",
+                subject_type=subject_type, subject_key=subject_key, scope=scope,
                 metrics={"samples": len(items), "passes": passes,
                          "pass_rate": round(passes / max(len(items), 1), 4)},
                 sample_count=len(items), privacy_class="PRIVATE",
