@@ -284,12 +284,13 @@ class SubmissionWorker:
         """Persist and clear every HTTP attempt from one logical submission operation."""
         drain = getattr(self.client, "drain_attempts", None)
         attempts = []
-        if callable(drain):
+        modern_buffer = callable(drain)
+        if modern_buffer:
             try:
                 attempts = drain() or []
             except Exception:
                 attempts = []
-        if not attempts:
+        if not attempts and not modern_buffer:
             request = getattr(self.client, "last_request", {}) or {}
             if request:
                 attempts = [{
