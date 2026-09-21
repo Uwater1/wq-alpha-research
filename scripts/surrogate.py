@@ -91,13 +91,14 @@ def _token_features(row: Mapping[str, Any]) -> dict[str, float]:
 
 
 def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Attach only parent outcomes that existed before the child was queued.
+    """Attach only parent outcomes that existed before the child entered the queue.
 
-    Current parent state is not enough: a parent that settles after the child was
-    created must not retroactively become a feature for that historical child.
+    Event IDs are the causal clock. Timestamps are second-granularity and can tie,
+    so current parent state alone must never retroactively enrich an older child.
     """
     enriched: list[dict[str, Any]] = []
-    cache: dict[int, dict[str, Any]] = {}
+    parent_cache: dict[int, dict[str, Any]] = {}
+    child_queue_events: dict[int, int | None] = {}
     for row in rows:
         item = dict(row)
         parent_id = row.get("parent_id")
@@ -107,25 +108,37 @@ def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, 
             except (TypeError, ValueError):
                 pid = None
             if pid is not None:
-                if pid not in cache:
+                if pid not in parent_cache:
                     try:
                         parent = db.get_candidate(pid)
                     except (AttributeError, KeyError):
                         parent = None
                     payload = dict(parent) if parent else {}
-                    if payload.get("canonical_key"):
-                        completed = db.query(
-                            "SELECT completed_at FROM simulations "
-                            "WHERE canonical_key=? AND status='DONE' LIMIT 1",
-                            (payload["canonical_key"],),
-                        )
-                        payload["_outcome_at"] = completed[0].get("completed_at") if completed else None
-                    cache[pid] = payload
-                parent = cache[pid]
-                child_created = str(row.get("created_at") or "")
-                parent_outcome = str(parent.get("_outcome_at") or "")
-                available_at_queue = bool(
-                    child_created and parent_outcome and parent_outcome <= child_created
+                    result_event = db.query(
+                        "SELECT MIN(id) AS event_id FROM events "
+                        "WHERE entity='simulation' AND CAST(entity_id AS INTEGER)=? AND event='result'",
+                        (pid,),
+                    )
+                    payload["_outcome_event_id"] = (
+                        result_event[0].get("event_id") if result_event else None
+                    )
+                    parent_cache[pid] = payload
+                parent = parent_cache[pid]
+
+                child_id = int(row.get("id") or 0)
+                if child_id not in child_queue_events:
+                    queued = db.query(
+                        "SELECT MIN(id) AS event_id FROM events "
+                        "WHERE entity='candidate' AND CAST(entity_id AS INTEGER)=? AND event='queued'",
+                        (child_id,),
+                    )
+                    child_queue_events[child_id] = queued[0].get("event_id") if queued else None
+                parent_event = parent.get("_outcome_event_id")
+                child_event = child_queue_events[child_id]
+                available_at_queue = (
+                    isinstance(parent_event, int)
+                    and isinstance(child_event, int)
+                    and parent_event < child_event
                 )
                 if parent and available_at_queue:
                     is_pass = parent.get("is_pass")
@@ -144,13 +157,19 @@ def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, 
 def _rows(db: Any, *, training: bool) -> list[dict[str, Any]]:
     if training:
         query = """
-            SELECT c.*, s.completed_at AS outcome_at
+            SELECT c.*, s.completed_at AS outcome_at,
+                   (
+                       SELECT MIN(e.id) FROM events e
+                       WHERE e.entity='simulation'
+                         AND CAST(e.entity_id AS INTEGER)=c.id
+                         AND e.event='result'
+                   ) AS outcome_event_id
             FROM candidates c
             JOIN simulations s ON s.canonical_key=c.canonical_key
             WHERE c.status IN ('IS_PASS','CORR_PASS','SUBMISSION_READY','SUBMITTING','ACTIVE','REJECTED')
               AND c.attempt_count > 0
               AND s.completed_at IS NOT NULL
-            ORDER BY s.completed_at, c.id
+            ORDER BY s.completed_at, outcome_event_id, c.id
         """
     else:
         query = "SELECT * FROM candidates WHERE status IN ('QUEUED','RETRY','SIMULATING') ORDER BY id"
@@ -280,7 +299,11 @@ def evaluate(db: Any, *, top_k: int = 10, penalty: float = 1.0) -> dict[str, Any
     """
     rows = sorted(
         _enrich_with_parents(db, _rows(db, training=True)),
-        key=lambda r: (str(r.get("outcome_at") or ""), int(r.get("id") or 0)),
+        key=lambda r: (
+            str(r.get("outcome_at") or ""),
+            int(r.get("outcome_event_id") or 0),
+            int(r.get("id") or 0),
+        ),
     )
     total = len(rows)
     if not rows or load(db) is None:
@@ -313,6 +336,8 @@ def evaluate(db: Any, *, top_k: int = 10, penalty: float = 1.0) -> dict[str, Any
             "test_ids": [int(r["id"]) for r in test_rows],
             "train_max_completed_at": train_rows[-1].get("outcome_at"),
             "test_min_completed_at": test_rows[0].get("outcome_at"),
+            "train_max_outcome_event_id": int(train_rows[-1].get("outcome_event_id") or 0),
+            "test_min_outcome_event_id": int(test_rows[0].get("outcome_event_id") or 0),
             "train_last_id": int(train_rows[-1]["id"]),
             "test_first_id": int(test_rows[0]["id"]),
         },
