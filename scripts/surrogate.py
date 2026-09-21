@@ -60,7 +60,8 @@ def _token_features(row: Mapping[str, Any]) -> dict[str, float]:
     family = str(row.get("signal_family") or "unknown")
     features[f"family:{family}"] = 1.0
     features["generation"] = float(row.get("generation") or 0)
-    features["attempt_count"] = float(row.get("attempt_count") or 0)
+    # attempt_count is intentionally excluded: the final retry count of a settled
+    # training row was not known at the equivalent pre-simulation prediction point.
     features["near_duplicate"] = 1.0 if row.get("near_duplicate_of") else 0.0
     # Lineage / mutation signals known at queue time (pre-simulation).
     mutation_type = row.get("mutation_type")
