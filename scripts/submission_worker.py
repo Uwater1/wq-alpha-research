@@ -235,8 +235,15 @@ class SubmissionWorker:
                 self.reconciled += 1
                 continue
 
-            status = self.client.alpha_status(str(alpha_id))
-            checks = self.client.submit_checks(str(alpha_id))
+            candidate_id = int(row["candidate_id"])
+            status = self._call_with_transport(
+                operation="submission.reconcile_status", submission_id=submission_id,
+                candidate_id=candidate_id, call=lambda: self.client.alpha_status(str(alpha_id)),
+            )
+            checks = self._call_with_transport(
+                operation="submission.reconcile_checks", submission_id=submission_id,
+                candidate_id=candidate_id, call=lambda: self.client.submit_checks(str(alpha_id)),
+            )
             verdict = _self_correlation_verdict(checks)
             if status == "ACTIVE":
                 self.db.finish_submission(submission_id, "ACTIVE", message="reconciled: confirmed ACTIVE",
@@ -272,6 +279,57 @@ class SubmissionWorker:
         candidate = self.db.get_candidate(candidate_id)
         return str(candidate["brain_alpha_id"]) if candidate and candidate.get("brain_alpha_id") else None
 
+    def _log_transport(self, *, operation: str, submission_id: int,
+                       candidate_id: int, result_class: str) -> None:
+        """Persist and clear every HTTP attempt from one logical submission operation."""
+        drain = getattr(self.client, "drain_attempts", None)
+        attempts = []
+        if callable(drain):
+            try:
+                attempts = drain() or []
+            except Exception:
+                attempts = []
+        if not attempts:
+            request = getattr(self.client, "last_request", {}) or {}
+            if request:
+                attempts = [{
+                    "http_status": request.get("http_status"),
+                    "error_category": request.get("error_category"),
+                    "attempt": request.get("retry_count", 0),
+                    "latency_ms": request.get("latency_ms"),
+                    "rate_limit_seconds": request.get("rate_limit_seconds"),
+                    "final": True,
+                }]
+        for entry in attempts:
+            self.db.log_event(
+                "transport", submission_id, "http", operation=operation,
+                candidate_id=candidate_id, submission_id=submission_id,
+                http_status=entry.get("http_status"),
+                error_category=entry.get("error_category"),
+                retry_count=int(entry.get("attempt") or 0),
+                latency_ms=entry.get("latency_ms"),
+                rate_limit_seconds=entry.get("rate_limit_seconds"),
+                result_class=result_class if entry.get("final", True) else "retry",
+            )
+
+    def _call_with_transport(self, *, operation: str, submission_id: int,
+                             candidate_id: int, call: Callable[[], Any]) -> Any:
+        """Run one logical BRAIN operation and flush its telemetry on success or failure."""
+        try:
+            result = call()
+        except Exception:
+            self._log_transport(operation=operation, submission_id=submission_id,
+                                candidate_id=candidate_id, result_class="error")
+            raise
+        result_class = (
+            str(result.get("outcome"))
+            if isinstance(result, Mapping) and result.get("outcome")
+            else "ok"
+        )
+        self._log_transport(operation=operation, submission_id=submission_id,
+                            candidate_id=candidate_id, result_class=result_class)
+        return result
+
     # -- one submission ----------------------------------------------------
 
     def _process(self, submission: Mapping[str, Any]) -> None:
@@ -299,33 +357,11 @@ class SubmissionWorker:
         # Write-ahead marker: if this process dies during the POST, recovery knows the
         # outcome is unknown and must be reconciled instead of blindly retried.
         self.db.mark_submission_posted(submission_id)
-        outcome = self.client.submit_alpha(alpha_id)
-        attempts = []
-        drain = getattr(self.client, "drain_attempts", None)
-        if callable(drain):
-            try:
-                attempts = drain() or []
-            except Exception:
-                attempts = []
-        if attempts:
-            for entry in attempts:
-                self.db.log_event(
-                    "transport", submission_id, "http", operation="submission.submit",
-                    candidate_id=int(candidate["id"]), submission_id=submission_id,
-                    http_status=entry.get("http_status"), error_category=entry.get("error_category"),
-                    retry_count=int(entry.get("attempt") or 0), latency_ms=entry.get("latency_ms"),
-                    rate_limit_seconds=entry.get("rate_limit_seconds"),
-                    result_class=outcome.get("outcome") if entry.get("final") else "retry",
-                )
-        else:
-            request = getattr(self.client, "last_request", {}) or {}
-            self.db.log_event(
-                "transport", submission_id, "http", operation="submission.submit",
-                candidate_id=int(candidate["id"]), submission_id=submission_id,
-                http_status=request.get("http_status"), error_category=request.get("error_category"),
-                retry_count=int(request.get("retry_count") or 0), latency_ms=request.get("latency_ms"),
-                rate_limit_seconds=request.get("rate_limit_seconds"), result_class=outcome.get("outcome"),
-            )
+        candidate_id = int(candidate["id"])
+        outcome = self._call_with_transport(
+            operation="submission.submit", submission_id=submission_id,
+            candidate_id=candidate_id, call=lambda: self.client.submit_alpha(alpha_id),
+        )
         print(f"[submit] alpha {_mask(alpha_id)}: {outcome['outcome']}")
         if outcome["outcome"] == "uncertain":
             # The POST may have reached BRAIN even though its response was lost. Do not
@@ -345,7 +381,9 @@ class SubmissionWorker:
             return
 
         self.submitted += 1
-        status, message, max_corr = self._await_result(alpha_id, submission_id)
+        status, message, max_corr = self._await_result(
+            alpha_id, submission_id, candidate_id=int(candidate["id"])
+        )
         self.db.finish_submission(submission_id, status, message=message, max_corr=max_corr,
                                   brain_alpha_id=alpha_id)
         if status == "ACTIVE":
@@ -355,13 +393,17 @@ class SubmissionWorker:
         else:
             self.rejected += 1
 
-    def _await_result(self, alpha_id: str, submission_id: int) -> tuple[str, str, float | None]:
+    def _await_result(self, alpha_id: str, submission_id: int, *,
+                          candidate_id: int) -> tuple[str, str, float | None]:
         """Poll within a bounded window; never predict a verdict we did not read."""
         max_corr: float | None = None
         for _ in range(self.max_polls):
             if self._runtime_exceeded():
                 return "CHECK_PENDING", "run out of time while checks were pending", max_corr
-            checks = self.client.submit_checks(alpha_id)
+            checks = self._call_with_transport(
+                operation="submission.poll_checks", submission_id=submission_id,
+                candidate_id=candidate_id, call=lambda: self.client.submit_checks(alpha_id),
+            )
             self_corr = next((c for c in checks if c.get("name") == "SELF_CORRELATION"), None)
             if self_corr is not None:
                 value = self_corr.get("value")
@@ -370,14 +412,20 @@ class SubmissionWorker:
                     return "SELF_CORR_FAIL", "platform SELF_CORRELATION check failed", max_corr
                 if str(self_corr.get("result", "")).upper() == "PASS":
                     break
-            status = self.client.alpha_status(alpha_id)
+            status = self._call_with_transport(
+                operation="submission.poll_status", submission_id=submission_id,
+                candidate_id=candidate_id, call=lambda: self.client.alpha_status(alpha_id),
+            )
             if status == "ACTIVE":
                 return "ACTIVE", "confirmed ACTIVE", max_corr
             if status in ("REJECTED", "DELETED"):
                 return "PLATFORM_REJECTED", f"alpha status={status}", max_corr
             self._sleep(self.poll_interval)
 
-        status = self.client.alpha_status(alpha_id)
+        status = self._call_with_transport(
+            operation="submission.final_status", submission_id=submission_id,
+            candidate_id=candidate_id, call=lambda: self.client.alpha_status(alpha_id),
+        )
         if status == "ACTIVE":
             return "ACTIVE", "confirmed ACTIVE", max_corr
         if status in ("REJECTED", "DELETED"):
