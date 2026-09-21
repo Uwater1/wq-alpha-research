@@ -9,6 +9,7 @@ import pytest
 
 import brain_api
 import research_db as rdb
+import sim_scheduler
 import skill_manager
 import surrogate
 
@@ -315,3 +316,157 @@ def test_production_like_review_worker_from_events(db):
     assert all(db.get_rule(item["rule_id"])["state"] == "proposed"
                for item in report["proposals"])
     assert not db.recall_knowledge("rank", max_privacy="PRIVATE")
+
+
+def test_executable_rule_requires_real_passing_replay(db):
+    for i in range(8):
+        _settle(db, f"rank(close) + {i}", i % 2 == 0)
+    first = _obs(db, "campaign-a")
+    second = _obs(db, "campaign-b")
+    rule_id = db.propose_rule(
+        title="Filter high-turnover candidates",
+        body="Executable policy: keep the historically stronger low-turnover slice.",
+        scope={"region": "USA", "universe": "TOP3000"},
+        evidence=[(first, "support"), (second, "support")],
+        provenance={
+            "source": "issue5",
+            "effect": {
+                "kind": "candidate_filter",
+                "conditions": [{"field": "turnover", "op": "lte", "value": 0.10}],
+                "acceptance": {
+                    "min_selected": 2,
+                    "min_pass_rate_delta": 0.20,
+                    "max_wasted_rate_delta": 0.0,
+                    "max_mean_turnover_delta": 0.0,
+                },
+            },
+        },
+    )
+    evaluation = db.evaluate_rule(rule_id)
+    assert evaluation["rule_mode"] == "executable"
+    assert evaluation["evidence_passed"] is True
+    assert evaluation["replay"]["status"] == "passed"
+    assert evaluation["replay"]["result"] is True
+    assert evaluation["passed"] is True
+
+    unsupported = db.propose_rule(
+        title="Unsupported executable rule",
+        body="Must not promote without an executable replay evaluator.",
+        scope={"region": "USA", "universe": "TOP3000"},
+        evidence=[(first, "support"), (second, "support")],
+        provenance={"effect": {"kind": "priority_adjustment", "amount": 1.0}},
+    )
+    blocked = db.evaluate_rule(unsupported)
+    assert blocked["evidence_passed"] is True
+    assert blocked["replay"]["status"] == "unsupported_effect"
+    assert blocked["passed"] is False
+    with pytest.raises(ValueError, match="evaluation gate"):
+        db.transition_rule(unsupported, "active", expected_version=1)
+
+
+def test_submission_observation_resolves_submission_to_real_candidate(db):
+    _settle(db, "rank(open) + 100", True)  # candidate id 1; never submitted
+    target = db.queue_candidate("rank(close) + 200", {"decay": 6})
+    claimed = db.claim_simulation("seed", candidate_id=target.candidate_id)
+    db.record_simulation_result(
+        candidate_id=claimed["id"], status="DONE",
+        metrics={"sharpe": 1.8, "fitness": 1.4, "turnover": 0.05},
+        checks=[{"name": "LOW_SHARPE", "result": "PASS"}], brain_alpha_id="TARGET2",
+    )
+    submission_id = db.enqueue_submission(target.candidate_id)
+    submission = db.claim_submission("submitter")
+    assert submission["id"] == submission_id
+    assert submission_id != target.candidate_id  # catches the old id-domain join bug
+    db.finish_submission(submission_id, "ACTIVE", brain_alpha_id="TARGET2")
+
+    report = db.materialize_submission_observations()
+    assert report["created"] >= 1
+    observations = db.observations(claim="submission_outcome")
+    active = [row for row in observations if row["value"].get("status") == "ACTIVE"]
+    assert active
+    assert active[-1]["candidate_id"] == target.candidate_id
+    assert active[-1]["submission_id"] == submission_id
+    assert active[-1]["subject_key"] != f"candidate:{submission_id}"
+
+
+def test_knowledge_aggregates_never_mix_scopes(db):
+    common = dict(
+        subject_type="signal_structure", subject_key="same-skeleton",
+        claim="simulation_outcome", value={"is_pass": True},
+        provenance={"source": "scope-test"}, privacy_class="PRIVATE",
+    )
+    db.record_observation(scope={"region": "USA", "universe": "TOP3000"},
+                          evidence_group="usa-a", **common)
+    db.record_observation(scope={"region": "CHN", "universe": "TOP3000"},
+                          evidence_group="chn-a", **common)
+    report = db.refresh_knowledge_aggregates()
+    assert report["aggregates"] == 2
+    rows = db.query(
+        "SELECT aggregate_key, scope_json, sample_count FROM knowledge_aggregates "
+        "WHERE subject_key='same-skeleton' ORDER BY aggregate_key"
+    )
+    assert len(rows) == 2
+    scopes = {json.loads(row["scope_json"])["region"] for row in rows}
+    assert scopes == {"USA", "CHN"}
+    assert all(int(row["sample_count"]) == 1 for row in rows)
+
+
+def test_autonomous_skill_application_requires_both_cas_inputs(tmp_path, db):
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("# Router\n", encoding="utf-8")
+    sha = skill_manager.read_skill(skill)[1]
+    rule_id = _evaluated_rule(db)
+    version = int(db.get_rule(rule_id)["version"])
+    with pytest.raises(ValueError, match="expected_rule_version"):
+        skill_manager.apply_evaluated_rule(db, skill, rule_id, expected_sha=sha)
+    with pytest.raises(ValueError, match="expected_sha"):
+        skill_manager.apply_evaluated_rule(
+            db, skill, rule_id, expected_rule_version=version
+        )
+
+
+def test_surrogate_excludes_final_attempt_count_from_presim_features():
+    features = surrogate._token_features({
+        "expression": "rank(close)",
+        "attempt_count": 99,
+        "generation": 2,
+    })
+    assert "attempt_count" not in features
+    assert features["generation"] == 2.0
+
+
+def test_scheduler_persists_terminal_rate_limit_attempt(db):
+    outcome = db.queue_candidate("rank(close) + 999", {"decay": 6})
+    candidate = db.claim_simulation("scheduler-test", candidate_id=outcome.candidate_id)
+
+    class Client:
+        def __init__(self):
+            self.attempt_history = []
+            self.last_request = {}
+
+        def submit(self, expression, settings, candidate_id=None):
+            self.attempt_history.append({
+                "operation": "POST /simulations", "attempt": 0, "http_status": 429,
+                "error_category": "rate_limit", "latency_ms": 1.0,
+                "rate_limit_seconds": 7.0, "final": True,
+            })
+            raise brain_api.RateLimitError("rate limited", 7.0)
+
+        def drain_attempts(self):
+            out = list(self.attempt_history)
+            self.attempt_history = []
+            return out
+
+    scheduler = sim_scheduler.SimulationScheduler(
+        db, Client(), adopt_orphans=False, halving=False, staged_search=False,
+        sleep=lambda _: None,
+    )
+    assert scheduler.start(candidate) is False
+    events = db.query(
+        "SELECT * FROM events WHERE entity='transport' AND candidate_id=? ORDER BY id",
+        (outcome.candidate_id,),
+    )
+    assert len(events) == 1
+    assert events[0]["http_status"] == 429
+    assert events[0]["error_category"] == "rate_limit"
+    assert events[0]["operation"] == "simulation.submit"
