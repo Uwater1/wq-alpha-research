@@ -91,7 +91,11 @@ def _token_features(row: Mapping[str, Any]) -> dict[str, float]:
 
 
 def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Attach parent outcome metrics (pre-simulation knowledge) for lineage features."""
+    """Attach only parent outcomes that existed before the child was queued.
+
+    Current parent state is not enough: a parent that settles after the child was
+    created must not retroactively become a feature for that historical child.
+    """
     enriched: list[dict[str, Any]] = []
     cache: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -108,9 +112,22 @@ def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, 
                         parent = db.get_candidate(pid)
                     except (AttributeError, KeyError):
                         parent = None
-                    cache[pid] = dict(parent) if parent else {}
+                    payload = dict(parent) if parent else {}
+                    if payload.get("canonical_key"):
+                        completed = db.query(
+                            "SELECT completed_at FROM simulations "
+                            "WHERE canonical_key=? AND status='DONE' LIMIT 1",
+                            (payload["canonical_key"],),
+                        )
+                        payload["_outcome_at"] = completed[0].get("completed_at") if completed else None
+                    cache[pid] = payload
                 parent = cache[pid]
-                if parent:
+                child_created = str(row.get("created_at") or "")
+                parent_outcome = str(parent.get("_outcome_at") or "")
+                available_at_queue = bool(
+                    child_created and parent_outcome and parent_outcome <= child_created
+                )
+                if parent and available_at_queue:
                     is_pass = parent.get("is_pass")
                     if isinstance(is_pass, bool):
                         item["parent_is_pass"] = float(is_pass)
@@ -127,10 +144,13 @@ def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, 
 def _rows(db: Any, *, training: bool) -> list[dict[str, Any]]:
     if training:
         query = """
-            SELECT * FROM candidates
-            WHERE status IN ('IS_PASS','CORR_PASS','SUBMISSION_READY','SUBMITTING','ACTIVE','REJECTED')
-              AND attempt_count > 0
-            ORDER BY id
+            SELECT c.*, s.completed_at AS outcome_at
+            FROM candidates c
+            JOIN simulations s ON s.canonical_key=c.canonical_key
+            WHERE c.status IN ('IS_PASS','CORR_PASS','SUBMISSION_READY','SUBMITTING','ACTIVE','REJECTED')
+              AND c.attempt_count > 0
+              AND s.completed_at IS NOT NULL
+            ORDER BY s.completed_at, c.id
         """
     else:
         query = "SELECT * FROM candidates WHERE status IN ('QUEUED','RETRY','SIMULATING') ORDER BY id"
@@ -258,7 +278,10 @@ def evaluate(db: Any, *, top_k: int = 10, penalty: float = 1.0) -> dict[str, Any
     test slice. Small samples report ``insufficient_oos_data`` instead of a
     misleading in-sample metric. Split boundaries persist with the report.
     """
-    rows = sorted(_enrich_with_parents(db, _rows(db, training=True)), key=lambda r: int(r.get("id") or 0))
+    rows = sorted(
+        _enrich_with_parents(db, _rows(db, training=True)),
+        key=lambda r: (str(r.get("outcome_at") or ""), int(r.get("id") or 0)),
+    )
     total = len(rows)
     if not rows or load(db) is None:
         return {"available": False, "samples": total}
@@ -285,10 +308,14 @@ def evaluate(db: Any, *, top_k: int = 10, penalty: float = 1.0) -> dict[str, Any
     return {
         "available": True, "oos": True, "samples": total,
         "train_samples": len(train_rows), "test_samples": len(test_rows),
-        "split": {"train_ids": [int(r["id"]) for r in train_rows],
-                  "test_ids": [int(r["id"]) for r in test_rows],
-                  "train_max_id": int(train_rows[-1]["id"]),
-                  "test_min_id": int(test_rows[0]["id"])},
+        "split": {
+            "train_ids": [int(r["id"]) for r in train_rows],
+            "test_ids": [int(r["id"]) for r in test_rows],
+            "train_max_completed_at": train_rows[-1].get("outcome_at"),
+            "test_min_completed_at": test_rows[0].get("outcome_at"),
+            "train_last_id": int(train_rows[-1]["id"]),
+            "test_first_id": int(test_rows[0]["id"]),
+        },
         "top_k": len(top),
         "top_pass_recall": round(sum(1 for i in top if test_actual[i]) / max(sum(1 for v in test_actual if v), 1), 6),
         "top_pass_rate": round(sum(1 for i in top if test_actual[i]) / max(len(top), 1), 6),
