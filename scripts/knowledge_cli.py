@@ -211,13 +211,15 @@ def main(argv: list[str] | None = None) -> int:
                 rendered = []
                 for mutation in mutations:
                     item = dict(mutation)
-                    backup_path = Path(str(item.get("backup_path") or ""))
-                    before = backup_path.read_text(encoding="utf-8") if backup_path.exists() else None
+                    ledger_path = Path(str(item.get("backup_path") or ""))
+                    history_root = ledger_path.parent
+                    before_path = history_root / f"{item.get('before_sha')}.md"
+                    before = before_path.read_text(encoding="utf-8") if before_path.exists() else None
                     after = None
                     if str(item.get("after_sha") or "") == current_sha:
                         after = content
-                    elif backup_path.parent:
-                        after_path = backup_path.parent / f"{item.get('after_sha')}.md"
+                    else:
+                        after_path = history_root / f"{item.get('after_sha')}.md"
                         if after_path.exists():
                             after = after_path.read_text(encoding="utf-8")
                     if before is None or after is None:
@@ -238,21 +240,22 @@ def main(argv: list[str] | None = None) -> int:
                 latest = mutations[-1] if mutations else None
                 expected_matches = args.expected_sha in (None, sha)
                 ledger_matches = latest is None or str(latest.get("after_sha") or "") == sha
-                backup_exists = (
-                    latest is None
-                    or (bool(latest.get("backup_path")) and Path(str(latest["backup_path"])).exists())
-                )
+                before_backup_exists = True
+                if latest is not None:
+                    ledger_path = Path(str(latest.get("backup_path") or ""))
+                    before_backup = ledger_path.parent / f"{latest.get('before_sha')}.md"
+                    before_backup_exists = before_backup.exists()
                 versions = [int(row["version"]) for row in mutations]
                 version_contiguous = not versions or versions == list(range(versions[0], versions[0] + len(versions)))
                 frontmatter_ok = content.startswith("---\n") and "\n---\n" in content[4:]
                 _emit({
-                    "valid": bool(expected_matches and ledger_matches and backup_exists
+                    "valid": bool(expected_matches and ledger_matches and before_backup_exists
                                   and version_contiguous and frontmatter_ok),
                     "skill_sha": sha,
                     "expected_sha": args.expected_sha,
                     "expected_matches": expected_matches,
                     "ledger_matches_current_sha": ledger_matches,
-                    "latest_backup_exists": backup_exists,
+                    "latest_before_backup_exists": before_backup_exists,
                     "version_contiguous": version_contiguous,
                     "frontmatter_ok": frontmatter_ok,
                     "latest_mutation": latest,
