@@ -2882,10 +2882,12 @@ class ResearchDB:
         return {"created": created, "skipped": skipped, "scanned": len(rows)}
 
     def materialize_submission_observations(self, *, limit: int = 500) -> dict[str, int]:
-        """Turn submission-result events into scoped PRIVATE observations.
+        """Turn canonical submission-result events into scoped PRIVATE observations.
 
-        Covers submission outcomes, ACTIVE portfolio changes, and other
-        pipeline verdicts the simulation-only path misses. Idempotent per event.
+        Candidate status mirrors are intentionally excluded: one submission outcome
+        must produce one evidence item, not a duplicate "independent" observation.
+        ACTIVE/rejection portfolio changes are already represented by the submission
+        result itself. Idempotent per source event.
         """
         rows = self.query(
             """
@@ -2902,8 +2904,7 @@ class ResearchDB:
                   ELSE NULL
               END
             LEFT JOIN knowledge_observations o ON o.source_event_id=e.id
-            WHERE e.entity IN ('submission','candidate')
-              AND e.event IN ('result','status') AND o.id IS NULL
+            WHERE e.entity='submission' AND e.event='result' AND o.id IS NULL
             ORDER BY e.id LIMIT ?
             """, (max(int(limit), 0),)
         )
