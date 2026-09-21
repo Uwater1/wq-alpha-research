@@ -6,6 +6,7 @@ in the ignored database; the tracked skill manager accepts only PUBLIC/SANITIZED
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import sys
 from pathlib import Path
@@ -121,8 +122,8 @@ def main(argv: list[str] | None = None) -> int:
 
     skill_apply = sub.add_parser("skill-apply-rule", help="render an evaluated rule into the tracked skill")
     skill_apply.add_argument("rule_id", type=int)
-    skill_apply.add_argument("--expected-rule-version", type=int)
-    skill_apply.add_argument("--expected-sha")
+    skill_apply.add_argument("--expected-rule-version", type=int, required=True)
+    skill_apply.add_argument("--expected-sha", required=True)
 
     skill_history = sub.add_parser("skill-history", help="alias for skill-diff")
     skill_history.add_argument("--limit", type=int, default=20)
@@ -200,16 +201,63 @@ def main(argv: list[str] | None = None) -> int:
                        "submission": db.materialize_submission_observations()})
             elif args.command == "review":
                 _emit(db.review_knowledge(min_support=args.min_support, min_groups=args.min_groups))
-            elif args.command in ("skill-diff", "skill-history"):
+            elif args.command == "skill-history":
                 _emit(db.query("SELECT * FROM skill_mutations ORDER BY id DESC LIMIT ?",
                                (int(args.limit),)))
+            elif args.command == "skill-diff":
+                content, current_sha = skill_manager.read_skill(args.skill)
+                mutations = db.query("SELECT * FROM skill_mutations ORDER BY id DESC LIMIT ?",
+                                     (int(args.limit),))
+                rendered = []
+                for mutation in mutations:
+                    item = dict(mutation)
+                    backup_path = Path(str(item.get("backup_path") or ""))
+                    before = backup_path.read_text(encoding="utf-8") if backup_path.exists() else None
+                    after = None
+                    if str(item.get("after_sha") or "") == current_sha:
+                        after = content
+                    elif backup_path.parent:
+                        after_path = backup_path.parent / f"{item.get('after_sha')}.md"
+                        if after_path.exists():
+                            after = after_path.read_text(encoding="utf-8")
+                    if before is None or after is None:
+                        item["diff_available"] = False
+                        item["diff"] = None
+                    else:
+                        item["diff_available"] = True
+                        item["diff"] = "".join(difflib.unified_diff(
+                            before.splitlines(keepends=True), after.splitlines(keepends=True),
+                            fromfile=str(item.get("before_sha") or "before"),
+                            tofile=str(item.get("after_sha") or "after"),
+                        ))
+                    rendered.append(item)
+                _emit(rendered)
             elif args.command == "skill-validate":
                 content, sha = skill_manager.read_skill(args.skill)
-                mutations = db.query("SELECT * FROM skill_mutations ORDER BY id DESC LIMIT 1")
-                _emit({"skill_sha": sha, "expected_sha": args.expected_sha,
-                       "matches": args.expected_sha in (None, sha),
-                       "latest_mutation": mutations[0] if mutations else None,
-                       "chars": len(content)})
+                mutations = db.query("SELECT * FROM skill_mutations ORDER BY id")
+                latest = mutations[-1] if mutations else None
+                expected_matches = args.expected_sha in (None, sha)
+                ledger_matches = latest is None or str(latest.get("after_sha") or "") == sha
+                backup_exists = (
+                    latest is None
+                    or (bool(latest.get("backup_path")) and Path(str(latest["backup_path"])).exists())
+                )
+                versions = [int(row["version"]) for row in mutations]
+                version_contiguous = not versions or versions == list(range(versions[0], versions[0] + len(versions)))
+                frontmatter_ok = content.startswith("---\n") and "\n---\n" in content[4:]
+                _emit({
+                    "valid": bool(expected_matches and ledger_matches and backup_exists
+                                  and version_contiguous and frontmatter_ok),
+                    "skill_sha": sha,
+                    "expected_sha": args.expected_sha,
+                    "expected_matches": expected_matches,
+                    "ledger_matches_current_sha": ledger_matches,
+                    "latest_backup_exists": backup_exists,
+                    "version_contiguous": version_contiguous,
+                    "frontmatter_ok": frontmatter_ok,
+                    "latest_mutation": latest,
+                    "chars": len(content),
+                })
             elif args.command == "skill-apply-rule":
                 _emit(skill_manager.apply_evaluated_rule(
                     db, args.skill, args.rule_id,
