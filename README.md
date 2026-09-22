@@ -66,10 +66,11 @@ wq-alpha-research/
 ├── SKILL.md
 ├── scripts/
 │   ├── evolve_skill.py
-│   ├── generator.py          # catalog coverage + targeted mutations
+│   ├── generator.py          # catalog coverage + failure-directed mutations
+│   ├── compatibility.py      # shared field/operator type rules
 │   ├── archive.py             # quality-diversity archive + family allocation
-│   ├── robustness.py          # search-aware advisory diagnostics
-│   ├── field_intelligence.py  # empirical field/operator coverage
+│   ├── robustness.py          # search-aware advisory diagnostics (daily returns)
+│   ├── field_intelligence.py  # scope-aware field/operator coverage
 │   ├── credential_crypto.py
 │   ├── fetch_operators.py
 │   ├── canonical.py         # expression/settings normalization + cache keys
@@ -197,7 +198,9 @@ Generate catalog-backed candidates without preparing a CSV:
 ./.venv/bin/python -m wq mutate CANDIDATE_ID --campaign repair-1 --count 4
 ```
 
-The generator is deterministic for a fixed seed, records catalog version, campaign, parentage, mutation type, parameters, and reason, and still routes every expression through static validation and the persistent queue. `--all-fields` attempts every compatible MATRIX/VECTOR field in the supplied USA/TOP3000/delay=1 snapshot; it is a coverage probe, not evidence that every field is profitable.
+The generator is deterministic for a fixed seed and records catalog version, campaign, scope, parentage, generation, mutation type, parameters, and reason; every expression still routes through static validation and the persistent queue. Rejected children keep the same provenance as queued ones, a descendant's generation is `max(parent generations) + 1`, and failure-directed repair dispatches on the diagnosed failure mode (turnover, Sharpe, Fitness, weight concentration, sub-universe, correlation) instead of perturbing numbers. `--all-fields` attempts every compatible MATRIX/VECTOR field in the supplied USA/TOP3000/delay=1 snapshot; it is a coverage probe, not evidence that every field is profitable.
+
+Every decision is written to the permanent `research_trials` ledger, independently of candidate deduplication: the same canonical candidate generated in two campaigns is one candidate but two research trials, so a winner is always reported next to the search that produced it (including invalid, duplicate, simulation-failed and correlation-failed attempts).
 
 Track candidate state locally so an identical simulation is never paid for twice:
 
@@ -240,9 +243,9 @@ The gates decide what the capacity is spent on:
 ./.venv/bin/python scripts/submission_worker.py --require-correlation --max-submissions 1
 ```
 
-Invalid candidates (typo'd field, unknown operator, wrong arity, impossible settings)
-never reach BRAIN; parameter grids hold one slot until a representative variant shows the
-structure is worth expanding; and a candidate that passes the IS gate enters a submission
+Provably-broken candidates (typo'd field, unknown operator, wrong arity, impossible
+settings, malformed structure) never reach BRAIN; parameter grids hold one slot until a
+representative variant shows the structure is worth expanding; and a candidate that passes the IS gate enters a submission
 queue that is drained independently, one leased row at a time. With `--require-correlation`
 the worker also compares aligned daily returns against the locally cached ACTIVE book and
 holds anything too redundant, while an uncertain POST is reconciled against BRAIN instead
@@ -253,14 +256,34 @@ P2/P3/P4 services are available without changing live scheduler behavior:
 ```bash
 ./.venv/bin/python scripts/archive.py --rebuild
 ./.venv/bin/python scripts/archive.py --parents 10 --seed 7
-./.venv/bin/python scripts/archive.py --allocate 20 --families analyst4 fundamental2 news12 pv1
+./.venv/bin/python scripts/archive.py --allocate 20 --families analyst4 fundamental2 news12 pv1 --max-family-share 0.5
 ./.venv/bin/python scripts/robustness.py --campaign CAMPAIGN_ID --no-persist
 ./.venv/bin/python scripts/field_intelligence.py --refresh
 ```
 
+`archive.py --allocate` always spends exactly the requested budget: when the budget is
+smaller than the family count only a bounded subset is seated, no family may exceed
+`--max-family-share` of the budget, and under-tested families hold the exploration
+reserve. Parent selection rotates across families and niches, so generation does not
+collapse onto whichever family currently holds the best alpha. `robustness.py` converts
+cached **cumulative** PnL into daily returns before computing any Sharpe-like statistic,
+reports year-by-year/rolling/subperiod Sharpe, drawdown, turnover and correlation
+dispersion, and states explicitly when PnL data is missing. `field_intelligence.py`
+keys coverage by field + catalog version + scope, and derives each pipeline stage from
+real evidence (validation events, terminal simulation rows, submission rows) rather than
+from the candidate's current status.
+
 The supplied field snapshot covers 4,367 fields across 14 dataset families (including analyst, fundamental, news, option, price/volume, social-media, model, and universe data); the operator snapshot contains 66 operators. The generator uses metadata-compatible templates and deliberately skips GROUP/UNIVERSE/SYMBOL fields when a regular alpha expression cannot consume them directly.
 
 The generator design follows constrained symbolic search and provenance principles discussed in [AlphaAgent (arXiv:2502.16789)](https://arxiv.org/abs/2502.16789), [Human-AI Interactive Alpha Mining / Alpha-GPT (arXiv:2308.00016)](https://arxiv.org/abs/2308.00016), and recent MCTS formulaic-factor mining work ([arXiv:2505.11122](https://arxiv.org/abs/2505.11122)): metadata narrows proposals, the service remains deterministic and auditable, and validation is outside any optional agent or LLM.
+
+The generator, the static validator and the persisted `operator_compatibility` table all
+read their type rules from `scripts/compatibility.py`, so a combination cannot be
+"impossible" for one caller and acceptable for another. Those type findings — a non-GROUP
+`group` argument, a bare VECTOR field outside `vec_avg`/`vec_sum`, a MATRIX field passed
+to a vector operator — stay **advisory by default**: they lower a candidate's priority and
+are recorded in its structural features, while BRAIN remains the final judge. Pass
+`type_policy="strict"` to `validate()` to promote them to a local reject.
 
 The scripts require `requests` and `numpy`. `alpha_db.json` is retained only for legacy compatibility and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
 

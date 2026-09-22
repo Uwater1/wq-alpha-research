@@ -17,7 +17,37 @@ The existing queue, scheduler, correlation, submission recovery, knowledge store
 
 ## P0 — Reconcile docs and close the previous roadmap
 
-**Status: implemented in the current working tree.**
+**Status: docs implemented; issue #1 reconciliation recorded, not closed.**
+
+Clean up artifacts left by the completed roadmap before adding new architecture.
+
+### Issue #1 reconciliation (audited 2026-09-22)
+
+Issue [#1](https://github.com/Uwater1/wq-alpha-research/issues/1) is still open. Its
+explicit acceptance criteria are now met except one, which is the only item that blocks
+closing it:
+
+- met: `AGENTS.md` + compact `SKILL.md` are the entry points; raw experiments live in
+  `research.db`; learned rules carry scope/evidence/provenance/lifecycle; contradiction
+  can weaken/retire a rule; skill mutations are atomic, auditable and rollbackable;
+  concurrent writers cannot overwrite a stale skill; user-owned/pinned guidance is
+  protected; private data cannot be compiled into tracked files; the loop is CLI/SQLite
+  based with no agent-specific runtime;
+- **unmet: "historical simulation cache can evaluate at least some proposed
+  policy/skill changes offline"** — this is exactly P5 (offline research-policy
+  benchmark), which is not implemented yet.
+
+It also lists P12 implementation items that are outside the acceptance criteria and are
+still open, tracked here rather than in #1:
+
+- the universal `python -m wq ...` CLI surface (P12G/P12M: `wq status`, `wq candidate`,
+  `wq recall`, `wq knowledge`, `wq learn`, `wq skill`); today `python -m wq` exposes the
+  generator only and the equivalent work lives in `scripts/*_cli.py`;
+- agent/model telemetry tables (`agent_runs`, `skill_versions`, `skill_usage`,
+  `eval_runs`); `skill_mutations` currently covers the mutation ledger only.
+
+Closing #1 therefore depends on P5 (plus the CLI-surface decision above). This issue is
+the consolidation tracker for that work.
 
 Clean up artifacts left by the completed roadmap before adding new architecture.
 
@@ -65,7 +95,8 @@ If its acceptance criteria are now satisfied:
 
 # P1 — Autonomous candidate generation and targeted mutation
 
-**Status: implemented in the current working tree.**
+**Status: implemented in the current working tree** (`scripts/generator.py`,
+generator version `catalog-generator-v2`); hardened by issue #7.
 
 This is the main missing capability.
 
@@ -195,6 +226,17 @@ Generated candidates must pass through existing:
 
 Implemented by `scripts/generator.py` and `python -m wq generate|mutate`. The generator uses the supplied catalog (4,367 fields / 14 dataset families), deterministic seeds, type-compatible templates, explicit mutation metadata, and the existing queue safety boundary.
 
+Mutation dispatch covers the failure modes this section requires: `HIGH_TURNOVER`,
+`LOW_TURNOVER`, `LOW_SHARPE`, `LOW_FITNESS`, `CONCENTRATED_WEIGHT`,
+`LOW_SUB_UNIVERSE_SHARPE`, and `SELF_CORRELATION`/`CORR_FAIL`. Each child records the
+repair `mutation_type` plus `parameters["operation"]` (hump smoothing, window change,
+decay change, neutralization change, group transform, rank normalization, truncation,
+field swap, signal combination, component removal), so the concrete edit is auditable
+even though the decision is labelled by the failure it answers. Coverage-aware ordering
+is a primary sort on attempts with a seeded tie-break inside one attempts bucket, and
+generation is `max(parent generations) + 1`, so descendants can no longer stay at
+generation 1.
+
 Research basis: AlphaAgent (arXiv:2502.16789), Human-AI Interactive Alpha Mining / Alpha-GPT (arXiv:2308.00016), and constrained MCTS formulaic-factor mining (arXiv:2505.11122). These support structured operand/operator metadata, regularized exploration, and auditable search; they do not justify treating a generated backtest as independent evidence.
 
 - the project can generate and queue new candidates without a manually prepared CSV;
@@ -207,7 +249,8 @@ Research basis: AlphaAgent (arXiv:2502.16789), Human-AI Interactive Alpha Mining
 
 # P2 — Quality-diversity archive and adaptive research allocation
 
-**Status: implemented in the current working tree.**
+**Status: implemented in the current working tree** (`scripts/archive.py`); hardened by
+issue #7.
 
 Avoid converging the whole search onto one temporarily successful family.
 
@@ -308,6 +351,13 @@ high-uncertainty candidates
 
 Implemented by `scripts/archive.py`: persisted archive cells, deterministic cross-niche parent selection, seeded Beta-Bernoulli allocation, reward-version metadata, and an exploration reserve. Allocation is advisory until a caller explicitly consumes the returned plan.
 
+Allocation now conserves the requested budget exactly (`sum(budgets) == budget`) for every
+input, seats only a bounded subset of families when the budget is smaller than the family
+count, honours a configurable `max_family_share` so one family cannot consume the campaign,
+and hands out slots with sequential Thompson draws. Parent selection scores quality together
+with niche sparsity and lineage depth and then rotates across families and niches instead of
+taking the global top-elite list.
+
 - one successful family cannot monopolize the research budget;
 - unexplored but promising niches continue receiving bounded exploration;
 - family allocation adapts from empirical outcomes;
@@ -317,7 +367,8 @@ Implemented by `scripts/archive.py`: persisted archive cells, deterministic cros
 
 # P3 — Search-aware statistical robustness
 
-**Status: implemented in the current working tree.**
+**Status: implemented in the current working tree** (`scripts/robustness.py`); hardened by
+issue #7.
 
 A large autonomous search can discover impressive results by chance.
 
@@ -390,6 +441,17 @@ The search cost itself is part of the evidence.
 
 Implemented by `scripts/robustness.py`: advisory campaign reports preserve trial counts, independence groups, family diagnostics, multiple-testing proxies, provenance, and explicit missing-PnL stability status. Reports are persisted in `robustness_reports` and never hard-reject candidates.
 
+The permanent ledger is the `research_trials` table: one row per research decision,
+keyed to the campaign with parentage, generation, mutation type/parameters, generator
+version, reason, scope, field/operator catalog versions and the queue outcome, so a
+canonical candidate can have several trial rows without spending duplicate BRAIN
+capacity. Campaign reports count every attempt — validation reject, duplicate/cache
+hit, simulation fail, IS fail, correlation fail, submission reject, ACTIVE — and the
+outcome buckets partition the ledger exactly. Stability metrics first-difference the
+cached cumulative PnL into daily returns before computing subperiod, yearly and rolling
+Sharpe, report drawdown on the PnL path, add turnover/correlation dispersion, and name
+the reason whenever a candidate has no usable PnL series.
+
 - best-performing candidates can be viewed in the context of all trials that produced them;
 - campaign reports expose search size and independence structure;
 - robustness diagnostics cannot silently ignore losing variants.
@@ -398,7 +460,8 @@ Implemented by `scripts/robustness.py`: advisory campaign reports preserve trial
 
 # P4 — Empirical field/operator intelligence
 
-**Status: implemented in the current working tree.**
+**Status: implemented in the current working tree** (`scripts/field_intelligence.py`);
+hardened by issue #7.
 
 Turn the static reference catalog into a continuously updated research map.
 
@@ -495,9 +558,23 @@ Do not add broad new scopes until data references and validation rules exist, bu
 
 Implemented by `scripts/field_intelligence.py`: catalog-versioned field coverage, dataset aggregates, machine-readable operator compatibility, and under-tested-field ordering for the generator. Historical rows retain their catalog version and scope.
 
+Coverage identity is now `field_id + catalog_version + scope_hash`, so USA/TOP3000/delay=1
+evidence is never pooled with another scope (an existing pre-scope table is migrated in
+place into the USA/TOP3000/delay=1 scope). Each stage is derived from evidence — a
+`validation_passed` event, a terminal `simulations` row, a `submissions` row, an ACTIVE
+state — instead of the candidate's current status, so a statically rejected candidate is
+never counted as simulated. Type rules live in `scripts/compatibility.py` and are shared by
+the generator, the validator, and the persisted `operator_compatibility` table. The
+default validator policy is advisory: a known type mismatch lowers priority and is
+recorded in the candidate's structural features, because BRAIN remains the final judge of
+what it accepts. `validate(..., type_policy="strict")` promotes those findings to local
+errors for callers that want a hard gate; provably-broken requests (unknown field or
+operator, wrong arity, malformed, impossible settings) stay errors under both policies.
+
 - field coverage is queryable from the database;
 - generators can prioritize under-explored datasets;
-- known field/operator type incompatibilities are rejected locally;
+- known field/operator type incompatibilities are surfaced locally (advisory warnings by
+  default, local rejects when a caller opts into strict type checking);
 - research history remains interpretable after catalog updates.
 
 ---

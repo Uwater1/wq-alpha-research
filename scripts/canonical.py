@@ -346,6 +346,29 @@ def canonical_key(expression: Any, settings: Mapping[str, Any] | None = None, **
     return _sha256(f"{expression_part}|{settings_part}")
 
 
+#: Dimensions that decide *which data* an expression is evaluated on. Evidence gathered
+#: in one scope must never be pooled with another, even when the expression text is
+#: identical: the same field name can mean different data in a different region/universe.
+SCOPE_SETTINGS_FIELDS: tuple[str, ...] = ("region", "universe", "delay")
+
+
+def scope_from_settings(settings: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Normalized research scope (region/universe/delay) implied by a settings mapping."""
+    normalized = normalize_settings(settings)
+    return {field: normalized[field] for field in SCOPE_SETTINGS_FIELDS}
+
+
+def scope_hash(scope: Mapping[str, Any] | None = None, **overrides: Any) -> str:
+    """Stable 16-char identity of a scope; missing dimensions take catalog defaults."""
+    raw: dict[str, Any] = dict(scope or {})
+    raw.update(overrides)
+    scope_settings: dict[str, Any] = {}
+    for field in SCOPE_SETTINGS_FIELDS:
+        if field in raw and raw[field] not in (None, ""):
+            scope_settings[field] = raw[field]
+    return _sha256(settings_payload(scope_settings))[:16]
+
+
 # ---------------------------------------------------------------------------
 # Near-duplicate / structure helpers (flags only — never an automatic merge)
 # ---------------------------------------------------------------------------

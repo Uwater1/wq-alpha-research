@@ -113,7 +113,8 @@ def test_fields_outside_the_catalog_scope_are_warnings_not_errors():
     assert any("outside its scope" in warning for warning in report.warnings)
 
 
-def test_vector_fields_are_flagged_but_not_rejected():
+def test_bare_vector_fields_are_flagged_but_not_rejected():
+    """Type findings are advisory: BRAIN is the final judge of what it accepts."""
     bare = v.validate("max(composite_sentiment_score_2, close)", {"region": "USA"})
     wrapped = v.validate("rank(vec_avg(composite_sentiment_score_2))", {"region": "USA"})
 
@@ -125,7 +126,17 @@ def test_group_arguments_must_be_group_fields():
     report = v.validate("group_rank(close, close)", {"region": "USA"})
 
     assert report.ok  # still simulated: the platform is the final judge
-    assert any("expects a GROUP field" in warning for warning in report.warnings)
+    assert any("GROUP field" in warning for warning in report.warnings)
+
+
+def test_type_findings_can_be_promoted_to_errors_explicitly():
+    strict = v.validate("group_rank(close, close)", {"region": "USA"}, type_policy=v.TYPE_POLICY_STRICT)
+    bare_vector = v.validate("vec_avg(close)", {"region": "USA"}, type_policy=v.TYPE_POLICY_STRICT)
+
+    assert not strict.ok and any("GROUP field" in error for error in strict.errors)
+    assert not bare_vector.ok and any("VECTOR field" in error for error in bare_vector.errors)
+    with pytest.raises(ValueError, match="unknown type_policy"):
+        v.validate("rank(close)", {"region": "USA"}, type_policy="paranoid")
 
 
 def test_warnings_lower_priority_without_blocking():

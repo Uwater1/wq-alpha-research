@@ -3,6 +3,7 @@
 One SQLite file is the single source of truth for the pipeline:
 
     candidates     lifecycle + priority + metrics of one canonical research idea
+    research_trials permanent per-campaign ledger of every research decision
     simulations    reusable simulation cache, one row per canonical request
     submissions    submission queue state, leased like simulations
     active_alphas  ACTIVE portfolio snapshot + correlation bookkeeping
@@ -76,8 +77,10 @@ DB_ENV_VAR = "WQ_RESEARCH_DB"
 
 #: meta key holding the monotonic version of the local ACTIVE snapshot.
 META_ACTIVE_SET_VERSION = "active_set_version"
+#: meta key marking the one-time ledger backfill of candidates that predate research_trials.
+META_TRIALS_BACKFILLED = "research_trials_backfilled"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
@@ -228,6 +231,37 @@ SETTINGS_COLUMNS: tuple[str, ...] = (
     "nanHandling",
     "language",
 )
+
+#: Scope-aware field coverage. The primary key deliberately includes ``scope_hash`` so
+#: USA/TOP3000/delay=1 evidence can never be pooled with another region/universe/delay.
+#: Kept as a module constant because the migration in `_migrate_field_coverage` has to
+#: rebuild a pre-scope table with exactly this definition.
+FIELD_COVERAGE_DDL = """
+    CREATE TABLE IF NOT EXISTS field_coverage (
+        field_id       TEXT NOT NULL,
+        dataset        TEXT NOT NULL,
+        category       TEXT,
+        field_type     TEXT,
+        catalog_version TEXT NOT NULL,
+        scope_hash     TEXT NOT NULL,
+        scope_json     TEXT NOT NULL,
+        cataloged      INTEGER NOT NULL DEFAULT 1,
+        validated      INTEGER NOT NULL DEFAULT 0,
+        simulated      INTEGER NOT NULL DEFAULT 0,
+        is_pass        INTEGER NOT NULL DEFAULT 0,
+        corr_pass      INTEGER NOT NULL DEFAULT 0,
+        submitted      INTEGER NOT NULL DEFAULT 0,
+        active         INTEGER NOT NULL DEFAULT 0,
+        rejected       INTEGER NOT NULL DEFAULT 0,
+        attempts       INTEGER NOT NULL DEFAULT 0,
+        median_sharpe  REAL,
+        median_fitness REAL,
+        median_turnover REAL,
+        failure_reasons_json TEXT NOT NULL,
+        last_tested_at TEXT,
+        PRIMARY KEY(field_id, catalog_version, scope_hash)
+    )
+    """
 
 SCHEMA: tuple[str, ...] = (
     """
@@ -485,6 +519,30 @@ SCHEMA: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_archive_elite ON archive_cells(elite_score DESC)",
     """
+    CREATE TABLE IF NOT EXISTS research_trials (
+        id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id               TEXT,
+        candidate_id              INTEGER REFERENCES candidates(id),
+        creation_order            INTEGER NOT NULL DEFAULT 0,
+        parent_ids_json           TEXT,
+        generation                INTEGER NOT NULL DEFAULT 0,
+        mutation_type             TEXT,
+        mutation_parameters_json  TEXT,
+        generator_version         TEXT,
+        reason                    TEXT,
+        validation_result         TEXT,
+        signal_family             TEXT,
+        is_duplicate              INTEGER NOT NULL DEFAULT 0,
+        scope_json                TEXT,
+        field_catalog_version     TEXT,
+        operator_catalog_version  TEXT,
+        provenance_json           TEXT,
+        created_at                TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_research_trials_campaign ON research_trials(campaign_id, creation_order, id)",
+    "CREATE INDEX IF NOT EXISTS idx_research_trials_candidate ON research_trials(candidate_id)",
+    """
     CREATE TABLE IF NOT EXISTS family_allocations (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
         allocation_key TEXT NOT NULL,
@@ -512,32 +570,7 @@ SCHEMA: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_robustness_campaign ON robustness_reports(campaign_id, created_at)",
-    """
-    CREATE TABLE IF NOT EXISTS field_coverage (
-        field_id       TEXT NOT NULL,
-        dataset        TEXT NOT NULL,
-        category       TEXT,
-        field_type     TEXT,
-        catalog_version TEXT NOT NULL,
-        scope_json     TEXT NOT NULL,
-        cataloged      INTEGER NOT NULL DEFAULT 1,
-        validated      INTEGER NOT NULL DEFAULT 0,
-        simulated      INTEGER NOT NULL DEFAULT 0,
-        is_pass        INTEGER NOT NULL DEFAULT 0,
-        corr_pass      INTEGER NOT NULL DEFAULT 0,
-        submitted      INTEGER NOT NULL DEFAULT 0,
-        active         INTEGER NOT NULL DEFAULT 0,
-        rejected       INTEGER NOT NULL DEFAULT 0,
-        attempts       INTEGER NOT NULL DEFAULT 0,
-        median_sharpe  REAL,
-        median_fitness REAL,
-        median_turnover REAL,
-        failure_reasons_json TEXT NOT NULL,
-        last_tested_at TEXT,
-        PRIMARY KEY(field_id, catalog_version)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_field_coverage_dataset ON field_coverage(dataset, catalog_version)",
+    FIELD_COVERAGE_DDL,
     """
     CREATE TABLE IF NOT EXISTS operator_compatibility (
         operator_name  TEXT NOT NULL,
@@ -850,6 +883,14 @@ class ResearchDB:
             for statement in SCHEMA:
                 conn.execute(statement)
             self._ensure_columns(conn)
+            # Scope is part of the coverage identity; upgrade a pre-scope table before any
+            # index references the new column.
+            self._migrate_field_coverage(conn)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_field_coverage_dataset "
+                "ON field_coverage(dataset, catalog_version, scope_hash)"
+            )
+            self._backfill_trials(conn)
             # This index references columns added by ADDED_COLUMNS; create it only after
             # upgrading an older events table in place.
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_operation ON events(operation, created_at)")
@@ -890,6 +931,104 @@ class ResearchDB:
                 column = definition.split()[0]
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    def _migrate_field_coverage(self, conn: sqlite3.Connection) -> None:
+        """Rebuild a pre-scope ``field_coverage`` table so scope is part of its identity.
+
+        The old primary key was ``(field_id, catalog_version)``; SQLite cannot alter a
+        primary key, so the rows are copied across with a normalized scope hash. Rows
+        written before this migration were USA/TOP3000/delay=1 by construction.
+        """
+        info = conn.execute("PRAGMA table_info(field_coverage)").fetchall()
+        if not info:
+            return
+        primary_key = {row["name"] for row in info if row["pk"]}
+        if "scope_hash" in primary_key:
+            return
+        conn.execute("ALTER TABLE field_coverage RENAME TO field_coverage_legacy")
+        conn.execute(FIELD_COVERAGE_DDL)
+        legacy_columns = {row["name"] for row in conn.execute("PRAGMA table_info(field_coverage_legacy)")}
+        scope_json = "scope_json" if "scope_json" in legacy_columns else "'{}'"
+        # Pre-scope rows were hard-coded USA/TOP3000/delay=1, so they migrate into that
+        # scope instead of being discarded.
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO field_coverage(
+                field_id, dataset, category, field_type, catalog_version, scope_hash, scope_json,
+                cataloged, validated, simulated, is_pass, corr_pass, submitted, active, rejected,
+                attempts, median_sharpe, median_fitness, median_turnover, failure_reasons_json, last_tested_at)
+            SELECT field_id, dataset, category, field_type, catalog_version, ?, {scope_json},
+                cataloged, validated, simulated, is_pass, corr_pass, submitted, active, rejected,
+                attempts, median_sharpe, median_fitness, median_turnover, failure_reasons_json, last_tested_at
+            FROM field_coverage_legacy
+            """,
+            (canonical.scope_hash(),),
+        )
+        conn.execute("DROP TABLE field_coverage_legacy")
+        # The renamed table keeps its indexes; recreate the one this schema defines.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_field_coverage_dataset "
+            "ON field_coverage(dataset, catalog_version, scope_hash)"
+        )
+
+    def _backfill_trials(self, conn: sqlite3.Connection) -> int:
+        """One-time ledger backfill for candidates created before the trial ledger existed.
+
+        Without this, an existing research.db would report zero trials next to its real
+        candidate history and robustness accounting would silently lose every past attempt.
+        A backfilled row is marked as such; canonical duplicates that predate the ledger
+        cannot be reconstructed, but no surviving candidate is dropped.
+        """
+        existing = conn.execute(
+            "SELECT value FROM meta WHERE key=?", (META_TRIALS_BACKFILLED,)
+        ).fetchone()
+        if existing is not None:
+            return 0
+        rows = conn.execute("SELECT * FROM candidates ORDER BY id").fetchall()
+        written = 0
+        for row in rows:
+            try:
+                settings = json.loads(str(row["settings_json"] or "{}"))
+            except ValueError:
+                settings = {}
+            parent_ids: list[int] = []
+            try:
+                parsed = json.loads(str(row["parent_ids_json"] or "[]"))
+                parent_ids = [int(value) for value in parsed]
+            except (TypeError, ValueError):
+                parent_ids = []
+            try:
+                parameters = json.loads(str(row["mutation_parameters_json"] or "{}"))
+            except ValueError:
+                parameters = {}
+            status = str(row["status"] or "")
+            # Only a static screening refusal is a validation reject. A candidate that was
+            # rejected after simulating is an IS/correlation failure, and labelling it as a
+            # validation reject would misreport the campaign funnel.
+            static_reject = status == "REJECTED" and str(row["failure_reason"] or "").startswith("validation:")
+            self._record_trial(
+                conn,
+                candidate_id=int(row["id"]),
+                validation_result="rejected_invalid" if static_reject else "backfilled",
+                is_duplicate=False,
+                timestamp=str(row["created_at"] or now_iso()),
+                campaign_id=row["campaign_id"],
+                parent_ids=parent_ids,
+                generation=int(row["generation"] or 0),
+                mutation_type=row["mutation_type"],
+                mutation_parameters=parameters if isinstance(parameters, Mapping) else {},
+                generator_version=row["generator_version"],
+                reason=row["generation_reason"],
+                signal_family=row["signal_family"],
+                scope=canonical.scope_from_settings(settings if isinstance(settings, Mapping) else {}),
+                provenance={"backfilled": True},
+            )
+            written += 1
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (META_TRIALS_BACKFILLED, "1"),
+        )
+        return written
 
     @contextlib.contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -972,27 +1111,56 @@ class ResearchDB:
         signal_family: str | None = None,
         priority: float = 0.0,
         parent_id: int | None = None,
-        generation: int = 0,
+        generation: int | None = None,
         mutation_type: str | None = None,
         campaign_id: str | None = None,
         parent_ids: Sequence[int] | None = None,
         mutation_parameters: Mapping[str, Any] | None = None,
         generator_version: str | None = None,
         reason: str | None = None,
+        field_catalog_version: str | None = None,
+        operator_catalog_version: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        record_trial: bool = True,
         requeue: bool = False,
         validate: bool = True,
     ) -> QueueOutcome:
         """Register a candidate and decide whether it still needs BRAIN capacity.
 
-        The candidate is screened locally first: a request BRAIN would reject
-        is filed as REJECTED with the reason instead of spending a simulation slot. Warnings
-        are stored as structural features and only cost priority.
+        The candidate is screened locally first: a request BRAIN would reject is filed as
+        REJECTED with the reason instead of spending a simulation slot. Warnings are stored
+        as structural features and only cost priority.
+
+        Every call also appends one row to the permanent ``research_trials`` ledger, even
+        when the canonical candidate already exists: candidate identity is the canonical
+        expression, but a repeated decision to evaluate it is still a distinct research
+        trial. ``generation`` is derived from the parents when the caller does not state it,
+        so a grandchild is never filed as generation 1.
         """
         normalized_expression = canonical.normalize_expression(expression)
         normalized_settings = canonical.normalize_settings(settings)
         key = canonical.canonical_key(normalized_expression, normalized_settings)
         settings_json = json.dumps(normalized_settings, sort_keys=True)
         timestamp = now_iso()
+        parent_ids_tuple = tuple(
+            int(value) for value in (parent_ids if parent_ids is not None else ([parent_id] if parent_id is not None else []))
+        )
+        resolved_generation = self.next_generation(parent_ids_tuple) if generation is None else int(generation)
+        trial: dict[str, Any] = {
+            "campaign_id": campaign_id,
+            "parent_ids": parent_ids_tuple,
+            "generation": resolved_generation,
+            "mutation_type": mutation_type,
+            "mutation_parameters": mutation_parameters,
+            "generator_version": generator_version,
+            "reason": reason,
+            "signal_family": signal_family,
+            "scope": canonical.scope_from_settings(normalized_settings),
+            "field_catalog_version": field_catalog_version,
+            "operator_catalog_version": operator_catalog_version,
+            "provenance": provenance,
+            "record_trial": record_trial,
+        }
         report = None
         if validate:
             import validate as validator  # local import: keeps the store import-light
@@ -1000,7 +1168,8 @@ class ResearchDB:
             report = validator.validate(normalized_expression, normalized_settings)
             if not report.ok:
                 return self._reject_invalid(
-                    key, expression, normalized_expression, normalized_settings, settings_json, report, source
+                    key, expression, normalized_expression, normalized_settings, settings_json, report, source,
+                    trial=trial,
                 )
 
         with self._tx() as conn:
@@ -1021,10 +1190,10 @@ class ResearchDB:
                     signal_family=signal_family,
                     priority=priority,
                     parent_id=parent_id,
-                    generation=generation,
+                    generation=resolved_generation,
                     mutation_type=mutation_type,
                     campaign_id=campaign_id,
-                    parent_ids=parent_ids,
+                    parent_ids=parent_ids_tuple,
                     mutation_parameters=mutation_parameters,
                     generator_version=generator_version,
                     reason=reason,
@@ -1042,22 +1211,41 @@ class ResearchDB:
                     "candidate", candidate_id, "cache_hit", to_status=candidate["status"] if candidate else "SIMULATED",
                     payload={"canonical_key": key}, conn=conn,
                 )
+                self._record_trial(
+                    conn, candidate_id=candidate_id, validation_result="cache_hit",
+                    is_duplicate=not is_new, timestamp=timestamp, **trial,
+                )
                 return QueueOutcome("cache_hit", key, candidate_id, candidate["status"] if candidate else "SIMULATED",
                                     cached=self._cached_result(simulation))
 
             if simulation is not None and simulation["status"] in ("QUEUED", "RUNNING"):
-                if simulation["status"] == "RUNNING" and is_expired(candidate["lease_until"] if candidate else None):
+                stale = simulation["status"] == "RUNNING" and is_expired(candidate["lease_until"] if candidate else None)
+                self._record_trial(
+                    conn, candidate_id=candidate["id"] if candidate else None,
+                    validation_result="requeued" if stale else "in_flight",
+                    is_duplicate=True, timestamp=timestamp, **trial,
+                )
+                if stale:
                     return self._requeue(conn, candidate, simulation, timestamp, reason="stale_lease")
                 return QueueOutcome("in_flight", key, candidate["id"] if candidate else None,
                                     candidate["status"] if candidate else simulation["status"])
 
             if candidate is not None and candidate["status"] in ("REJECTED", "ACTIVE", "SUBMITTING"):
+                self._record_trial(
+                    conn, candidate_id=candidate["id"], validation_result="skipped_final",
+                    is_duplicate=True, timestamp=timestamp, **trial,
+                )
                 return QueueOutcome("skipped_final", key, candidate["id"], candidate["status"])
 
             if candidate is not None and candidate["status"] == "RETRY" and not requeue \
                     and not is_expired(candidate["next_attempt_at"], timestamp):
+                self._record_trial(
+                    conn, candidate_id=candidate["id"], validation_result="in_flight",
+                    is_duplicate=True, timestamp=timestamp, **trial,
+                )
                 return QueueOutcome("in_flight", key, candidate["id"], candidate["status"])
 
+            already_known = candidate is not None
             if candidate is None:
                 candidate_id = self._insert_candidate(
                     conn,
@@ -1071,10 +1259,10 @@ class ResearchDB:
                     signal_family=signal_family,
                     priority=priority,
                     parent_id=parent_id,
-                    generation=generation,
+                    generation=resolved_generation,
                     mutation_type=mutation_type,
                     campaign_id=campaign_id,
-                    parent_ids=parent_ids,
+                    parent_ids=parent_ids_tuple,
                     mutation_parameters=mutation_parameters,
                     generator_version=generator_version,
                     reason=reason,
@@ -1113,6 +1301,10 @@ class ResearchDB:
                 payload={"canonical_key": key}, conn=conn,
             )
             action = "requeued" if from_status == "RETRY" or requeue else "queued"
+            self._record_trial(
+                conn, candidate_id=candidate_id, validation_result=action,
+                is_duplicate=already_known, timestamp=timestamp, **trial,
+            )
             return QueueOutcome(action, key, candidate_id, "QUEUED")
 
     def _insert_candidate(
@@ -1180,18 +1372,59 @@ class ResearchDB:
         settings_json: str,
         report: Any,
         source: str,
+        *,
+        trial: Mapping[str, Any] | None = None,
     ) -> QueueOutcome:
-        """File a statically invalid request so the generator can learn from it, never simulate it."""
+        """File a statically invalid request so the generator can learn from it, never simulate it.
+
+        A generated child that fails local validation keeps exactly the same provenance a
+        queued child would get: campaign, parents, generation, mutation type and parameters,
+        generator version, family and reason. Losing that metadata used to break lineage and
+        campaign accounting for every rejected mutation.
+        """
         timestamp = now_iso()
         reason = "validation: " + "; ".join(report.errors)[:500]
+        context = dict(trial or {})
+        record_trial = bool(context.pop("record_trial", True))
+        parent_ids = tuple(context.get("parent_ids") or ())
+        generation = int(context.get("generation") or 0)
+        mutation_type = context.get("mutation_type")
+        mutation_parameters = context.get("mutation_parameters") or {}
+        generator_version = context.get("generator_version")
+        reason_text = context.get("reason")
+        campaign_id = context.get("campaign_id")
+        signal_family = context.get("signal_family")
         with self._tx() as conn:
             existing = conn.execute("SELECT * FROM candidates WHERE canonical_key=?", (key,)).fetchone()
             if existing is not None:
                 candidate_id = int(existing["id"])
+                # Existing rows keep their identity: provenance is filled in only where it
+                # is missing, and the generation only ever moves forward.
                 conn.execute(
-                    "UPDATE candidates SET failure_reason=?, structural_json=?, updated_at=? WHERE id=?",
-                    (reason, _structural_payload(report), timestamp, candidate_id),
+                    """
+                    UPDATE candidates SET
+                        failure_reason=?, structural_json=?, updated_at=?,
+                        signal_family=COALESCE(signal_family, ?),
+                        campaign_id=COALESCE(campaign_id, ?),
+                        parent_id=COALESCE(parent_id, ?),
+                        parent_ids_json=CASE WHEN parent_ids_json IS NULL OR parent_ids_json='[]'
+                                             THEN ? ELSE parent_ids_json END,
+                        mutation_type=COALESCE(mutation_type, ?),
+                        mutation_parameters_json=CASE WHEN mutation_parameters_json IS NULL OR mutation_parameters_json='{}'
+                                                      THEN ? ELSE mutation_parameters_json END,
+                        generator_version=COALESCE(generator_version, ?),
+                        generation_reason=COALESCE(generation_reason, ?),
+                        generation=MAX(generation, ?)
+                    WHERE id=?
+                    """,
+                    (
+                        reason, _structural_payload(report), timestamp, signal_family, campaign_id,
+                        parent_ids[0] if parent_ids else None, json.dumps(list(parent_ids)), mutation_type,
+                        json.dumps(dict(mutation_parameters), sort_keys=True, default=str), generator_version,
+                        reason_text, generation, candidate_id,
+                    ),
                 )
+                is_duplicate = True
             else:
                 candidate_id = self._insert_candidate(
                     conn,
@@ -1202,18 +1435,150 @@ class ResearchDB:
                     settings_json,
                     timestamp,
                     source=source,
-                    signal_family=None,
+                    signal_family=signal_family,
                     priority=0.0,
-                    parent_id=None,
-                    generation=0,
-                    mutation_type=None,
+                    parent_id=parent_ids[0] if parent_ids else None,
+                    generation=generation,
+                    mutation_type=mutation_type,
+                    campaign_id=campaign_id,
+                    parent_ids=parent_ids,
+                    mutation_parameters=mutation_parameters,
+                    generator_version=generator_version,
+                    reason=reason_text,
                     status="REJECTED",
                     structural_json=_structural_payload(report),
                 )
                 conn.execute("UPDATE candidates SET failure_reason=? WHERE id=?", (reason, candidate_id))
-                self.log_event("candidate", candidate_id, "validation_failed", to_status="REJECTED",
-                               payload={"errors": report.errors}, conn=conn)
+                is_duplicate = False
+            self.log_event("candidate", candidate_id, "validation_failed", to_status="REJECTED",
+                           payload={"errors": report.errors}, conn=conn)
+            if record_trial:
+                self._record_trial(
+                    conn, candidate_id=candidate_id, validation_result="rejected_invalid",
+                    is_duplicate=is_duplicate, timestamp=timestamp,
+                    campaign_id=campaign_id, parent_ids=parent_ids, generation=generation,
+                    mutation_type=mutation_type, mutation_parameters=mutation_parameters,
+                    generator_version=generator_version, reason=reason_text, signal_family=signal_family,
+                    scope=context.get("scope"), field_catalog_version=context.get("field_catalog_version"),
+                    operator_catalog_version=context.get("operator_catalog_version"),
+                    provenance=context.get("provenance"),
+                )
         return QueueOutcome("rejected_invalid", key, candidate_id, "REJECTED", issues=list(report.errors))
+
+    # -- research trial ledger ---------------------------------------------
+
+    def next_generation(self, parent_ids: Sequence[int]) -> int:
+        """``max(parent generations) + 1``, or 0 when the proposal is a root."""
+        parents = [int(value) for value in parent_ids]
+        if not parents:
+            return 0
+        placeholders = ",".join("?" for _ in parents)
+        row = self._conn.execute(
+            f"SELECT MAX(generation) AS generation FROM candidates WHERE id IN ({placeholders})",
+            tuple(parents),
+        ).fetchone()
+        parent_generation = row["generation"] if row else None
+        return 0 if parent_generation is None else int(parent_generation) + 1
+
+    def _next_trial_order(self, conn: sqlite3.Connection, campaign_id: str | None) -> int:
+        """Monotonic per-campaign decision counter; survives process restarts."""
+        if campaign_id is None:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(creation_order), 0) AS n FROM research_trials WHERE campaign_id IS NULL"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(creation_order), 0) AS n FROM research_trials WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchone()
+        return int(row["n"]) + 1
+
+    def _record_trial(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        candidate_id: int | None,
+        validation_result: str,
+        is_duplicate: bool,
+        timestamp: str,
+        campaign_id: str | None = None,
+        parent_ids: Sequence[int] = (),
+        generation: int = 0,
+        mutation_type: str | None = None,
+        mutation_parameters: Mapping[str, Any] | None = None,
+        generator_version: str | None = None,
+        reason: str | None = None,
+        signal_family: str | None = None,
+        scope: Mapping[str, Any] | None = None,
+        field_catalog_version: str | None = None,
+        operator_catalog_version: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        record_trial: bool = True,
+    ) -> int | None:
+        """Append one research decision to the permanent ledger.
+
+        Called inside the caller's transaction so a trial can never be recorded for a
+        candidate write that rolled back.
+        """
+        if not record_trial:
+            return None
+        order = self._next_trial_order(conn, campaign_id)
+        cursor = conn.execute(
+            """
+            INSERT INTO research_trials(
+                campaign_id, candidate_id, creation_order, parent_ids_json, generation,
+                mutation_type, mutation_parameters_json, generator_version, reason,
+                validation_result, signal_family, is_duplicate, scope_json,
+                field_catalog_version, operator_catalog_version, provenance_json, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                campaign_id, candidate_id, order,
+                json.dumps([int(value) for value in parent_ids]), int(generation),
+                mutation_type,
+                json.dumps(dict(mutation_parameters or {}), sort_keys=True, default=str) if mutation_parameters else None,
+                generator_version, reason, validation_result, signal_family, int(bool(is_duplicate)),
+                json.dumps(dict(scope), sort_keys=True) if scope else None,
+                field_catalog_version, operator_catalog_version,
+                json.dumps(dict(provenance), sort_keys=True, default=str) if provenance else None,
+                timestamp,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def trial_count(self, campaign_id: str | None = None) -> int:
+        """Number of recorded research decisions (optionally for one campaign)."""
+        if campaign_id is None:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM research_trials").fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM research_trials WHERE campaign_id=?", (campaign_id,)
+            ).fetchone()
+        return int(row["n"])
+
+    def trials(self, campaign_id: str | None = None, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """Ledger rows joined with the candidate state they produced.
+
+        The join is what turns "invalid trial", "simulation fail", "correlation fail" and
+        "ACTIVE" into countable outcomes without duplicating lifecycle state in the ledger.
+        """
+        where = "WHERE t.campaign_id=?" if campaign_id is not None else ""
+        params: list[Any] = [campaign_id] if campaign_id is not None else []
+        sql = (
+            "SELECT t.id, t.campaign_id, t.candidate_id, t.creation_order, t.parent_ids_json,"
+            " t.generation, t.mutation_type, t.mutation_parameters_json, t.generator_version, t.reason,"
+            " t.validation_result, t.signal_family, t.is_duplicate, t.scope_json, t.field_catalog_version,"
+            " t.operator_catalog_version, t.provenance_json, t.created_at,"
+            " c.status AS candidate_status, c.gate_reason, c.failure_reason, c.brain_alpha_id,"
+            " c.sharpe, c.fitness, c.turnover, c.self_corr, c.is_pass, c.skeleton_hash,"
+            " (SELECT s.status FROM submissions s WHERE s.candidate_id=t.candidate_id"
+            "  ORDER BY s.id DESC LIMIT 1) AS submission_status"
+            " FROM research_trials t LEFT JOIN candidates c ON c.id=t.candidate_id"
+            f" {where} ORDER BY t.id"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return [dict(row) for row in self._conn.execute(sql, params)]
 
     def get_candidate(self, candidate_id: int) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()

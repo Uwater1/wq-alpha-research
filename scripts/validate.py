@@ -7,19 +7,26 @@ expression and its settings against the local references:
     references/wq_operators.json                    66 operators with signatures
     references/wq_usa_top3000_delay1_data_fields.json 4,367 fields, USA TOP3000 delay 1
 
-Severity split (errors reject, warnings only flag):
-
-    errors    malformed structure, an operator that does not exist, wrong argument
+Severity split (errors reject, warnings only flag):    errors    malformed structure, an operator that does not exist, wrong argument
               count, invalid settings values, and a field that is unknown *inside the
               scope the catalog actually covers*
-    warnings  everything that depends on catalog freshness or on judgement: a field
-              used outside the catalog scope, a vector field that was not aggregated
-              with vec_avg/vec_sum, an unknown keyword, deep nesting. Warnings lower a
-               candidate's priority instead of rejecting it, exactly as designed.
+    warnings  everything else, including every type-compatibility finding: a VECTOR
+              field used without vec_avg/vec_sum, a non-VECTOR argument to a vector
+              operator, a non-GROUP `group` argument, an unknown keyword, deep nesting,
+              and a field outside the catalog scope. Warnings lower priority instead of
+              rejecting, because BRAIN remains the final judge.
+
+Type-compatibility findings come from ``scripts/compatibility.py``. They are advisory by
+default and can be promoted to errors per call with ``type_policy="strict"`` for callers
+that want a hard local gate over the *known* type rules.
 
 Field checks only fire when the requested region/universe/delay is the scope the
 snapshot covers (USA/TOP3000/delay 1); for any other scope unknown names are warnings,
 so a valid CHN alpha is never rejected by a USA catalog.
+
+The type rules themselves live in ``scripts/compatibility.py`` so the generator, this
+validator, and the persisted ``operator_compatibility`` table cannot disagree about
+what is impossible.
 
 Usage:
     from validate import validate
@@ -39,6 +46,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import canonical
+import compatibility
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPERATORS_PATH = REPO_ROOT / "references" / "wq_operators.json"
@@ -58,12 +66,21 @@ DELAYS = frozenset({0, 1})
 DECAY_RANGE = (0, 512)
 LITERAL_KEYWORDS = frozenset({"true", "false", "nan", "inf", "none", "null"})
 
+#: Type-check policies. ``advisory`` (default) reports a known type mismatch as a warning
+#: that only lowers priority; ``strict`` promotes it to a local error. Either way the
+#: rules themselves come from the shared compatibility model, never from this module.
+TYPE_POLICY_ADVISORY = "advisory"
+TYPE_POLICY_STRICT = "strict"
+TYPE_POLICIES = (TYPE_POLICY_ADVISORY, TYPE_POLICY_STRICT)
+
 #: Operators that consume vector fields directly; a VECTOR field outside one of these
-#: is a warning, because BRAIN requires aggregation before most operators.
-VECTOR_OPERATORS = frozenset({"vec_avg", "vec_sum"})
+#: is a known type mismatch (advisory by default).
+VECTOR_OPERATORS = compatibility.VECTOR_AGGREGATORS
 
 #: Operators whose `group` argument must be a GROUP-type field.
-GROUP_OPERATORS = frozenset({"group_rank", "group_neutralize", "group_zscore", "group_scale", "group_backfill", "group_mean"})
+GROUP_OPERATORS = frozenset(
+    name for name, spec in compatibility.constraints().items() if spec.requires_group
+)
 
 DEEP_DEPTH_WARNING = 8
 QUOTES = "\"'“”‘’"
@@ -312,8 +329,18 @@ def validate(
     check_fields: bool = True,
     catalog: Mapping[str, FieldInfo] | None = None,
     operators: Mapping[str, OperatorSpec] | None = None,
+    type_policy: str = TYPE_POLICY_ADVISORY,
 ) -> ValidationReport:
-    """Statically screen one candidate; never raises for a bad expression."""
+    """Statically screen one candidate; never raises for a bad expression.
+
+    ``type_policy`` decides how a known field/operator type mismatch is reported:
+    ``advisory`` (default) warns and only lowers priority, ``strict`` rejects locally.
+    Malformed expressions, unknown operators, wrong arity and impossible settings stay
+    errors under both policies.
+    """
+    if type_policy not in TYPE_POLICIES:
+        raise ValueError(f"unknown type_policy {type_policy!r}; expected one of {list(TYPE_POLICIES)}")
+    strict_types = type_policy == TYPE_POLICY_STRICT
     report = ValidationReport()
     try:
         normalized = canonical.normalize_expression(expression)
@@ -333,7 +360,9 @@ def validate(
     if re.search(r"\(\s*,", masked) or re.search(r",\s*\)", masked) or re.search(r",\s*,", masked):
         report.errors.append("malformed: empty argument in a call")
 
-    # 2. calls: known operator, argument count, keyword arguments
+    # 2. calls: known operator, argument count, keyword arguments, type compatibility
+    field_types = {name: info.type for name, info in catalog.items()}
+    type_findings: list[str] = []
     call_spans: list[tuple[int, int]] = []
     for match in _CALL_RE.finditer(masked):
         name = match.group(1)
@@ -346,6 +375,14 @@ def validate(
         call_spans.append((open_index, close_index))
         arguments = _split_args(masked[open_index + 1 : close_index])
         positional = [a.strip() for a in arguments if a.strip() and _KWARG_RE.match(a) is None]
+        # Type compatibility findings are collected here and routed by `type_policy`
+        # after the field checks; the catalog-scope question ('is this field real here?')
+        # stays a separate check below.
+        type_findings.extend(
+            compatibility.type_errors(
+                lower, [compatibility.bare_field_argument(argument, field_types) for argument in positional]
+            )
+        )
         spec = operators.get(lower)
         if spec is None:
             report.errors.append(f"unknown operator {name!r}")
@@ -363,7 +400,7 @@ def validate(
             if keyword is not None and keyword.group(1) not in known_keywords:
                 report.warnings.append(f"unknown keyword argument {keyword.group(1)!r} on {lower}()")
 
-    # 3. fields: unknown names, vector misuse, group arguments
+    # 3. fields: unknown names and vector usage
     called = {match.group(1).lower() for match in _CALL_RE.finditer(masked)}
     keywords = {match.group(1) for match in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*=", masked)}
     # Keyword values are settings, not fields: the reference writes `driver = gaussian`.
@@ -390,15 +427,16 @@ def validate(
 
     if fields_used:
         for info in fields_used.values():
-            if info.type == "VECTOR" and not _inside_vector_operator(masked, info.id, call_spans):
-                report.warnings.append(
-                    f"vector field {info.id!r} should be aggregated with vec_avg/vec_sum before use"
-                )
-        for call in GROUP_OPERATORS & called:
-            for group_argument in _group_arguments(masked, call):
-                info = catalog.get(group_argument.lower())
-                if info is not None and info.type != "GROUP":
-                    report.warnings.append(f"{call}(..., {group_argument}) expects a GROUP field, got a {info.type} field")
+            misuse = compatibility.vector_misuse(
+                info.id, info.type, _inside_vector_operator(masked, info.id, call_spans)
+            )
+            if misuse:
+                type_findings.append(misuse)
+
+    # The group-argument rule is owned by compatibility.type_errors() above; the `groups`
+    # feature below still records the written argument for ranking and provenance.
+    if type_findings:
+        (report.errors if strict_types else report.warnings).extend(type_findings)
 
     depth = canonical.expression_depth(normalized)
     if depth > DEEP_DEPTH_WARNING:
@@ -475,10 +513,8 @@ def _group_arguments(masked: str, operator: str) -> list[str]:
         if close_index is None:
             continue
         arguments = [a.strip() for a in _split_args(masked[match.end() : close_index])]
-        positional = [a for a in arguments if a and "=" not in a and "(" not in a]
-        if operator in ("group_backfill", "group_mean"):
-            if len(positional) >= 3:
-                found.append(positional[2])
-        elif positional:
-            found.append(positional[-1])
+        # Keyword arguments are dropped, nested calls are kept: the argument index must
+        # stay aligned with the operator's published definition.
+        positional = [a for a in arguments if a and _KWARG_RE.match(a) is None]
+        found.extend(compatibility.group_argument_positions(operator, positional, {}))
     return found
