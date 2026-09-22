@@ -286,8 +286,8 @@ def _commit_evaluated_rule_locked(
             after_sha = sha256_text(after)
             _atomic_write(path, after)
             file_written = True
-            outcome = db._record_skill_mutation_in_tx(
-                conn,
+            outcome = db.record_skill_mutation_atomic(
+                conn=conn,
                 operation="skill.apply",
                 actor=actor,
                 expected_sha=expected_sha,

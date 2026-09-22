@@ -3216,12 +3216,24 @@ class ResearchDB:
     def record_skill_mutation_atomic(
         self, *, operation: str, actor: str, expected_sha: str | None, before_sha: str,
         after_sha: str, backup_sha: str, backup_path: str, rule_id: int | None,
-        privacy_class: str, result: str = "applied",
+        privacy_class: str, result: str = "applied", conn: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
-        """Bump skill_version and insert the mutation ledger row in one IMMEDIATE transaction."""
-        with self._tx() as conn:
+        """Bump skill_version and insert the mutation ledger row atomically.
+
+        An existing transaction may supply ``conn``; this keeps the public mutation
+        boundary injectable for failure recovery while preserving the caller's lock and
+        transaction. Without a connection the method owns an IMMEDIATE transaction.
+        """
+        if conn is not None:
             return self._record_skill_mutation_in_tx(
                 conn, operation=operation, actor=actor, expected_sha=expected_sha,
+                before_sha=before_sha, after_sha=after_sha, backup_sha=backup_sha,
+                backup_path=backup_path, rule_id=rule_id, privacy_class=privacy_class,
+                result=result,
+            )
+        with self._tx() as owned:
+            return self._record_skill_mutation_in_tx(
+                owned, operation=operation, actor=actor, expected_sha=expected_sha,
                 before_sha=before_sha, after_sha=after_sha, backup_sha=backup_sha,
                 backup_path=backup_path, rule_id=rule_id, privacy_class=privacy_class,
                 result=result,
