@@ -77,7 +77,7 @@ DB_ENV_VAR = "WQ_RESEARCH_DB"
 #: meta key holding the monotonic version of the local ACTIVE snapshot.
 META_ACTIVE_SET_VERSION = "active_set_version"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
@@ -473,6 +473,86 @@ SCHEMA: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_skill_mutations_created ON skill_mutations(created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS archive_cells (
+        cell_key       TEXT PRIMARY KEY,
+        dimensions_json TEXT NOT NULL,
+        elite_candidate_id INTEGER REFERENCES candidates(id),
+        elite_score     REAL NOT NULL,
+        member_count    INTEGER NOT NULL DEFAULT 0,
+        updated_at      TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_archive_elite ON archive_cells(elite_score DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS family_allocations (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        allocation_key TEXT NOT NULL,
+        family         TEXT NOT NULL,
+        budget         INTEGER NOT NULL,
+        exploration    INTEGER NOT NULL DEFAULT 0,
+        reward_version TEXT NOT NULL,
+        alpha          REAL NOT NULL,
+        beta           REAL NOT NULL,
+        seed           INTEGER NOT NULL,
+        created_at     TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_family_allocations_key ON family_allocations(allocation_key, id)",
+    """
+    CREATE TABLE IF NOT EXISTS robustness_reports (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id    TEXT,
+        candidate_id   INTEGER,
+        report_type    TEXT NOT NULL,
+        metrics_json   TEXT NOT NULL,
+        trial_count    INTEGER NOT NULL,
+        independence_count INTEGER NOT NULL,
+        created_at     TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_robustness_campaign ON robustness_reports(campaign_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS field_coverage (
+        field_id       TEXT NOT NULL,
+        dataset        TEXT NOT NULL,
+        category       TEXT,
+        field_type     TEXT,
+        catalog_version TEXT NOT NULL,
+        scope_json     TEXT NOT NULL,
+        cataloged      INTEGER NOT NULL DEFAULT 1,
+        validated      INTEGER NOT NULL DEFAULT 0,
+        simulated      INTEGER NOT NULL DEFAULT 0,
+        is_pass        INTEGER NOT NULL DEFAULT 0,
+        corr_pass      INTEGER NOT NULL DEFAULT 0,
+        submitted      INTEGER NOT NULL DEFAULT 0,
+        active         INTEGER NOT NULL DEFAULT 0,
+        rejected       INTEGER NOT NULL DEFAULT 0,
+        attempts       INTEGER NOT NULL DEFAULT 0,
+        median_sharpe  REAL,
+        median_fitness REAL,
+        median_turnover REAL,
+        failure_reasons_json TEXT NOT NULL,
+        last_tested_at TEXT,
+        PRIMARY KEY(field_id, catalog_version)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_field_coverage_dataset ON field_coverage(dataset, catalog_version)",
+    """
+    CREATE TABLE IF NOT EXISTS operator_compatibility (
+        operator_name  TEXT NOT NULL,
+        catalog_version TEXT NOT NULL,
+        input_type      TEXT,
+        output_type     TEXT,
+        requires_group INTEGER NOT NULL DEFAULT 0,
+        requires_vector INTEGER NOT NULL DEFAULT 0,
+        min_args       INTEGER,
+        max_args       INTEGER,
+        source_json     TEXT NOT NULL,
+        PRIMARY KEY(operator_name, catalog_version)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_operator_compatibility_name ON operator_compatibility(operator_name)",
 )
 
 
