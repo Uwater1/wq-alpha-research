@@ -152,10 +152,15 @@ class CandidateGenerator:
         failure = " ".join(str(parent.get(key) or "") for key in ("failure_reason", "gate_reason")).lower()
         settings = _settings(parent)
         proposals: list[Proposal] = []
-        if "turnover" in failure or "turnover" in str(parent.get("failure_reason") or "").lower():
+        measured_turnover = parent.get("turnover")
+        high_turnover = isinstance(measured_turnover, (int, float)) and float(measured_turnover) > 0.20
+        if high_turnover or "turnover" in failure:
+            base_decay = int(settings.get("decay", 6) or 6)
+            repair_settings = {**settings, "decay": min(512, base_decay + 4)}
+
             for hump in (0.005, 0.01):
                 proposals.append(Proposal(
-                    f"hump({expression}, {hump})", settings, family, "turnover_repair",
+                    f"hump({expression}, {hump})", repair_settings, family, "turnover_repair",
                     {"hump": hump}, (parent_id,) if parent_id else (), "repair diagnosed high turnover",
                 ))
         elif "corr" in failure or "correlation" in failure:

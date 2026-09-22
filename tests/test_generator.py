@@ -36,6 +36,15 @@ def test_generation_is_reproducible_and_records_lineage(db):
     assert row["mutation_type"] == "dataset_coverage"
 
 
+def test_numeric_turnover_diagnosis_selects_repair_even_without_named_check(db):
+    outcome = db.queue_candidate("rank(close)", {"decay": 4}, signal_family="technical")
+    parent = db.get_candidate(outcome.candidate_id)
+    db.query("UPDATE candidates SET turnover=? WHERE id=?", (0.39, parent["id"]))
+    proposals = generator.CandidateGenerator(db, seed=1).mutate(db.get_candidate(parent["id"]), count=2)
+    assert [proposal.mutation_type for proposal in proposals] == ["turnover_repair", "turnover_repair"]
+    assert all(proposal.settings["decay"] == 8 for proposal in proposals)
+
+
 def test_failure_directed_turnover_repair_uses_structured_mutation(db):
     outcome = db.queue_candidate("rank(close)", {"decay": 4}, signal_family="technical")
     parent = db.get_candidate(outcome.candidate_id)
