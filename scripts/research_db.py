@@ -77,7 +77,7 @@ DB_ENV_VAR = "WQ_RESEARCH_DB"
 #: meta key holding the monotonic version of the local ACTIVE snapshot.
 META_ACTIVE_SET_VERSION = "active_set_version"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
@@ -85,6 +85,11 @@ ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
     "candidates": (
         "structural_json TEXT",
         "gate_reason TEXT",
+        "campaign_id TEXT",
+        "parent_ids_json TEXT",
+        "mutation_parameters_json TEXT",
+        "generator_version TEXT",
+        "generation_reason TEXT",
         # local self-correlation bookkeeping (see scripts/correlation.py).
         "max_corr_alpha_id TEXT",
         "corr_checked_at TEXT",
@@ -253,6 +258,11 @@ SCHEMA: tuple[str, ...] = (
         parent_id             INTEGER REFERENCES candidates(id),
         generation            INTEGER NOT NULL DEFAULT 0,
         mutation_type         TEXT,
+        campaign_id           TEXT,
+        parent_ids_json       TEXT,
+        mutation_parameters_json TEXT,
+        generator_version     TEXT,
+        generation_reason     TEXT,
         near_duplicate_of     INTEGER REFERENCES candidates(id),
         brain_alpha_id        TEXT,
         simulation_id         TEXT,
@@ -884,6 +894,11 @@ class ResearchDB:
         parent_id: int | None = None,
         generation: int = 0,
         mutation_type: str | None = None,
+        campaign_id: str | None = None,
+        parent_ids: Sequence[int] | None = None,
+        mutation_parameters: Mapping[str, Any] | None = None,
+        generator_version: str | None = None,
+        reason: str | None = None,
         requeue: bool = False,
         validate: bool = True,
     ) -> QueueOutcome:
@@ -928,6 +943,11 @@ class ResearchDB:
                     parent_id=parent_id,
                     generation=generation,
                     mutation_type=mutation_type,
+                    campaign_id=campaign_id,
+                    parent_ids=parent_ids,
+                    mutation_parameters=mutation_parameters,
+                    generator_version=generator_version,
+                    reason=reason,
                     status="SIMULATED",
                     structural_json=_structural_payload(report),
                 )
@@ -973,6 +993,11 @@ class ResearchDB:
                     parent_id=parent_id,
                     generation=generation,
                     mutation_type=mutation_type,
+                    campaign_id=campaign_id,
+                    parent_ids=parent_ids,
+                    mutation_parameters=mutation_parameters,
+                    generator_version=generator_version,
+                    reason=reason,
                     status="QUEUED",
                     structural_json=_structural_payload(report),
                 )
@@ -1026,6 +1051,11 @@ class ResearchDB:
         parent_id: int | None,
         generation: int,
         mutation_type: str | None,
+        campaign_id: str | None = None,
+        parent_ids: Sequence[int] | None = None,
+        mutation_parameters: Mapping[str, Any] | None = None,
+        generator_version: str | None = None,
+        reason: str | None = None,
         status: str,
         structural_json: str | None = None,
     ) -> int:
@@ -1039,14 +1069,18 @@ class ResearchDB:
             INSERT INTO candidates(
                 canonical_key, expression, normalized_expression, expression_hash, settings_hash,
                 settings_json, skeleton_hash, status, priority, signal_family, source, parent_id,
-                generation, mutation_type, near_duplicate_of, structural_json, created_at, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                generation, mutation_type, campaign_id, parent_ids_json, mutation_parameters_json,
+                generator_version, generation_reason, near_duplicate_of, structural_json, created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 key, expression, normalized_expression, canonical.expression_hash(normalized_expression),
                 canonical.settings_hash(normalized_settings), settings_json, skeleton_hash, status, priority,
-                signal_family, source, parent_id, generation, mutation_type,
-                duplicate["id"] if duplicate else None, structural_json, timestamp, timestamp,
+                signal_family,                source, parent_id, generation, mutation_type, campaign_id,
+                json.dumps(list(parent_ids or ([parent_id] if parent_id else [])), sort_keys=True),
+                json.dumps(dict(mutation_parameters or {}), sort_keys=True, default=str),
+                generator_version, reason, duplicate["id"] if duplicate else None,
+                structural_json, timestamp, timestamp,
             ),
         )
         candidate_id = int(cursor.lastrowid)

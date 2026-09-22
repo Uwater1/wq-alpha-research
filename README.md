@@ -4,9 +4,17 @@
 <p align="center"><img src="pic/20260626094115.png" width="600"></p>
 
 
-A self-evolving WorldQuant BRAIN alpha research skill. It helps agents design WQ Alpha expressions, search fields, diagnose simulation failures, check IS metrics, manage self-correlation, and turn each BRAIN interaction into reusable research rules.
+A WorldQuant BRAIN alpha research skill with evidence-backed learning and autonomous candidate generation. It helps agents design WQ Alpha expressions, search fields, diagnose simulation failures, check IS metrics, manage self-correlation, and turn each BRAIN interaction into reusable research rules.
 
-The core idea is simple: do not let alpha research stay as scattered one-off prompts. Use the skill to build alphas, test them, inspect failures, compare daily-return correlations, and then distill the useful lessons back into `SKILL.md`.
+The core idea is simple: do not let alpha research stay as scattered one-off prompts. Use the skill to build alphas, test them, inspect failures, compare daily-return correlations, and preserve evidence in the local research store before any reviewed skill update.
+
+The canonical learning flow is:
+
+```text
+research events → observations → evidence → evaluated rules → skill manager → SKILL.md
+```
+
+`research.db` is the durable operational source of truth. `SKILL.md` is reviewed, sanitized guidance—not an experiment log.
 
 This repository is a reusable agent skill, not a credential bundle. Keep all account credentials, raw alpha IDs, PnL records, and private candidate expressions local.
 
@@ -35,19 +43,21 @@ The current playbook is built around USA TOP3000 delay=1 and includes a local sn
 
 The goal is not to promise a fixed Sharpe or submission pass rate. The value is a faster, cleaner alpha mining loop: fewer invalid-field attempts, less repeated correlation failure, better default templates, and a growing memory of what worked or failed.
 
-## Self-Evolution Loop
+## Learning and Skill Updates
 
-`scripts/evolve_skill.py` is the feedback engine. After simulations, submissions, or status checks, it can fetch the user's alpha list, compare new/changed alphas with the local snapshot, compute daily-return correlations against ACTIVE alphas, and generate a Markdown lesson snippet.
+Research events are recorded in `research.db`, materialized as scoped observations, attached to independent evidence, and evaluated before a rule can become active. Use the knowledge CLI for this workflow:
 
-Recommended loop:
+```bash
+./.venv/bin/python scripts/knowledge_cli.py recall "QUERY" --max-privacy SANITIZED
+./.venv/bin/python scripts/knowledge_cli.py observe --subject-type signal_structure --subject-key STRUCTURE \
+  --claim simulation_outcome --value '{"is_pass":true}' --scope '{"region":"USA"}' \
+  --evidence-group CAMPAIGN_OR_LINEAGE
+./.venv/bin/python scripts/knowledge_cli.py propose ...
+./.venv/bin/python scripts/knowledge_cli.py evaluate RULE_ID
+./.venv/bin/python scripts/knowledge_cli.py transition RULE_ID active --expected-version VERSION
+```
 
-1. Generate or modify candidate expressions from `SKILL.md`.
-2. Simulate and inspect IS checks on BRAIN.
-3. Pull all ACTIVE alphas and compare daily-return correlation.
-4. Run `python scripts/evolve_skill.py` to preview new lessons.
-5. Review the output manually.
-6. Run `python scripts/evolve_skill.py --apply` only for local/private updates.
-7. Publish only sanitized general rules, never raw account-linked records.
+`scripts/evolve_skill.py` remains a legacy preview/reporting utility. It is not the normal learning path; do not use `--apply` or `--raw` for autonomous updates. Reviewed sanitized rules may be rendered through `scripts/skill_manager.py` after evidence and privacy checks.
 
 ## Contents
 
@@ -56,6 +66,7 @@ wq-alpha-research/
 ├── SKILL.md
 ├── scripts/
 │   ├── evolve_skill.py
+│   ├── generator.py          # catalog coverage + targeted mutations
 │   ├── credential_crypto.py
 │   ├── fetch_operators.py
 │   ├── canonical.py         # expression/settings normalization + cache keys
@@ -148,21 +159,13 @@ All tooling scripts (`wq_session.py`, `evolve_skill.py`, etc.) automatically dec
 
 ## Scripts
 
-Preview skill evolution output without modifying files:
+Preview legacy skill-evolution output only when auditing compatibility:
 
 ```bash
 ./.venv/bin/python scripts/evolve_skill.py
 ```
 
-Apply updates to local `SKILL.md` and `alpha_db.json` after reviewing the preview:
-
-```bash
-./.venv/bin/python scripts/evolve_skill.py --apply
-```
-
-The generated record is sanitized by default (pseudonymous alpha IDs plus an operator
-skeleton instead of the exact expression). `--raw` writes the real IDs and expressions
-and is only safe for a private local `SKILL.md`.
+The canonical learning workflow writes observations, evidence, and rule lifecycle state to `research.db`; it does not append directly to `SKILL.md` or use `alpha_db.json` as its source of truth.
 
 Refresh the operator reference (rarely needed — operators barely change):
 
@@ -182,6 +185,16 @@ Simulate, scrape, and submit a batch of expressions:
 # 3. Submit sharpe-first and confirm the alpha reaches ACTIVE
 ./.venv/bin/python legacy/wq_brain/submit_from_csv.py legacy/wq_brain/data/scrape_<ts>.csv
 ```
+
+Generate catalog-backed candidates without preparing a CSV:
+
+```bash
+./.venv/bin/python -m wq generate --campaign coverage-1 --count 50 --family all
+./.venv/bin/python -m wq generate --campaign dataset-audit --all-fields --family all
+./.venv/bin/python -m wq mutate CANDIDATE_ID --campaign repair-1 --count 4
+```
+
+The generator is deterministic for a fixed seed, records catalog version, campaign, parentage, mutation type, parameters, and reason, and still routes every expression through static validation and the persistent queue. `--all-fields` attempts every compatible MATRIX/VECTOR field in the supplied USA/TOP3000/delay=1 snapshot; it is a coverage probe, not evidence that every field is profitable.
 
 Track candidate state locally so an identical simulation is never paid for twice:
 
@@ -232,7 +245,11 @@ the worker also compares aligned daily returns against the locally cached ACTIVE
 holds anything too redundant, while an uncertain POST is reconciled against BRAIN instead
 of being blindly retried.
 
-The scripts require `requests` and `numpy`. `alpha_db.json` is a local memory file and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
+The supplied field snapshot covers 4,367 fields across 14 dataset families (including analyst, fundamental, news, option, price/volume, social-media, model, and universe data); the operator snapshot contains 66 operators. The generator uses metadata-compatible templates and deliberately skips GROUP/UNIVERSE/SYMBOL fields when a regular alpha expression cannot consume them directly.
+
+The generator design follows constrained symbolic search and provenance principles discussed in [AlphaAgent (arXiv:2502.16789)](https://arxiv.org/abs/2502.16789), [Human-AI Interactive Alpha Mining / Alpha-GPT (arXiv:2308.00016)](https://arxiv.org/abs/2308.00016), and recent MCTS formulaic-factor mining work ([arXiv:2505.11122](https://arxiv.org/abs/2505.11122)): metadata narrows proposals, the service remains deterministic and auditable, and validation is outside any optional agent or LLM.
+
+The scripts require `requests` and `numpy`. `alpha_db.json` is retained only for legacy compatibility and is intentionally ignored by git, as are the CSV/log/JSON outputs under `legacy/wq_brain/data/` and the submission record `batch_submit_results.json`.
 
 ## Safety Notes
 

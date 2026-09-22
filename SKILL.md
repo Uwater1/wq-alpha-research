@@ -195,6 +195,8 @@ For current evidence, query `research.db`; do not grow this section with chronol
 Use deterministic code rather than copying API examples into prompts:
 
 - `scripts/validate.py` — field/operator/settings screening.
+- `scripts/generator.py` — deterministic catalog coverage and failure-directed mutations.
+- `python -m wq generate|mutate` — stable candidate-generation CLI.
 - `scripts/research_db.py` — queue/cache/state machine/knowledge store.
 - `scripts/sim_scheduler.py` — bounded persistent simulation dispatcher.
 - `scripts/correlation.py` — ACTIVE-book sync and daily-return correlation.
@@ -203,6 +205,6 @@ Use deterministic code rather than copying API examples into prompts:
 - `scripts/knowledge_cli.py` — recall, observations, proposals, evaluation, lifecycle.
 - `AGENTS.md` — environment, secrets, operational commands, testing, and repository-change rules.
 
-### 13. Dataset/operator coverage protocol
+## 11. Dataset/operator coverage protocol
 
 The local catalog is a **catalog, not proof**: it covers USA/TOP3000/delay=1 with 4,367 fields across 14 dataset families and 66 operators. Before calling a family or operator validated, search the local references, choose up to three representative fields/structures, run static validation, then simulate; submit at most the strongest candidate after IS, correlation, and status gates pass. Record coverage as `cataloged`, `validated`, `submitted`, `ACTIVE`, or `rejected`, with the field family, operator shape, settings, and sanitized outcome. Skip already-tested families unless the goal is a deliberate re-test. Never infer that an untested field works because another field in its dataset works, and never infer that a successful simulation became ACTIVE without checking status. The 2026-09-20 coverage probe found that Fundamental Scores, Relationship Data, and Volatility Data fields were accepted by the API but the sampled structures failed IS metrics; Universe Dataset fields were rejected as `Unit[Universe]` where a group operator required `Unit[Group]`. These are API/type and performance findings, not proof that every field in those families fails.

@@ -397,12 +397,21 @@ def apply_evaluated_rule(
     backup_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Autonomous mutation path with mandatory rule-version and file-SHA CAS."""
-    if expected_rule_version is None:
-        raise ValueError("autonomous rule application requires expected_rule_version")
     if expected_sha is None:
         raise ValueError("autonomous rule application requires expected_sha")
     path = Path(skill_path)
     with _skill_lock(path):
+        # Validate lifecycle before the optimistic-concurrency requirement so callers
+        # receive the actionable rule-state error for a proposed rule.
+        if expected_rule_version is None:
+            rule = db.get_rule(int(rule_id))
+            if rule is None:
+                raise KeyError(f"rule {rule_id} not found")
+            if str(rule["state"]) not in EVALUATED_RULE_STATES:
+                raise ValueError(
+                    f"rule {rule_id} is '{rule['state']}': only evaluated active/pinned rules may enter tracked skill text"
+                )
+            raise ValueError("autonomous rule application requires expected_rule_version")
         return _commit_evaluated_rule_locked(
             db, path, rule_id=int(rule_id),
             expected_rule_version=expected_rule_version,

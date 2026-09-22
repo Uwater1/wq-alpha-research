@@ -17,6 +17,8 @@ The existing queue, scheduler, correlation, submission recovery, knowledge store
 
 ## P0 — Reconcile docs and close the previous roadmap
 
+**Status: implemented in the current working tree.**
+
 Clean up artifacts left by the completed roadmap before adding new architecture.
 
 ### Documentation
@@ -62,6 +64,8 @@ If its acceptance criteria are now satisfied:
 ---
 
 # P1 — Autonomous candidate generation and targeted mutation
+
+**Status: implemented in the current working tree.**
 
 This is the main missing capability.
 
@@ -188,6 +192,10 @@ Generated candidates must pass through existing:
 - privacy rules.
 
 ### Acceptance
+
+Implemented by `scripts/generator.py` and `python -m wq generate|mutate`. The generator uses the supplied catalog (4,367 fields / 14 dataset families), deterministic seeds, type-compatible templates, explicit mutation metadata, and the existing queue safety boundary.
+
+Research basis: AlphaAgent (arXiv:2502.16789), Human-AI Interactive Alpha Mining / Alpha-GPT (arXiv:2308.00016), and constrained MCTS formulaic-factor mining (arXiv:2505.11122). These support structured operand/operator metadata, regularized exploration, and auditable search; they do not justify treating a generated backtest as independent evidence.
 
 - the project can generate and queue new candidates without a manually prepared CSV;
 - candidate lineage is complete;
