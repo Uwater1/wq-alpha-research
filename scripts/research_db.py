@@ -1812,6 +1812,22 @@ class ResearchDB:
                 raise KeyError(f"candidate {candidate_id} not found")
             if candidate["status"] != "SUBMISSION_READY":
                 self._set_status(conn, candidate, "SUBMISSION_READY", timestamp)
+            # Default submission priority reflects settled quality, while an explicit
+            # priority remains authoritative for callers such as the ranked worker.
+            if priority is None:
+                quality_priority = float(candidate["priority"] or 0.0)
+                if isinstance(candidate["sharpe"], (int, float)) and isinstance(candidate["fitness"], (int, float)):
+                    quality_priority = max(quality_priority, float(candidate["sharpe"]) + float(candidate["fitness"]))
+            else:
+                quality_priority = float(priority)
+            if priority is None:
+                # An explicit manual enqueue/requeue means "work on this next";
+                # automatic enqueue always supplies its ranked priority explicitly.
+                queued_max = conn.execute(
+                    "SELECT MAX(priority) AS value FROM submissions WHERE status IN ('READY','RETRY')"
+                ).fetchone()["value"]
+                if queued_max is not None:
+                    quality_priority = max(quality_priority, float(queued_max) + 1e-6)
             # One open submission row per candidate: a terminal row is history, any
             # other row is reused so RETRY/CHECK_PENDING work is never duplicated.
             terminal = sorted(FINAL_SUBMISSION_STATUSES)
@@ -1825,18 +1841,22 @@ class ResearchDB:
                 conn.execute(
                     "UPDATE submissions SET status='READY', next_attempt_at=NULL, worker_id=NULL, lease_until=NULL, "
                     "priority=?, updated_at=? WHERE id=?",
-                    (candidate["priority"] if priority is None else priority, timestamp, open_row["id"]),
+                    (quality_priority, timestamp, open_row["id"]),
                 )
                 self.log_event("submission", open_row["id"], "requeued", to_status="READY",
                                payload={"candidate_id": candidate_id}, conn=conn)
                 return int(open_row["id"])
+            # Submission IDs are an independent domain: allocate explicitly above
+            # both current ID spaces so diagnostics cannot confuse row identities.
+            candidate_max = int(conn.execute("SELECT COALESCE(MAX(id), 0) AS value FROM candidates").fetchone()["value"] or 0)
+            submission_max = int(conn.execute("SELECT COALESCE(MAX(id), 0) AS value FROM submissions").fetchone()["value"] or 0)
+            submission_id = max(candidate_max, submission_max) + 1
             cursor = conn.execute(
                 """
-                INSERT INTO submissions(candidate_id, brain_alpha_id, status, priority, created_at, updated_at)
-                VALUES(?,?, 'READY', ?, ?, ?)
+                INSERT INTO submissions(id, candidate_id, brain_alpha_id, status, priority, created_at, updated_at)
+                VALUES(?,?,?, 'READY', ?, ?, ?)
                 """,
-                (candidate_id, candidate["brain_alpha_id"], candidate["priority"] if priority is None else priority,
-                 timestamp, timestamp),
+                (submission_id, candidate_id, candidate["brain_alpha_id"], quality_priority, timestamp, timestamp),
             )
             submission_id = int(cursor.lastrowid)
             self.log_event("submission", submission_id, "ready", to_status="READY",
