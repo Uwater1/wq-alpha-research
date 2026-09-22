@@ -53,6 +53,7 @@ def test_failure_directed_turnover_repair_uses_structured_mutation(db):
 
     proposals = generator.CandidateGenerator(db, seed=1).mutate(parent, count=2)
     assert [proposal.mutation_type for proposal in proposals] == ["turnover_repair", "turnover_repair"]
+    assert all("hump=" in proposal.expression for proposal in proposals)
     outcomes = generator.CandidateGenerator(db, seed=1).queue("repair-campaign", proposals)
     assert all(item["action"] == "queued" for item in outcomes)
     child = db.get_candidate(outcomes[0]["candidate_id"])

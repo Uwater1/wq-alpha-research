@@ -160,7 +160,7 @@ class CandidateGenerator:
 
             for hump in (0.005, 0.01):
                 proposals.append(Proposal(
-                    f"hump({expression}, {hump})", repair_settings, family, "turnover_repair",
+                    f"hump({expression}, hump={hump})", repair_settings, family, "turnover_repair",
                     {"hump": hump}, (parent_id,) if parent_id else (), "repair diagnosed high turnover",
                 ))
         elif "corr" in failure or "correlation" in failure:
