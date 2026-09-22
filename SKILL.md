@@ -196,6 +196,9 @@ Use deterministic code rather than copying API examples into prompts:
 
 - `scripts/validate.py` — field/operator/settings screening.
 - `scripts/generator.py` — deterministic catalog coverage and failure-directed mutations.
+- `scripts/archive.py` — quality-diversity archive and family allocation.
+- `scripts/robustness.py` — advisory search-aware diagnostics.
+- `scripts/field_intelligence.py` — empirical field/operator coverage.
 - `python -m wq generate|mutate` — stable candidate-generation CLI.
 - `scripts/research_db.py` — queue/cache/state machine/knowledge store.
 - `scripts/sim_scheduler.py` — bounded persistent simulation dispatcher.

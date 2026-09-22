@@ -67,6 +67,9 @@ wq-alpha-research/
 ├── scripts/
 │   ├── evolve_skill.py
 │   ├── generator.py          # catalog coverage + targeted mutations
+│   ├── archive.py             # quality-diversity archive + family allocation
+│   ├── robustness.py          # search-aware advisory diagnostics
+│   ├── field_intelligence.py  # empirical field/operator coverage
 │   ├── credential_crypto.py
 │   ├── fetch_operators.py
 │   ├── canonical.py         # expression/settings normalization + cache keys
@@ -244,6 +247,16 @@ queue that is drained independently, one leased row at a time. With `--require-c
 the worker also compares aligned daily returns against the locally cached ACTIVE book and
 holds anything too redundant, while an uncertain POST is reconciled against BRAIN instead
 of being blindly retried.
+
+P2/P3/P4 services are available without changing live scheduler behavior:
+
+```bash
+./.venv/bin/python scripts/archive.py --rebuild
+./.venv/bin/python scripts/archive.py --parents 10 --seed 7
+./.venv/bin/python scripts/archive.py --allocate 20 --families analyst4 fundamental2 news12 pv1
+./.venv/bin/python scripts/robustness.py --campaign CAMPAIGN_ID --no-persist
+./.venv/bin/python scripts/field_intelligence.py --refresh
+```
 
 The supplied field snapshot covers 4,367 fields across 14 dataset families (including analyst, fundamental, news, option, price/volume, social-media, model, and universe data); the operator snapshot contains 66 operators. The generator uses metadata-compatible templates and deliberately skips GROUP/UNIVERSE/SYMBOL fields when a regular alpha expression cannot consume them directly.
 

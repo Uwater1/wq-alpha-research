@@ -207,6 +207,8 @@ Research basis: AlphaAgent (arXiv:2502.16789), Human-AI Interactive Alpha Mining
 
 # P2 — Quality-diversity archive and adaptive research allocation
 
+**Status: implemented in the current working tree.**
+
 Avoid converging the whole search onto one temporarily successful family.
 
 ## P2.1 — Elite archive
@@ -304,6 +306,8 @@ high-uncertainty candidates
 
 ### Acceptance
 
+Implemented by `scripts/archive.py`: persisted archive cells, deterministic cross-niche parent selection, seeded Beta-Bernoulli allocation, reward-version metadata, and an exploration reserve. Allocation is advisory until a caller explicitly consumes the returned plan.
+
 - one successful family cannot monopolize the research budget;
 - unexplored but promising niches continue receiving bounded exploration;
 - family allocation adapts from empirical outcomes;
@@ -312,6 +316,8 @@ high-uncertainty candidates
 ---
 
 # P3 — Search-aware statistical robustness
+
+**Status: implemented in the current working tree.**
 
 A large autonomous search can discover impressive results by chance.
 
@@ -382,6 +388,8 @@ The search cost itself is part of the evidence.
 
 ### Acceptance
 
+Implemented by `scripts/robustness.py`: advisory campaign reports preserve trial counts, independence groups, family diagnostics, multiple-testing proxies, provenance, and explicit missing-PnL stability status. Reports are persisted in `robustness_reports` and never hard-reject candidates.
+
 - best-performing candidates can be viewed in the context of all trials that produced them;
 - campaign reports expose search size and independence structure;
 - robustness diagnostics cannot silently ignore losing variants.
@@ -389,6 +397,8 @@ The search cost itself is part of the evidence.
 ---
 
 # P4 — Empirical field/operator intelligence
+
+**Status: implemented in the current working tree.**
 
 Turn the static reference catalog into a continuously updated research map.
 
@@ -482,6 +492,8 @@ USA / TOP3000 / delay=1
 Do not add broad new scopes until data references and validation rules exist, but make the core scope-aware.
 
 ### Acceptance
+
+Implemented by `scripts/field_intelligence.py`: catalog-versioned field coverage, dataset aggregates, machine-readable operator compatibility, and under-tested-field ordering for the generator. Historical rows retain their catalog version and scope.
 
 - field coverage is queryable from the database;
 - generators can prioritize under-explored datasets;

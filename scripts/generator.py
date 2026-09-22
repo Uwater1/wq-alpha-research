@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import random
+import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +98,13 @@ class CandidateGenerator:
     ) -> list[Proposal]:
         fields = self.catalog.select(family, dataset)
         rng = random.Random(self.seed)
+        # Coverage intelligence is advisory and read-only: unknown/unrefreshed fields
+        # retain deterministic seed ordering, while refreshed catalogs prioritize gaps.
+        try:
+            from field_intelligence import under_tested
+            fields = under_tested(self.db, fields)
+        except (ImportError, sqlite3.Error):
+            pass
         rng.shuffle(fields)
         if not all_fields:
             fields = fields[: max(0, int(count))]
