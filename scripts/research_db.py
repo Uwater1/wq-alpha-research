@@ -1160,6 +1160,7 @@ class ResearchDB:
         provenance: Mapping[str, Any] | None = None,
         record_trial: bool = True,
         severity_policy: Mapping[str, str] | None = None,
+        type_policy: str | None = None,
         requeue: bool = False,
         validate: bool = True,
     ) -> QueueOutcome:
@@ -1168,6 +1169,15 @@ class ResearchDB:
         The candidate is screened locally first: a request BRAIN would reject is filed as
         REJECTED with the reason instead of spending a simulation slot. Warnings are stored
         as structural features and only cost priority.
+
+        The queue is the *safety boundary*, so it enforces known deterministic field/operator
+        type incompatibilities (the ``TYPE_*`` findings from ``compatibility.py``) as local
+        errors by default: ``group_rank(x, x)``, ``vec_avg(x)`` on a MATRIX field and a bare
+        VECTOR outside ``vec_avg``/``vec_sum`` are refused before any simulation row exists.
+        The reusable ``validate()`` keeps its advisory default for standalone callers, and a
+        caller can pass ``type_policy="advisory"`` to queue deliberately-flagged work (for
+        example to model what BRAIN does with it). Uncertain/out-of-scope findings stay
+        advisory either way, because the local catalog cannot prove those.
 
         Every call also appends one row to the permanent ``research_trials`` ledger, even
         when the canonical candidate already exists: candidate identity is the canonical
@@ -1203,10 +1213,16 @@ class ResearchDB:
         if validate:
             import validate as validator  # local import: keeps the store import-light
 
-            # An approved (measured) severity policy is enforced here; with nothing approved
-            # every finding stays advisory and only lowers priority.
+            # Known deterministic type incompatibilities are rejected at this boundary; the
+            # validator itself stays advisory for its other callers. An approved (measured)
+            # severity policy can still override a specific code, and everything that is not
+            # a deterministic type finding stays advisory and only lowers priority.
             policy = self.load_severity_policy() if severity_policy is None else dict(severity_policy)
-            report = validator.validate(normalized_expression, normalized_settings, severity_policy=policy)
+            resolved_type_policy = validator.TYPE_POLICY_STRICT if type_policy is None else type_policy
+            report = validator.validate(
+                normalized_expression, normalized_settings,
+                type_policy=resolved_type_policy, severity_policy=policy,
+            )
             if not report.ok:
                 return self._reject_invalid(
                     key, expression, normalized_expression, normalized_settings, settings_json, report, source,

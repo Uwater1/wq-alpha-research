@@ -48,9 +48,15 @@ def _settle(db, expression, *, accepted=True, family="momentum", settings=None, 
     ``is_fail`` is the third outcome that matters: BRAIN accepted and evaluated the request,
     the IS gate refused the alpha. It costs a slot and yields nothing — and it is *not* evidence
     that any local screening rule was right about the request.
+
+    The screening mode is forced to *advisory* on purpose: the calibration corpora here are
+    work that reached BRAIN while carrying a local finding, and the normal queue path now
+    rejects deterministic type findings outright. Opting back into advisory lets the tests
+    model what the platform did with that work.
     """
     outcome = db.queue_candidate(expression, settings or {"decay": 6}, signal_family=family,
-                                 source=source or f"run-{next(_RUNS)}")
+                                 source=source or f"run-{next(_RUNS)}",
+                                 type_policy=validate.TYPE_POLICY_ADVISORY)
     assert outcome.action in ("queued", "requeued"), outcome.action
     db.claim_simulation("seed", candidate_id=outcome.candidate_id)
     if accepted:
@@ -74,6 +80,15 @@ GROUP_ARGUMENT_EXPRESSIONS = (
     "group_rank(close, close)",
     "group_rank(open, open)",
     "group_rank(high, high)",
+)
+
+#: The same three-in-a-row shape for an *advisory* code. The deterministic ``TYPE_*`` rules are
+#: now hard gates at the queue boundary, so an approval/reversibility test needs a rule whose
+#: enforcement is still opt-in — the positional-optional-argument rule is exactly that.
+ADVISORY_POSITIONAL_EXPRESSIONS = (
+    "hump(rank(ts_mean(close, 10)), 0.005)",
+    "hump(rank(ts_mean(open, 10)), 0.005)",
+    "hump(rank(ts_mean(high, 10)), 0.005)",
 )
 
 
@@ -155,46 +170,55 @@ def _measured_recommendation(db, **kwargs):
     return calibration.recommended_policy(report)
 
 
+def _measured_advisory_recommendation(db, **kwargs):
+    """The policy calibration proposes for the still-advisory positional-argument rule."""
+    report = calibration.refresh(db, min_samples=1, strict_threshold=0.6, **kwargs)
+    return calibration.recommended_policy(report)
+
+
 def test_approval_is_enforced_and_reversible_once_the_benchmark_agrees(db):
-    for expression in GROUP_ARGUMENT_EXPRESSIONS:
+    # Enforcement is only *observable* for an advisory code: the deterministic TYPE_* rules are
+    # already hard gates at the queue boundary whatever the persisted policy says.
+    for expression in ADVISORY_POSITIONAL_EXPRESSIONS:
         _settle(db, expression, accepted=False)
     for index in range(3):
         _settle(db, f"rank(ts_delta(close, {5 + index}))", accepted=True)
-    proposed = _measured_recommendation(db)
+    proposed = _measured_advisory_recommendation(db)
 
+    assert proposed == {validate.CODE_POSITIONAL_OPTIONAL_ARGUMENT: validate.SEVERITY_ERROR}
     assert db.load_severity_policy() == {}  # measuring alone changes nothing
-    assert validate.validate("group_rank(low, low)").ok is True  # advisory still, by default
+    assert validate.validate("hump(rank(low), 0.005)").ok is True  # advisory still, by default
 
     result = calibration.approve(db, proposed, budget=6)
 
     assert result["enforced"] == proposed
     assert result["refused"] == {}
-    evidence = result["evidence"][GROUP_ARGUMENT_FINDING]
+    evidence = result["evidence"][validate.CODE_POSITIONAL_OPTIONAL_ARGUMENT]
     assert evidence["verdict"] == "improved"
     assert evidence["leakage"]["finding_gate"] == "passed"
     assert evidence["refused_decisions"]  # the baseline really did buy the refused work
     assert evidence["gate"]["simulations_used"] < evidence["baselines"]["fifo"]["simulations_used"]
     assert evidence["gate"]["is_pass_from_simulated"] == evidence["baselines"]["fifo"]["is_pass_from_simulated"]
 
-    assert db.queue_candidate("group_rank(low, low)", {"decay": 6}).action == "rejected_invalid"
+    assert db.queue_candidate("hump(rank(low), 0.005)", {"decay": 6}).action == "rejected_invalid"
 
     calibration.clear(db)
     # A different expression, because the rejected one is already settled history.
-    assert db.queue_candidate("group_rank(vwap, vwap)", {"decay": 6}).action == "queued"
+    assert db.queue_candidate("hump(rank(vwap), 0.005)", {"decay": 6}).action == "queued"
 
 
 def test_approval_is_refused_when_the_rule_would_decline_everything(db):
     """A rule that blocks the whole corpus proves nothing, however accurate it looks."""
-    for expression in GROUP_ARGUMENT_EXPRESSIONS:
+    for expression in ADVISORY_POSITIONAL_EXPRESSIONS:
         _settle(db, expression, accepted=False)
-    proposed = _measured_recommendation(db)
+    proposed = _measured_advisory_recommendation(db)
 
     result = calibration.approve(db, proposed, budget=3)
 
     assert result["enforced"] == {}
-    assert result["refused"][GROUP_ARGUMENT_FINDING]["verdict"] == "declines_everything"
+    assert result["refused"][validate.CODE_POSITIONAL_OPTIONAL_ARGUMENT]["verdict"] == "declines_everything"
     assert db.load_severity_policy() == {}
-    assert db.queue_candidate("group_rank(low, low)", {"decay": 6}).action == "queued"
+    assert db.queue_candidate("hump(rank(volume), 0.005)", {"decay": 6}).action == "queued"
 
 
 def test_approval_is_refused_when_the_rule_would_refuse_passing_work(db):
@@ -554,7 +578,8 @@ def test_the_evidence_threshold_is_the_price_of_learning_a_rule(db):
     later: list[int] = []
     for index, field in enumerate(("low", "volume", "vwap")):
         flagged_next = db.queue_candidate(f"group_rank({field}, {field})", {"decay": 6},
-                                          source=f"wave-{index + 3}")
+                                          source=f"wave-{index + 3}",
+                                          type_policy=validate.TYPE_POLICY_ADVISORY)
         assert flagged_next.action == "queued", flagged_next.action
         later.append(flagged_next.candidate_id)
         later.append(_settle(db, f"rank(ts_delta(close, {20 + index}))", accepted=True,

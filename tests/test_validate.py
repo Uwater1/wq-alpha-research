@@ -191,14 +191,17 @@ def test_queue_refuses_invalid_candidates_but_records_them(db):
     assert db.counts("simulations") == {}  # and no simulation row either
 
 
-def test_queue_accepts_flagged_candidates_and_stores_features(db):
+def test_queue_rejects_type_mismatch_and_records_its_features(db):
+    """A deterministic type mismatch is a local reject: no simulation row is created."""
     outcome = db.queue_candidate("group_rank(close, close)", {"region": "USA"})
 
-    assert outcome.action == "queued"
+    assert outcome.action == "rejected_invalid"
     candidate = db.get_candidate(outcome.candidate_id)
+    assert candidate["status"] == "REJECTED"
     assert candidate["structural_json"] is not None
     assert "GROUP field" in candidate["structural_json"]
-    assert db.list_queued()[0]["id"] == candidate["id"]
+    assert db.list_queued() == []
+    assert db.counts("simulations") == {}
 
 
 def test_queue_validation_can_be_disabled_for_experiments(db):

@@ -21,6 +21,7 @@ import field_intelligence
 import generator
 import research_db as rdb
 import robustness
+import validate
 
 
 @pytest.fixture()
@@ -241,6 +242,79 @@ def test_invalid_trial_is_counted_in_campaign(db):
     assert report["trials"]["accounted_trials"] == report["trials"]["trial_count"]
 
 
+def test_cross_campaign_duplicate_is_in_campaign_report(db):
+    """One canonical candidate, two campaigns: each report must own its own decision."""
+    first = db.queue_candidate("group_rank(ts_rank(close, 60), subindustry)", {"decay": 6}, campaign_id="A")
+    second = db.queue_candidate("group_rank(ts_rank(close, 60), subindustry)", {"decay": 6}, campaign_id="B")
+    assert first.candidate_id == second.candidate_id  # canonical identity is stable
+    # There is only one candidate row, so candidates.campaign_id cannot be the membership key.
+    assert db.get_candidate(first.candidate_id)["campaign_id"] == "A"
+
+    report_b = robustness.campaign_report(db, "B", persist=False)
+    assert report_b["provenance"]["trial_count"] == 1
+    assert report_b["provenance"]["candidate_count"] == 1
+    assert report_b["multiple_testing"]["candidate_count"] == 1
+    assert [row["id"] for row in robustness.campaign_candidates(db, "B")] == [first.candidate_id]
+
+    report_a = robustness.campaign_report(db, "A", persist=False)
+    assert report_a["provenance"]["trial_count"] == 1
+    assert report_a["provenance"]["candidate_count"] == 1
+    assert [row["id"] for row in robustness.campaign_candidates(db, "A")] == [first.candidate_id]
+
+
+def test_multiple_testing_uses_trial_count_not_unique_candidate_count(db):
+    db.queue_candidate("rank(close)", {"decay": 6}, campaign_id="dup")
+    db.queue_candidate("rank(close)", {"decay": 6}, campaign_id="dup")
+    report = robustness.campaign_report(db, "dup", persist=False)
+
+    assert report["provenance"]["trial_count"] == 2
+    assert report["provenance"]["candidate_count"] == 1
+    metrics = report["multiple_testing"]
+    assert metrics["trial_count"] == 2        # search effort: two research decisions
+    assert metrics["candidate_count"] == 1    # one unique canonical candidate
+    assert metrics["independence_count"] == 1  # duplicates are not independent structures
+    assert metrics["effective_number_of_trials"] == 1
+
+
+def test_duplicate_trials_do_not_inflate_independence_count(db):
+    # The same canonical candidate decided once per campaign: each campaign sees one trial and
+    # one independent structure, never two.
+    db.queue_candidate("rank(close)", {"decay": 6}, campaign_id="A")
+    db.queue_candidate("rank(close)", {"decay": 6}, campaign_id="B")
+
+    for campaign in ("A", "B"):
+        metrics = robustness.campaign_report(db, campaign, persist=False)["multiple_testing"]
+        assert metrics["trial_count"] == 1
+        assert metrics["candidate_count"] == 1
+        assert metrics["independence_count"] == 1
+        assert metrics["effective_number_of_trials"] == 1
+
+
+def test_invalid_trials_remain_in_search_accounting(db):
+    parent = db.queue_candidate("rank(close)", {"decay": 6}, campaign_id="mix").candidate_id
+    invalid = generator.Proposal(
+        expression="rank(not_a_real_field_xyz)", settings={"decay": 6}, family="pv",
+        mutation_type="field_swap", parameters={"replacement_field": "not_a_real_field_xyz"},
+        parent_ids=(parent,), reason="invalid child",
+    )
+    generator.CandidateGenerator(db, seed=0).queue("mix", [invalid])
+    good = db.queue_candidate("rank(open)", {"decay": 6}, campaign_id="mix")
+    claimed = db.claim_simulation("issue7", candidate_id=good.candidate_id)
+    db.record_simulation_result(
+        candidate_id=claimed["id"], status="DONE",
+        metrics={"sharpe": 1.4, "fitness": 1.2, "turnover": 0.1},
+        checks=[{"name": "IS", "result": "PASS"}], brain_alpha_id="A-mix",
+    )
+
+    report = robustness.campaign_report(db, "mix", persist=False)
+    assert report["trials"]["trial_count"] == 3
+    assert report["trials"]["outcomes"]["validation_reject"] == 1
+    # Every decision stays visible, including the one with no usable candidate metrics.
+    assert report["trials"]["accounted_trials"] == report["trials"]["trial_count"]
+    assert report["multiple_testing"]["trial_count"] == 3
+    assert report["multiple_testing"]["candidate_count"] == 3
+
+
 def test_robustness_uses_daily_returns_not_cumulative_levels(db):
     candidate_id = _settle(db, "rank(close)", "pv", sharpe=1.4, fitness=1.2, turnover=0.1)
     candidate = db.get_candidate(candidate_id)
@@ -259,6 +333,47 @@ def test_robustness_uses_daily_returns_not_cumulative_levels(db):
     assert entry["daily_return_mean"] != pytest.approx(float(np.mean(levels)), abs=1e-6)
     assert entry["subperiods"] and entry["rolling"]["status"] == "available"
     assert entry["max_drawdown"] >= 0.0
+
+
+def test_rolling_report_includes_return_and_sharpe(db):
+    candidate_id = _settle(db, "rank(close)", "pv", sharpe=1.4, fitness=1.2, turnover=0.1)
+    candidate = db.get_candidate(candidate_id)
+    rng = np.random.default_rng(7)
+    levels = np.cumsum(rng.normal(0.0004, 0.002, size=300))
+    db.cache_active_pnl(candidate["brain_alpha_id"],
+                        [f"2024-01-{day % 28 + 1:02d}" for day in range(301)], list(levels))
+
+    rolling = robustness.campaign_report(db, None, persist=False)["stability"]["candidates"][0]["rolling"]
+
+    assert rolling["status"] == "available"
+    assert {"mean_sharpe", "mean_return", "mean_cumulative_return",
+            "min_cumulative_return", "max_cumulative_return"} <= set(rolling)
+    returns = np.diff(np.asarray(levels))
+    window = rolling["window"]
+    windows = [returns[start : start + window] for start in range(returns.size - window + 1)]
+    assert rolling["mean_return"] == pytest.approx(float(np.mean([part.mean() for part in windows])), abs=1e-7)
+    assert rolling["mean_cumulative_return"] == pytest.approx(
+        float(np.mean([part.sum() for part in windows])), abs=1e-7)
+    assert rolling["min_cumulative_return"] <= rolling["mean_cumulative_return"] <= rolling["max_cumulative_return"]
+
+
+def test_subperiod_fitness_is_explicitly_unavailable(db):
+    """Fitness needs per-period turnover the PnL cache does not hold: report, never invent."""
+    candidate_id = _settle(db, "rank(open)", "pv", sharpe=1.4, fitness=1.2, turnover=0.1)
+    candidate = db.get_candidate(candidate_id)
+    rng = np.random.default_rng(11)
+    levels = np.cumsum(rng.normal(0.0004, 0.002, size=300))
+    db.cache_active_pnl(candidate["brain_alpha_id"],
+                        [f"2024-02-{day % 28 + 1:02d}" for day in range(301)], list(levels))
+
+    entry = robustness.campaign_report(db, None, persist=False)["stability"]["candidates"][0]
+
+    assert entry["subperiod_fitness_status"] == robustness.FITNESS_UNAVAILABLE
+    assert entry["subperiods"]
+    for subperiod in entry["subperiods"]:
+        assert subperiod["fitness"] is None
+        assert subperiod["fitness_status"] == "unavailable_from_cached_pnl"
+        assert subperiod["cumulative_return"] is not None
 
 
 def test_flat_cumulative_path_does_not_produce_a_fake_sharpe(db):
@@ -320,19 +435,50 @@ def test_generator_prefers_under_tested_fields(db):
         assert proposals[0].parameters["field"] != "close"
 
 
-def test_known_type_mismatch_is_advisory_and_strict_mode_is_opt_in(db):
-    import validate
+#: Deterministic field/operator type incompatibilities: a MATRIX where a GROUP/VECTOR is
+#: required, and a bare VECTOR outside vec_avg/vec_sum.
+KNOWN_TYPE_MISMATCHES = (
+    "group_rank(close, close)",
+    "max(composite_sentiment_score_2, close)",
+    "vec_avg(close)",
+)
 
-    impossible = ("group_rank(close, close)", "max(composite_sentiment_score_2, close)", "vec_avg(close)")
-    for expression in impossible:
-        report = validate.validate(expression, {"region": "USA"})
-        # BRAIN decides: locally this only lowers priority.
-        assert report.ok and report.warnings, expression
+
+def test_queue_rejects_known_type_mismatch_without_simulation(db):
+    """The queue is the safety boundary: a known-impossible request never gets a slot."""
+    for expression in KNOWN_TYPE_MISMATCHES:
+        outcome = db.queue_candidate(expression, {"region": "USA"})
+        assert outcome.action == "rejected_invalid", expression
+        assert outcome.needs_simulation is False
+        candidate = db.get_candidate(outcome.candidate_id)
+        assert candidate["status"] == "REJECTED"
+        assert candidate["failure_reason"].startswith("validation:")
+
+    assert db.list_queued() == []
+    assert db.counts("simulations") == {}  # no simulation row for any of them
+
+    # The hard gate is the default, not the only option: an explicit advisory policy still
+    # queues the same kind of work (for callers modelling what BRAIN does with it).
+    assert db.queue_candidate("vec_avg(open)", {"region": "USA"},
+                              type_policy=validate.TYPE_POLICY_ADVISORY).action == "queued"
+
+
+def test_validator_advisory_mode_remains_explicit():
+    """The reusable validator still screens advisably; only the queue path is strict."""
+    for expression in KNOWN_TYPE_MISMATCHES:
+        default = validate.validate(expression, {"region": "USA"})
+        assert default.ok and default.warnings, expression
+        advisory = validate.validate(expression, {"region": "USA"}, type_policy=validate.TYPE_POLICY_ADVISORY)
+        assert advisory.ok and advisory.warnings, expression
+        assert advisory.finding_codes, expression
         strict = validate.validate(expression, {"region": "USA"}, type_policy=validate.TYPE_POLICY_STRICT)
         assert not strict.ok, expression
+    with pytest.raises(ValueError, match="unknown type_policy"):
+        validate.validate("rank(close)", {"region": "USA"}, type_policy="paranoid")
 
-    assert db.queue_candidate("vec_avg(close)", {"region": "USA"}).action == "queued"
 
+def test_operator_compatibility_uses_the_shared_model(db):
+    """Generator, validator and the persisted table all read compatibility.py."""
     field_intelligence.refresh(db)
     rows = {row["operator_name"]: row for row in db.query("SELECT * FROM operator_compatibility")}
     for name in ("group_rank", "vec_avg", "ts_mean", "group_backfill"):

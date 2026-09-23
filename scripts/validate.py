@@ -16,9 +16,12 @@ Severity split (errors reject, warnings only flag):    errors    malformed struc
               and a field outside the catalog scope. Warnings lower priority instead of
               rejecting, because BRAIN remains the final judge.
 
-Type-compatibility findings come from ``scripts/compatibility.py``. They are advisory by
-default and can be promoted to errors per call with ``type_policy="strict"`` for callers
-that want a hard local gate over the *known* type rules.
+Type-compatibility findings come from ``scripts/compatibility.py``. This module is advisory
+by default and can be promoted to errors per call with ``type_policy="strict"`` for callers
+that want a hard local gate over the *known* type rules. The research queue is such a caller:
+``research_db.queue_candidate`` screens with strict type policy at that safety boundary, so a
+known-impossible field/operator combination never spends a BRAIN slot, while uncertain or
+out-of-scope findings stay advisory everywhere.
 
 Field checks only fire when the requested region/universe/delay is the scope the
 snapshot covers (USA/TOP3000/delay 1); for any other scope unknown names are warnings,

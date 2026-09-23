@@ -11,6 +11,24 @@ Two correctness rules drive the statistics:
 * the population of interest is the permanent trial ledger, not the surviving candidates:
   validation rejects, duplicate/cache decisions, simulation failures, IS failures,
   correlation failures and submission rejects are all counted.
+
+Three counts are deliberately kept apart, because conflating them is how a large adaptive
+search looks smaller than it was:
+
+``trial_count``
+    research decisions, straight from ``research_trials``. This is the raw search effort; a
+    repeated decision on an already-known canonical candidate still counts.
+``candidate_count``
+    unique canonical candidates those decisions produced.
+``independence_count``
+    estimated independent structures (distinct skeletons/families). A duplicate decision
+    adds a trial but no independent structure, so repeated work never inflates significance.
+
+The multiple-testing discount keys off ``independence_count`` (duplicates are not
+independent evidence) while the search cost is reported from ``trial_count``.
+
+BRAIN Fitness is a Sharpe/turnover construct and the cached PnL series has no per-period
+turnover, so subperiod Fitness is reported as explicitly unavailable rather than faked.
 """
 from __future__ import annotations
 
@@ -44,6 +62,9 @@ TRIAL_OUTCOMES: tuple[str, ...] = (
 )
 TRADING_DAYS = 252
 ROLLING_WINDOW = 63
+#: Fitness needs per-period turnover, which the PnL cache does not store, so it can never be
+#: reconstructed from cached PnL alone. Reported explicitly instead of guessed.
+FITNESS_UNAVAILABLE = "unavailable_from_cached_pnl"
 
 
 def _finite(values: Sequence[Any]) -> np.ndarray:
@@ -97,8 +118,13 @@ def subperiod_stats(returns: np.ndarray, *, chunks: int = 4) -> list[dict[str, A
             "period": index,
             "observations": int(chunk.size),
             "mean_return": round(float(np.mean(chunk)), 8),
+            "cumulative_return": round(float(np.sum(chunk)), 8),
             "std_return": round(float(np.std(chunk, ddof=1)), 8),
             "sharpe": None if sharpe is None else round(sharpe, 6),
+            # BRAIN Fitness needs a turnover figure per period; the PnL cache carries a
+            # returns path only, so an honest subperiod Fitness cannot be derived here.
+            "fitness": None,
+            "fitness_status": FITNESS_UNAVAILABLE,
         })
     return result
 
@@ -133,18 +159,29 @@ def yearly_stats(dates: Sequence[Any], returns: np.ndarray) -> list[dict[str, An
 
 
 def rolling_stats(returns: np.ndarray, *, window: int = ROLLING_WINDOW) -> dict[str, Any]:
-    """Rolling-window Sharpe, so an isolated good stretch is visible as such."""
+    """Rolling-window Sharpe and return, so an isolated good stretch is visible as such.
+
+    Sharpe alone hides whether a stable window carried a positive or negative return, so the
+    window mean (per-day) and cumulative (per-window) returns are reported alongside it.
+    """
     usable = min(window, returns.size)
     if returns.size < 2 or usable < 2:
         return {"status": "unavailable"}
     windows: list[float] = []
+    means: list[float] = []
+    cumulative: list[float] = []
     for start in range(0, returns.size - usable + 1):
-        value = _sharpe(returns[start : start + usable])
+        chunk = returns[start : start + usable]
+        value = _sharpe(chunk)
         if value is not None:
             windows.append(value)
+        means.append(float(np.mean(chunk)))
+        cumulative.append(float(np.sum(chunk)))
     if not windows:
         return {"status": "unavailable"}
     array = np.asarray(windows, dtype=float)
+    mean_array = np.asarray(means, dtype=float)
+    cumulative_array = np.asarray(cumulative, dtype=float)
     return {
         "status": "available",
         "window": int(usable),
@@ -153,6 +190,10 @@ def rolling_stats(returns: np.ndarray, *, window: int = ROLLING_WINDOW) -> dict[
         "min_sharpe": round(float(np.min(array)), 6),
         "max_sharpe": round(float(np.max(array)), 6),
         "positive_share": round(float(np.mean(array > 0)), 6),
+        "mean_return": round(float(np.mean(mean_array)), 8),
+        "mean_cumulative_return": round(float(np.mean(cumulative_array)), 8),
+        "min_cumulative_return": round(float(np.min(cumulative_array)), 8),
+        "max_cumulative_return": round(float(np.max(cumulative_array)), 8),
     }
 
 
@@ -173,14 +214,39 @@ def dispersion(values: Sequence[Any]) -> dict[str, Any]:
     }
 
 
-def multiple_testing(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def multiple_testing(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    trials: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Search-size diagnostics, keyed on *trials* for effort and *structures* for evidence.
+
+    ``rows`` are the unique canonical candidates (one per distinct expression). ``trials``,
+    when supplied, is the campaign's ledger of research decisions and is the source of the
+    raw search count. Two decisions on one candidate are two trials but one independent
+    structure, so the discount below never treats a duplicate as a second test:
+
+    * ``trial_count``        raw research decisions;
+    * ``candidate_count``    unique canonical candidates;
+    * ``independence_count`` distinct skeletons — the effective number of independent tests.
+
+    ``effective_number_of_trials`` stays advisory and equals ``independence_count``.
+    """
+    trial_count = len(trials) if trials is not None else len(rows)
+    candidate_count = len(rows)
     sharpes = _finite([row.get("sharpe") for row in rows])
     families = {str(row.get("signal_family") or "unknown") for row in rows}
     structures = {str(row.get("skeleton_hash") or row.get("id")) for row in rows}
-    n = len(rows)
     independent = max(1, len(structures)) if rows else 0
     if len(sharpes) < 2:
-        return {"status": "insufficient_trials", "trial_count": n, "independence_count": independent}
+        return {
+            "status": "insufficient_trials",
+            "trial_count": trial_count,
+            "candidate_count": candidate_count,
+            "independence_count": independent,
+            "effective_number_of_trials": independent,
+            "distinct_families": len(families),
+        }
     best = float(np.max(sharpes))
     mean = float(np.mean(sharpes))
     std = float(np.std(sharpes, ddof=1)) or 1e-12
@@ -189,7 +255,8 @@ def multiple_testing(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     psr = _normal_cdf((best / std) * math.sqrt(max(1, independent - 1)))
     return {
         "status": "advisory",
-        "trial_count": n,
+        "trial_count": trial_count,
+        "candidate_count": candidate_count,
         "independence_count": independent,
         "effective_number_of_trials": independent,
         "distinct_families": len(families),
@@ -306,6 +373,7 @@ def _pnl_stability(db: research_db.ResearchDB, rows: Sequence[Mapping[str, Any]]
             "flat_return_path": bool(returns.size and not np.any(returns)),
             "max_drawdown": round(_max_drawdown(levels), 8),
             "subperiods": subperiod_stats(returns),
+            "subperiod_fitness_status": FITNESS_UNAVAILABLE,
             "yearly": yearly_stats(dates, returns),
             "rolling": rolling_stats(returns),
             "metric_basis": "daily_returns",
@@ -315,11 +383,29 @@ def _pnl_stability(db: research_db.ResearchDB, rows: Sequence[Mapping[str, Any]]
     return {"status": "available", "candidates": candidates, "missing": missing, "metric_basis": "daily_returns"}
 
 
+def campaign_candidates(db: research_db.ResearchDB, campaign_id: str | None = None) -> list[dict[str, Any]]:
+    """Candidate rows the campaign's *trial ledger* refers to, deduplicated.
+
+    Campaign membership is the trial ledger, never ``candidates.campaign_id``: candidate
+    identity is the canonical expression, so the same canonical candidate generated by two
+    campaigns has one candidate row and two trial rows. Selecting by ``candidates.campaign_id``
+    would therefore hide a cross-campaign duplicate from every campaign but the first.
+    Trials with no candidate (an in-flight simulation that never produced a row) simply
+    contribute nothing here; they are still counted by :func:`trial_accounting`.
+    """
+    where = "WHERE t.campaign_id=?" if campaign_id is not None else ""
+    params: tuple[Any, ...] = (campaign_id,) if campaign_id is not None else ()
+    return db.query(
+        "SELECT DISTINCT c.* FROM candidates c JOIN research_trials t ON t.candidate_id=c.id"
+        f" {where} ORDER BY c.created_at, c.id",
+        params,
+    )
+
+
 def campaign_report(db: research_db.ResearchDB, campaign_id: str | None = None, *, persist: bool = True) -> dict[str, Any]:
     trials = db.trials(campaign_id)
-    where = "WHERE campaign_id=?" if campaign_id else ""
-    rows = db.query(f"SELECT * FROM candidates {where} ORDER BY created_at, id", (campaign_id,) if campaign_id else ())
-    trials_metrics = multiple_testing(rows)
+    rows = campaign_candidates(db, campaign_id)
+    trials_metrics = multiple_testing(rows, trials=trials)
     report = {
         "report_version": REPORT_VERSION,
         "campaign_id": campaign_id,
