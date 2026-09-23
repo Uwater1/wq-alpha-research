@@ -108,14 +108,70 @@ class OperatorSpec:
         return float("inf") if self.varargs else self.required + self.optional
 
 
+#: Severity vocabulary for a finding. "warning" lowers priority, "error" rejects locally.
+SEVERITY_ERROR = "error"
+SEVERITY_WARNING = "warning"
+SEVERITIES = (SEVERITY_ERROR, SEVERITY_WARNING)
+
+#: Finding codes this module owns (type codes live in compatibility).
+CODE_UNKNOWN_KEYWORD = "UNKNOWN_KEYWORD"
+CODE_DEEP_NESTING = "DEEP_NESTING"
+CODE_OUT_OF_SCOPE_FIELD = "OUT_OF_SCOPE_FIELD"
+#: A named optional argument passed positionally. BRAIN requires `hump(x, hump=0.01)`
+#: and refuses `hump(x, 0.01)` with "Invalid number of inputs", but the reference alone
+#: cannot prove that for every operator, so this stays advisory until calibration
+#: measures it against real rejections.
+CODE_POSITIONAL_OPTIONAL_ARGUMENT = "POSITIONAL_OPTIONAL_ARGUMENT"
+
+
+def severity_for_code(code: str, *, type_policy: str, severity_policy: Mapping[str, str] | None = None) -> str:
+    """Resolve one finding code to ``error``/``warning``.
+
+    Precedence: an explicit per-code override (for example a measured calibration policy),
+    then the type policy for ``TYPE_*`` codes, then the advisory warning default.
+    """
+    override = (severity_policy or {}).get(code)
+    if override in SEVERITIES:
+        return override
+    if code.startswith("TYPE_") and type_policy == TYPE_POLICY_STRICT:
+        return SEVERITY_ERROR
+    return SEVERITY_WARNING
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One machine-readable screening finding: a stable code plus a human message.
+
+    Codes are what calibration and replay reason about; messages are what an agent reads.
+    Never branch on the message text.
+    """
+
+    code: str
+    message: str
+    severity: str = SEVERITY_WARNING
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"code": self.code, "message": self.message, "severity": self.severity}
+
+
 @dataclass
 class ValidationReport:
     """Outcome of a static check, plus the structural features worth storing."""
 
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
     features: dict[str, Any] = field(default_factory=dict)
     scope_checked: bool = False
+
+    def add_finding(self, code: str, message: str, severity: str) -> None:
+        """Record a finding and route its message into the matching severity list."""
+        self.findings.append(Finding(code=code, message=message, severity=severity))
+        (self.errors if severity == SEVERITY_ERROR else self.warnings).append(message)
+
+    @property
+    def finding_codes(self) -> list[str]:
+        return sorted({finding.code for finding in self.findings})
 
     @property
     def ok(self) -> bool:
@@ -131,6 +187,7 @@ class ValidationReport:
             "ok": self.ok,
             "errors": self.errors,
             "warnings": self.warnings,
+            "findings": [finding.as_dict() for finding in self.findings],
             "scope_checked": self.scope_checked,
             "features": self.features,
         }
@@ -330,18 +387,26 @@ def validate(
     catalog: Mapping[str, FieldInfo] | None = None,
     operators: Mapping[str, OperatorSpec] | None = None,
     type_policy: str = TYPE_POLICY_ADVISORY,
+    severity_policy: Mapping[str, str] | None = None,
 ) -> ValidationReport:
     """Statically screen one candidate; never raises for a bad expression.
 
     ``type_policy`` decides how a known field/operator type mismatch is reported:
     ``advisory`` (default) warns and only lowers priority, ``strict`` rejects locally.
-    Malformed expressions, unknown operators, wrong arity and impossible settings stay
-    errors under both policies.
+    ``severity_policy`` overrides severity per finding *code*, which is how a measured
+    ``finding_calibration`` policy promotes only the rules that history shows BRAIN really
+    refuses. Malformed expressions, unknown operators, wrong arity and impossible settings
+    stay errors under every policy.
     """
     if type_policy not in TYPE_POLICIES:
         raise ValueError(f"unknown type_policy {type_policy!r}; expected one of {list(TYPE_POLICIES)}")
-    strict_types = type_policy == TYPE_POLICY_STRICT
+    for code, severity in (severity_policy or {}).items():
+        if severity not in SEVERITIES:
+            raise ValueError(f"unknown severity {severity!r} for finding {code!r}")
     report = ValidationReport()
+
+    def finding(code: str, message: str) -> None:
+        report.add_finding(code, message, severity_for_code(code, type_policy=type_policy, severity_policy=severity_policy))
     try:
         normalized = canonical.normalize_expression(expression)
     except ValueError as exc:
@@ -362,7 +427,7 @@ def validate(
 
     # 2. calls: known operator, argument count, keyword arguments, type compatibility
     field_types = {name: info.type for name, info in catalog.items()}
-    type_findings: list[str] = []
+    type_findings: list[tuple[str, str]] = []
     call_spans: list[tuple[int, int]] = []
     for match in _CALL_RE.finditer(masked):
         name = match.group(1)
@@ -375,14 +440,11 @@ def validate(
         call_spans.append((open_index, close_index))
         arguments = _split_args(masked[open_index + 1 : close_index])
         positional = [a.strip() for a in arguments if a.strip() and _KWARG_RE.match(a) is None]
-        # Type compatibility findings are collected here and routed by `type_policy`
-        # after the field checks; the catalog-scope question ('is this field real here?')
-        # stays a separate check below.
-        type_findings.extend(
-            compatibility.type_errors(
-                lower, [compatibility.bare_field_argument(argument, field_types) for argument in positional]
-            )
-        )
+        # Type compatibility findings are collected here and routed by the resolved
+        # severity after the field checks; the catalog-scope question ('is this field real
+        # here?') stays a separate check below.
+        argument_fields = [compatibility.bare_field_argument(argument, field_types) for argument in positional]
+        type_findings.extend(compatibility.type_findings(lower, argument_fields))
         spec = operators.get(lower)
         if spec is None:
             report.errors.append(f"unknown operator {name!r}")
@@ -392,13 +454,22 @@ def validate(
                 report.errors.append(f"{lower} needs at least {spec.required} argument(s), got {len(positional)}")
             elif len(positional) > spec.maximum:
                 report.errors.append(f"{lower} accepts at most {int(spec.maximum)} argument(s), got {len(positional)}")
+            elif len(positional) > spec.required:
+                optional_names = compatibility.named_optional_arguments(lower)
+                optional_index = len(positional) - spec.required - 1
+                if 0 <= optional_index < len(optional_names):
+                    finding(
+                        CODE_POSITIONAL_OPTIONAL_ARGUMENT,
+                        f"{lower}() expects its {optional_names[optional_index]!r} argument by keyword, "
+                        "got it positionally",
+                    )
         known_keywords = {"filter", "rate", "std", "constant", "driver", "sigma", "lag", "rettype", "dense",
                           "lookback", "k", "ignore", "hump", "range", "buckets", "skipBoth", "NaNGroup",
                           "useStd", "limit", "scale", "longscale", "shortscale", "group", "weight"}
         for argument in arguments:
             keyword = _KWARG_RE.match(argument)
             if keyword is not None and keyword.group(1) not in known_keywords:
-                report.warnings.append(f"unknown keyword argument {keyword.group(1)!r} on {lower}()")
+                finding(CODE_UNKNOWN_KEYWORD, f"unknown keyword argument {keyword.group(1)!r} on {lower}()")
 
     # 3. fields: unknown names and vector usage
     called = {match.group(1).lower() for match in _CALL_RE.finditer(masked)}
@@ -421,26 +492,26 @@ def validate(
                 hint = _closest(token.lower(), catalog)
                 report.errors.append(f"unknown field {token!r}" + (f" (did you mean {hint!r}?)" if hint else ""))
             else:
-                report.warnings.append(f"field {token!r} is not in the local snapshot (outside its scope)")
+                finding(CODE_OUT_OF_SCOPE_FIELD, f"field {token!r} is not in the local snapshot (outside its scope)")
             continue
         fields_used[info.id] = info
 
     if fields_used:
         for info in fields_used.values():
-            misuse = compatibility.vector_misuse(
+            misuse = compatibility.vector_misuse_finding(
                 info.id, info.type, _inside_vector_operator(masked, info.id, call_spans)
             )
             if misuse:
                 type_findings.append(misuse)
 
-    # The group-argument rule is owned by compatibility.type_errors() above; the `groups`
+    # The group-argument rule is owned by compatibility.type_findings() above; the `groups`
     # feature below still records the written argument for ranking and provenance.
-    if type_findings:
-        (report.errors if strict_types else report.warnings).extend(type_findings)
+    for code, message in type_findings:
+        finding(code, message)
 
     depth = canonical.expression_depth(normalized)
     if depth > DEEP_DEPTH_WARNING:
-        report.warnings.append(f"expression depth {depth} is deep (>{DEEP_DEPTH_WARNING})")
+        finding(CODE_DEEP_NESTING, f"expression depth {depth} is deep (>{DEEP_DEPTH_WARNING})")
 
     report.features = {
         "fields": sorted(fields_used),

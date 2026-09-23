@@ -33,9 +33,10 @@ closing it:
   concurrent writers cannot overwrite a stale skill; user-owned/pinned guidance is
   protected; private data cannot be compiled into tracked files; the loop is CLI/SQLite
   based with no agent-specific runtime;
-- **unmet: "historical simulation cache can evaluate at least some proposed
-  policy/skill changes offline"** — this is exactly P5 (offline research-policy
-  benchmark), which is not implemented yet.
+- met: "historical simulation cache can evaluate at least some proposed policy/skill
+  changes offline" — `scripts/policy_replay.py` replays selection policies and the
+  calibration evidence against local history with no BRAIN calls (P5). Closing #1 now
+  depends only on the CLI-surface decision below.
 
 It also lists P12 implementation items that are outside the acceptance criteria and are
 still open, tracked here rather than in #1:
@@ -46,8 +47,8 @@ still open, tracked here rather than in #1:
 - agent/model telemetry tables (`agent_runs`, `skill_versions`, `skill_usage`,
   `eval_runs`); `skill_mutations` currently covers the mutation ledger only.
 
-Closing #1 therefore depends on P5 (plus the CLI-surface decision above). This issue is
-the consolidation tracker for that work.
+Closing #1 therefore depends on the CLI-surface decision above. This issue is the
+consolidation tracker for that work.
 
 Clean up artifacts left by the completed roadmap before adding new architecture.
 
@@ -581,7 +582,33 @@ operator, wrong arity, malformed, impossible settings) stay errors under both po
 
 # P5 — Offline research-policy benchmark
 
-Before letting a new search policy spend real BRAIN capacity, evaluate it offline.
+**Status: implemented (2026-09-22).** `scripts/policy_replay.py` replays candidate-selection
+policies over local history and scores the funnel each would have produced; there are no BRAIN
+calls and no credentials involved.
+
+The point-in-time contract is enforced by one rule: a policy only ever sees pre-simulation
+facts, and an outcome is reachable only when it had settled *strictly before* the decision's
+clock. The clock is the monotonic `events.id`, not a timestamp — wall-clock stamps are
+second-granularity in this database, so a candidate queued and simulated inside one second
+would otherwise look settled the moment it was created and every decision would score as a
+free cache hit. A candidate created after the decision is invisible; one that settled at or
+after it exposes nothing (so neither the choice nor the calibration it consults can look
+ahead); one that settled before it costs no slot, because the real queue would serve it from
+cache. `replay()` re-checks all three afterwards and reports `leakage_check`.
+
+Decisions follow the **generation waves** — work that arrived together (one `source`, one
+clock second), which is how this history actually arrived (batches of 10–26 candidates per
+second). A round opens when a batch has finished arriving; the policy picks from everything
+visible then and may spend its remaining budget there, but the round's information is frozen,
+so it cannot learn from its own picks. Presenting one new candidate per step instead would
+force every policy to reproduce creation order and make the comparison meaningless.
+
+Measured on the local corpus (179 candidates, budget 20): FIFO and priority ranking agree on
+wasted share but differ on `simulations_to_first_is_pass` (17 vs 19), `coverage` reaches 4
+datasets against FIFO's 2, and `staged_search` 4 families against FIFO's 2. Policy comparison
+is discriminating exactly where the funnel is: the budget is the knob, and the default is
+deliberately scarce (10% of the corpus) because a budget covering the corpus makes every
+policy score the same.
 
 ## P5.1 — Historical replay environment
 
@@ -635,11 +662,73 @@ seed
 result metrics
 ```
 
+Each run is appended to the `policy_replay_runs` table with its comparison id, corpus size,
+simulation budget, seed, metrics and baseline deltas, so a policy's evidence is durable and
+attributable.
+
 ### Acceptance
 
 - candidate selection/search policies can be evaluated without BRAIN calls;
 - replay enforces point-in-time information boundaries;
 - a new policy has measurable evidence before becoming default.
+
+### Shipped surface
+
+```bash
+./.venv/bin/python scripts/policy_replay.py --list
+./.venv/bin/python scripts/policy_replay.py --compare --budget 20
+./.venv/bin/python scripts/policy_replay.py --run calibrated_skip --budget 20 --json
+```
+
+Policies: `fifo`, `ranking`, `staged_search` and `surrogate` (the baselines), plus `coverage`,
+`calibrated_rank` and `calibrated_skip`. Returning nothing from `order()` means *decline*: the
+rest of that round is skipped and no slot is spent, which is how "do not run work history says
+BRAIN refuses" is expressed. The calibrated policies read a calibration computed only from
+outcomes settled strictly before the round's clock.
+
+### Calibration of the advisory rules (`scripts/finding_calibration.py`)
+
+The P4 decision to keep type findings advisory was a guess: the offline reference files cannot
+prove what the platform accepts. This measures it instead. Every candidate that actually
+reached BRAIN is re-screened locally with a *neutral* severity policy, and each finding code
+is scored against the real outcome, where only `simulations.status = 'ERROR'` counts as a
+refusal. An IS-gate failure means BRAIN accepted the request and evaluated it, so it is not
+evidence that a local rule was right; a candidate the local gate itself refused never reached
+the platform, so it carries no evidence at all. Both are excluded from the denominator, and
+the per-code request counts are reported so the denominator is visible.
+
+Measured on the local corpus: 166 settleable candidates, 162 accepted, 4 refused.
+`POSITIONAL_OPTIONAL_ARGUMENT` fires on 17 candidates and only 2 of them were refused
+(11.8%), so it stays advisory and is explicitly marked inconclusive — the same rule that a
+naive "this looks wrong" heuristic would have promoted. `TYPE_GROUP_ARGUMENT` and
+`TYPE_VECTOR_UNAGGREGATED` have one sample each and are refused promotion for insufficient
+evidence.
+
+Nothing is enforced by measuring, and a rejection rate is not by itself a reason to enforce
+either: refusing work that *would* have passed costs passes, so an accurate rule can still be
+useless or harmful. `--approve` therefore replays each proposed code over the whole corpus
+with the flagged work declined, and enforces only the codes that reach the *same passes for
+less capacity*. The three outcomes are distinct on purpose:
+
+- **improved** — same passes, fewer simulations: worth enforcing;
+- **regression** — fewer passes: refused, with the lost passes named;
+- **insufficient_evidence** — no baseline ever bought a slot on a candidate carrying the code,
+  or the rule would decline everything and leave nothing to compare.
+
+The two views are reported side by side (`--refresh --funnel`) because they disagree in both
+directions on the real corpus: `POSITIONAL_OPTIONAL_ARGUMENT` is refused by BRAIN only 2 times
+out of 17, so the rate view calls it inconclusive, yet all 17 candidates delivered nothing, so
+the funnel view shows the same 7 passes for 17 fewer simulations. Conversely a code carried by
+passing work is refused by the funnel however perfectly it predicts refusals. `--code` proposes
+a specific rule, `--force` records an explicit override, and `--clear` reverses enforcement;
+approval covers the whole corpus by default, because a scarce budget would only reach the first
+generation wave and report no evidence for anything tripped later.
+
+That keeps "the pipeline now rejects this" an explicit, reviewable, reversible act, and the
+point-in-time replay is what prices it: on a corpus with refused `group_rank` work first,
+`calibrated_skip` at `min_samples=1` pays for exactly one refusal and then declines every
+flagged candidate, while the same policy at a threshold history cannot meet behaves exactly
+like FIFO. The difference between those two runs is the measured price of requiring evidence.
 
 ---
 

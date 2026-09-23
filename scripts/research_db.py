@@ -79,8 +79,12 @@ DB_ENV_VAR = "WQ_RESEARCH_DB"
 META_ACTIVE_SET_VERSION = "active_set_version"
 #: meta key marking the one-time ledger backfill of candidates that predate research_trials.
 META_TRIALS_BACKFILLED = "research_trials_backfilled"
+#: meta key holding an *approved* per-finding severity policy (finding code -> severity).
+#: Absent means every advisory finding stays a warning. Written only by an explicit
+#: approval step (scripts/finding_calibration.py --approve), never automatically.
+META_VALIDATION_SEVERITY_POLICY = "validation_severity_policy"
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
@@ -570,6 +574,39 @@ SCHEMA: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_robustness_campaign ON robustness_reports(campaign_id, created_at)",
+    # Measured evidence for the advisory screening rules, and offline policy benchmarks.
+    """
+    CREATE TABLE IF NOT EXISTS finding_calibrations (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        calibration_version TEXT NOT NULL,
+        as_of               TEXT,
+        scope_json          TEXT,
+        observations        INTEGER NOT NULL DEFAULT 0,
+        rejected            INTEGER NOT NULL DEFAULT 0,
+        policy_json         TEXT NOT NULL,
+        report_json         TEXT NOT NULL,
+        created_at          TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_finding_calibrations_created ON finding_calibrations(created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS policy_replay_runs (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        comparison_id          TEXT,
+        policy_name            TEXT NOT NULL,
+        policy_version         TEXT NOT NULL,
+        parameters_json        TEXT NOT NULL,
+        training_cutoff        TEXT,
+        evaluation_window_json TEXT,
+        corpus_size            INTEGER NOT NULL,
+        simulation_budget      INTEGER NOT NULL,
+        seed                   INTEGER NOT NULL,
+        is_baseline            INTEGER NOT NULL DEFAULT 0,
+        metrics_json           TEXT NOT NULL,
+        created_at             TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_policy_replay_comparison ON policy_replay_runs(comparison_id, id)",
     FIELD_COVERAGE_DDL,
     """
     CREATE TABLE IF NOT EXISTS operator_compatibility (
@@ -1122,6 +1159,7 @@ class ResearchDB:
         operator_catalog_version: str | None = None,
         provenance: Mapping[str, Any] | None = None,
         record_trial: bool = True,
+        severity_policy: Mapping[str, str] | None = None,
         requeue: bool = False,
         validate: bool = True,
     ) -> QueueOutcome:
@@ -1165,7 +1203,10 @@ class ResearchDB:
         if validate:
             import validate as validator  # local import: keeps the store import-light
 
-            report = validator.validate(normalized_expression, normalized_settings)
+            # An approved (measured) severity policy is enforced here; with nothing approved
+            # every finding stays advisory and only lowers priority.
+            policy = self.load_severity_policy() if severity_policy is None else dict(severity_policy)
+            report = validator.validate(normalized_expression, normalized_settings, severity_policy=policy)
             if not report.ok:
                 return self._reject_invalid(
                     key, expression, normalized_expression, normalized_settings, settings_json, report, source,
@@ -1579,6 +1620,117 @@ class ResearchDB:
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         return [dict(row) for row in self._conn.execute(sql, params)]
+
+    # -- screening severity policy, calibration, and policy replay ---------
+
+    def load_severity_policy(self) -> dict[str, str]:
+        """Approved per-finding severity overrides (empty when nothing is approved)."""
+        raw = self.get_meta(META_VALIDATION_SEVERITY_POLICY)
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(parsed, Mapping):
+            return {}
+        return {str(code): str(severity) for code, severity in parsed.items()}
+
+    def save_severity_policy(self, policy: Mapping[str, str]) -> dict[str, str]:
+        cleaned = {str(code): str(severity) for code, severity in dict(policy).items()}
+        self.set_meta(META_VALIDATION_SEVERITY_POLICY, json.dumps(cleaned, sort_keys=True))
+        return cleaned
+
+    def clear_severity_policy(self) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM meta WHERE key=?", (META_VALIDATION_SEVERITY_POLICY,))
+
+    def record_finding_calibration(self, report: Mapping[str, Any]) -> int:
+        """Persist a calibration report so a promoted rule has durable evidence behind it."""
+        observations_block = report.get("observations") or {}
+        with self._tx() as conn:
+            cursor = conn.execute(
+                """INSERT INTO finding_calibrations(
+                       calibration_version, as_of, scope_json, observations, rejected,
+                       policy_json, report_json, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    str(report.get("calibration_version") or "unknown"),
+                    report.get("as_of"),
+                    json.dumps(report.get("scope"), sort_keys=True) if report.get("scope") else None,
+                    int(observations_block.get("total") or 0),
+                    int(observations_block.get("rejected") or 0),
+                    json.dumps(report.get("recommended_policy") or {}, sort_keys=True),
+                    json.dumps(report, sort_keys=True, default=str),
+                    now_iso(),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def latest_finding_calibration(self) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM finding_calibrations ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            report = json.loads(row["report_json"])
+        except ValueError:
+            return None
+        return {**report, "calibration_id": int(row["id"])}
+
+    def record_policy_replay(
+        self,
+        *,
+        policy_name: str,
+        policy_version: str,
+        parameters: Mapping[str, Any] | None,
+        training_cutoff: str | None,
+        evaluation_window: Mapping[str, Any] | None,
+        corpus_size: int,
+        simulation_budget: int,
+        seed: int,
+        metrics: Mapping[str, Any],
+        comparison_id: str | None = None,
+        is_baseline: bool = False,
+        created_at: str | None = None,
+    ) -> int:
+        """Append one policy-replay result (P5.4 policy versioning)."""
+        with self._tx() as conn:
+            cursor = conn.execute(
+                """INSERT INTO policy_replay_runs(
+                       comparison_id, policy_name, policy_version, parameters_json, training_cutoff,
+                       evaluation_window_json, corpus_size, simulation_budget, seed, is_baseline,
+                       metrics_json, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    comparison_id, str(policy_name), str(policy_version),
+                    json.dumps(dict(parameters or {}), sort_keys=True, default=str),
+                    training_cutoff,
+                    json.dumps(dict(evaluation_window), sort_keys=True) if evaluation_window else None,
+                    int(corpus_size), int(simulation_budget), int(seed), int(bool(is_baseline)),
+                    json.dumps(dict(metrics), sort_keys=True, default=str),
+                    created_at or now_iso(),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def policy_replay_runs(self, comparison_id: str | None = None, *, limit: int | None = None) -> list[dict[str, Any]]:
+        where = "WHERE comparison_id=?" if comparison_id is not None else ""
+        params: list[Any] = [comparison_id] if comparison_id is not None else []
+        sql = f"SELECT * FROM policy_replay_runs {where} ORDER BY id"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        result: list[dict[str, Any]] = []
+        for row in self._conn.execute(sql, params):
+            payload = dict(row)
+            for key in ("parameters_json", "evaluation_window_json", "metrics_json"):
+                try:
+                    payload[key.removesuffix("_json")] = json.loads(payload[key]) if payload[key] else None
+                except ValueError:
+                    payload[key.removesuffix("_json")] = None
+            result.append(payload)
+        return result
 
     def get_candidate(self, candidate_id: int) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()

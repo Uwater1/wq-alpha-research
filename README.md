@@ -71,6 +71,8 @@ wq-alpha-research/
 │   ├── archive.py             # quality-diversity archive + family allocation
 │   ├── robustness.py          # search-aware advisory diagnostics (daily returns)
 │   ├── field_intelligence.py  # scope-aware field/operator coverage
+│   ├── finding_calibration.py # which advisory rules BRAIN actually refuses (measured)
+│   ├── policy_replay.py       # offline benchmark of selection policies (no BRAIN calls)
 │   ├── credential_crypto.py
 │   ├── fetch_operators.py
 │   ├── canonical.py         # expression/settings normalization + cache keys
@@ -272,6 +274,51 @@ dispersion, and states explicitly when PnL data is missing. `field_intelligence.
 keys coverage by field + catalog version + scope, and derives each pipeline stage from
 real evidence (validation events, terminal simulation rows, submission rows) rather than
 from the candidate's current status.
+
+A change to the selection policy can now show evidence before it spends capacity. Both
+halves of P5 stay offline:
+
+```bash
+./.venv/bin/python scripts/finding_calibration.py --refresh --funnel  # rates + per-code replay verdicts
+./.venv/bin/python scripts/finding_calibration.py --report
+./.venv/bin/python scripts/finding_calibration.py --approve [--code CODE] [--force]
+./.venv/bin/python scripts/finding_calibration.py --clear
+
+./.venv/bin/python scripts/policy_replay.py --list
+./.venv/bin/python scripts/policy_replay.py --compare --budget 20
+./.venv/bin/python scripts/policy_replay.py --run calibrated_skip --budget 20 --json
+```
+
+`finding_calibration.py` answers "is this local rule actually worth enforcing?" with two
+independent measurements. The **rejection rate** re-screens every candidate that reached
+BRAIN and scores each finding code against the real outcome, where only a platform
+**refusal** (`ERROR`) counts — an IS-gate failure means BRAIN accepted and evaluated the
+request, and a candidate the local gate itself blocked never reached the platform, so neither
+is evidence about the rule. The **funnel verdict** asks the better question: would declining
+the candidates this code flags have produced a better funnel? It replays the whole corpus with
+the flagged work declined and requires the same passes for less capacity — losing a pass is a
+regression however accurate the rule is, and a rule that declines everything proves nothing.
+
+On the local corpus the two views disagree, which is the point of having both.
+`POSITIONAL_OPTIONAL_ARGUMENT` fires on 17 candidates and BRAIN refused only 2 of them, so the
+rate view calls it inconclusive — but all 17 failed to deliver anything, so the funnel view
+shows the same 7 passes for 17 fewer simulations. The rate view would have skipped a rule the
+funnel supports; a rule that flags *passing* work is refused for the opposite reason.
+
+Measuring changes nothing. `--approve` enforces only the codes whose own replay supports them
+(a code can be proposed by name with `--code`), `--force` records an explicit override, and
+`--clear` reverses enforcement. Only the persisted map is read by `queue_candidate`.
+
+`policy_replay.py` scores selection policies (`fifo`, `ranking`, `staged_search`, `surrogate`,
+`coverage`, `calibrated_rank`, `calibrated_skip`) on the funnel each would have produced —
+simulations to first IS_PASS, passes per simulation, top-k recall against a perfect oracle,
+wasted variants, family/dataset/niche diversity, and robustness-adjusted quality. The
+point-in-time contract is the whole point: a policy sees only pre-simulation facts, and an
+outcome is visible only when it settled **strictly before** the decision's clock, where the
+clock is the monotonic `events.id` rather than a timestamp (second-granularity stamps tie
+constantly, which would make every decision a free cache hit). Decisions follow generation
+waves, the round's information is frozen, and `leakage_check` re-verifies all of it after
+the fact. Comparison runs are appended to `policy_replay_runs`.
 
 The supplied field snapshot covers 4,367 fields across 14 dataset families (including analyst, fundamental, news, option, price/volume, social-media, model, and universe data); the operator snapshot contains 66 operators. The generator uses metadata-compatible templates and deliberately skips GROUP/UNIVERSE/SYMBOL fields when a regular alpha expression cannot consume them directly.
 

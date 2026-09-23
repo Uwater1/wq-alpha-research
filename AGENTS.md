@@ -141,6 +141,29 @@ Do not rely on agent-specific memory, MCP, Codex, Pi, OpenCode, Hermes, or anoth
 
 A model prediction may reorder candidates; it must not be the sole reason to reject one.
 
+Advisory screening findings can be calibrated against what BRAIN actually refused, and a
+selection policy can be benchmarked offline before it spends capacity. Both are local and
+credential-free:
+
+```bash
+./.venv/bin/python scripts/finding_calibration.py --refresh
+./.venv/bin/python scripts/finding_calibration.py --report
+./.venv/bin/python scripts/finding_calibration.py --approve   # explicit, reversible
+./.venv/bin/python scripts/policy_replay.py --compare --budget 20
+```
+
+A finding is only evidence of a bad rule when BRAIN *refused* the request; an IS-gate
+failure means the request was accepted and evaluated. A rejection rate is also not evidence
+that enforcing a rule *pays*: refusing work that would have passed costs passes. So
+`--approve` replays each proposed code against the corpus and enforces only the codes whose
+counterfactual shows the same passes for less capacity. `--code CODE` proposes a specific
+rule, `--force` records an explicit override, and `--clear` reverses any enforcement.
+
+`policy_replay.py` accepts nothing that leaked from the future: a policy sees pre-simulation
+facts only, an outcome is visible only when it settled strictly before the decision's
+automatic event clock, and `leakage_check` re-verifies that afterwards. Never rank or
+shortlist on a replay metric produced by a policy that failed its leakage check.
+
 ## 6. Tests and changes
 
 Run the default offline suite before merging repository changes:

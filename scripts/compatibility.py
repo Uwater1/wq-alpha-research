@@ -170,6 +170,29 @@ def constraints(path: str | Path = OPERATORS_PATH) -> dict[str, OperatorConstrai
     return result
 
 
+@lru_cache(maxsize=4)
+def optional_argument_names(path: str | Path = OPERATORS_PATH) -> dict[str, tuple[str, ...]]:
+    """Named optional arguments per operator, e.g. ``hump -> ('hump',)``.
+
+    BRAIN writes these as ``name = value`` in the published definition and requires them
+    as keyword arguments: ``hump(x, 0.005)`` is refused with "Invalid number of inputs",
+    while ``hump(x, hump=0.005)`` is accepted.
+    """
+    result: dict[str, tuple[str, ...]] = {}
+    for item in operator_definitions(path):
+        names: list[str] = []
+        for argument in _split_definition_arguments(str(item.get("definition") or "")):
+            head, separator, _value = argument.partition("=")
+            if separator and head.strip():
+                names.append(head.strip())
+        result[str(item["name"]).lower()] = tuple(names)
+    return result
+
+
+def named_optional_arguments(operator: str) -> tuple[str, ...]:
+    return optional_argument_names().get(str(operator).lower(), ())
+
+
 def constraint_for(operator: str) -> OperatorConstraint | None:
     return constraints().get(str(operator).lower())
 
@@ -202,11 +225,21 @@ def bare_field_argument(argument: str, field_types: Mapping[str, str]) -> tuple[
     return token, str(field_type).upper()
 
 
-def type_errors(
+#: Stable finding codes. Callers persist and calibrate on these, so they are part of the
+#: public contract and must not be renamed without a migration.
+CODE_VECTOR_UNAGGREGATED = "TYPE_VECTOR_UNAGGREGATED"
+CODE_VECTOR_OPERATOR_ARGUMENT = "TYPE_VECTOR_OPERATOR_ARGUMENT"
+CODE_GROUP_ARGUMENT = "TYPE_GROUP_ARGUMENT"
+TYPE_FINDING_CODES = frozenset(
+    {CODE_VECTOR_UNAGGREGATED, CODE_VECTOR_OPERATOR_ARGUMENT, CODE_GROUP_ARGUMENT}
+)
+
+
+def type_findings(
     operator: str,
     argument_fields: Sequence[tuple[str, str] | None],
-) -> list[str]:
-    """Known-impossible type mismatches for one call.
+) -> list[tuple[str, str]]:
+    """Known-impossible type mismatches for one call, as ``(code, message)`` pairs.
 
     ``argument_fields`` holds one entry per *positional* argument: ``(field_id, type)``
     for a bare catalog field and ``None`` for anything else (a nested expression, a
@@ -216,23 +249,33 @@ def type_errors(
     constraint = constraint_for(operator)
     if constraint is None:
         return []
-    errors: list[str] = []
+    findings: list[tuple[str, str]] = []
     first = argument_fields[0] if argument_fields else None
     if (constraint.requires_vector or is_vector_aggregator(operator)) and first is not None:
         if first[1] != VECTOR:
-            errors.append(
-                f"{constraint.name}() requires a VECTOR field, got {first[1]} field {first[0]!r}"
-            )
+            findings.append((
+                CODE_VECTOR_OPERATOR_ARGUMENT,
+                f"{constraint.name}() requires a VECTOR field, got {first[1]} field {first[0]!r}",
+            ))
     if constraint.requires_group:
         index = group_argument_index(operator, len(argument_fields))
         if index is not None and 0 <= index < len(argument_fields):
             argument = argument_fields[index]
             if argument is not None and argument[1] != GROUP:
-                errors.append(
+                findings.append((
+                    CODE_GROUP_ARGUMENT,
                     f"{constraint.name}() requires a GROUP field for its group argument, "
-                    f"got {argument[1]} field {argument[0]!r}"
-                )
-    return errors
+                    f"got {argument[1]} field {argument[0]!r}",
+                ))
+    return findings
+
+
+def type_errors(
+    operator: str,
+    argument_fields: Sequence[tuple[str, str] | None],
+) -> list[str]:
+    """Messages only (see :func:`type_findings` for the structured form)."""
+    return [message for _code, message in type_findings(operator, argument_fields)]
 
 
 def vector_misuse(field_id: str, field_type: str, aggregated: bool) -> str | None:
@@ -243,6 +286,12 @@ def vector_misuse(field_id: str, field_type: str, aggregated: bool) -> str | Non
         f"vector field {field_id!r} must be aggregated with vec_avg/vec_sum "
         "before most operators can consume it"
     )
+
+
+def vector_misuse_finding(field_id: str, field_type: str, aggregated: bool) -> tuple[str, str] | None:
+    """Structured form of :func:`vector_misuse`."""
+    message = vector_misuse(field_id, field_type, aggregated)
+    return None if message is None else (CODE_VECTOR_UNAGGREGATED, message)
 
 
 def group_argument_positions(
