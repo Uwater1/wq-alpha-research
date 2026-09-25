@@ -617,21 +617,36 @@ would otherwise look settled the moment it was created and every decision would 
 free cache hit. A candidate created after the decision is invisible; one that settled at or
 after it exposes nothing (so neither the choice nor the calibration it consults can look
 ahead); one that settled before it costs no slot, because the real queue would serve it from
-cache. `replay()` re-checks all three afterwards and reports `leakage_check`.
+cache. `replay()` re-checks all of this afterwards and reports `leakage_check`, naming the
+failing step — so a reintroduced leak cannot pass silently.
+
+The single "settled strictly before" rule is enforced in every place it can be violated:
+
+- outcomes are exposed **stage by stage**. A result is several facts, each with its own
+  `events.id`: the simulation result, the correlation check (`self_corr`), and the move beyond
+  the IS gate (correlation pass, submission verdict, ACTIVE). A policy sees only the stages
+  that had settled at its clock, so an IS pass that later failed correlation reads as an IS
+  pass at the moment it passed.
+- the decision's **own history** records earlier choices as attempts but withholds each
+  result until it settled before the current clock, so a later pick in the same round cannot
+  read an earlier pick's outcome.
+- **ranking components** are resolved from the `ranked` events that existed before the clock,
+  never from the candidate's current row, so a later re-rank cannot reach back in time.
+- the **surrogate baseline is trained as of the decision clock** from already-settled results
+  and never consults the persisted live model; below the sample floor it degrades to FIFO.
+- **campaign membership is the `research_trials` ledger**, not `candidates.campaign_id`, so a
+  cross-campaign duplicate is replayed for every campaign that decided on it.
 
 Decisions follow the **generation waves** — work that arrived together (one `source`, one
-clock second), which is how this history actually arrived (batches of 10–26 candidates per
-second). A round opens when a batch has finished arriving; the policy picks from everything
-visible then and may spend its remaining budget there, but the round's information is frozen,
-so it cannot learn from its own picks. Presenting one new candidate per step instead would
-force every policy to reproduce creation order and make the comparison meaningless.
-
-Measured on the local corpus (179 candidates, budget 20): FIFO and priority ranking agree on
-wasted share but differ on `simulations_to_first_is_pass` (17 vs 19), `coverage` reaches 4
-datasets against FIFO's 2, and `staged_search` 4 families against FIFO's 2. Policy comparison
-is discriminating exactly where the funnel is: the budget is the knob, and the default is
-deliberately scarce (10% of the corpus) because a budget covering the corpus makes every
-policy score the same.
+clock second), which is how this history actually arrived (batches of candidates per second).
+A round opens when a batch has finished arriving; the policy picks from everything visible
+then and may spend its remaining budget there, but the round's information is frozen, so it
+cannot learn from its own picks. Presenting one new candidate per step instead would force
+every policy to reproduce creation order and make the comparison meaningless. The per-policy
+numbers move with the corpus and with these corrections; reproduce them locally with
+`--compare`. Policy comparison is discriminating exactly where the funnel is: the budget is
+the knob, and the default is deliberately scarce (10% of the corpus) because a budget
+covering the corpus makes every policy score the same.
 
 ## P5.1 — Historical replay environment
 
@@ -720,12 +735,13 @@ evidence that a local rule was right; a candidate the local gate itself refused 
 the platform, so it carries no evidence at all. Both are excluded from the denominator, and
 the per-code request counts are reported so the denominator is visible.
 
-Measured on the local corpus: 166 settleable candidates, 162 accepted, 4 refused.
-`POSITIONAL_OPTIONAL_ARGUMENT` fires on 17 candidates and only 2 of them were refused
-(11.8%), so it stays advisory and is explicitly marked inconclusive — the same rule that a
-naive "this looks wrong" heuristic would have promoted. `TYPE_GROUP_ARGUMENT` and
-`TYPE_VECTOR_UNAGGREGATED` have one sample each and are refused promotion for insufficient
-evidence.
+On the local corpus a rule such as `POSITIONAL_OPTIONAL_ARGUMENT` fires on many candidates
+while BRAIN refuses only a small share of them, so it stays advisory and is explicitly marked
+inconclusive — the same rule a naive "this looks wrong" heuristic would have promoted. Codes
+with a handful of samples are refused promotion for insufficient evidence. The counts are
+corpus-dependent and reproduced by `--refresh`, so they are not quoted as fixed numbers here;
+the deterministic `TYPE_*` findings are hard gates at the queue boundary (P4) and are no
+longer calibratable.
 
 Nothing is enforced by measuring, and a rejection rate is not by itself a reason to enforce
 either: refusing work that *would* have passed costs passes, so an accurate rule can still be

@@ -304,11 +304,13 @@ the candidates this code flags have produced a better funnel? It replays the who
 the flagged work declined and requires the same passes for less capacity — losing a pass is a
 regression however accurate the rule is, and a rule that declines everything proves nothing.
 
-On the local corpus the two views disagree, which is the point of having both.
-`POSITIONAL_OPTIONAL_ARGUMENT` fires on 17 candidates and BRAIN refused only 2 of them, so the
-rate view calls it inconclusive — but all 17 failed to deliver anything, so the funnel view
-shows the same 7 passes for 17 fewer simulations. The rate view would have skipped a rule the
-funnel supports; a rule that flags *passing* work is refused for the opposite reason.
+On the local corpus the two views disagree, which is the point of having both. A rule can fire
+on a batch of candidates that BRAIN hardly ever refuses — so the rate view calls it
+inconclusive — while none of that flagged work ever passed, so the funnel view still reaches
+the same passes for fewer simulations. The rate view would then have skipped a rule the funnel
+supports; conversely a rule that flags *passing* work is refused by the funnel however
+accurately it predicts refusals. The counts move with the corpus, so `--refresh --funnel`
+reproduces them rather than quoting them here.
 
 Measuring changes nothing. `--approve` enforces only the codes whose own replay supports them
 (a code can be proposed by name with `--code`), `--force` records an explicit override, and
@@ -321,9 +323,32 @@ wasted variants, family/dataset/niche diversity, and robustness-adjusted quality
 point-in-time contract is the whole point: a policy sees only pre-simulation facts, and an
 outcome is visible only when it settled **strictly before** the decision's clock, where the
 clock is the monotonic `events.id` rather than a timestamp (second-granularity stamps tie
-constantly, which would make every decision a free cache hit). Decisions follow generation
-waves, the round's information is frozen, and `leakage_check` re-verifies all of it after
-the fact. Comparison runs are appended to `policy_replay_runs`.
+constantly, which would make every decision a free cache hit). Comparison runs are appended
+to `policy_replay_runs`.
+
+No single leak remains, because each was closed at its source:
+
+- **outcomes are exposed stage by stage.** A candidate's result is several facts, each with
+  its own event clock — the simulation result, the correlation check (`self_corr`), and the
+  move beyond the IS gate (correlation pass, submission verdict, ACTIVE). A policy at clock T
+  sees only the stages that had settled by T, so an IS pass that later failed correlation
+  reads as an IS pass at the moment it passed.
+- **the round's own picks are opaque.** The decision's history records its earlier choices as
+  attempts, but withholds each result until it settled before the current clock, so a later
+  pick in the same generation wave cannot read an earlier pick's outcome.
+- **ranking components are point-in-time.** `priority`/`expected_quality`/`novelty_score`/
+  `failure_risk` are resolved from the `ranked` events that existed before the clock rather
+  than from the candidate's current row, so a later re-rank cannot reach back in time.
+- **the surrogate is trained as of the decision clock.** The `surrogate` baseline builds a
+  model from results already settled at that clock and never consults the persisted live
+  model; below the sample floor it degrades to FIFO.
+- **campaign membership is the `research_trials` ledger**, not `candidates.campaign_id`, so a
+  cross-campaign duplicate is replayed for every campaign that decided on it.
+
+Decisions follow generation waves and the round's information is frozen; `leakage_check`
+re-verifies every one of these invariants afterwards and reports `passed`/`failed` with the
+failing step, so a reintroduced leak cannot go unnoticed. The specific per-policy numbers
+move with the corpus; reproduce them locally with `--compare`.
 
 The supplied field snapshot covers 4,367 fields across 14 dataset families (including analyst, fundamental, news, option, price/volume, social-media, model, and universe data); the operator snapshot contains 66 operators. The generator uses metadata-compatible templates and deliberately skips GROUP/UNIVERSE/SYMBOL fields when a regular alpha expression cannot consume them directly.
 

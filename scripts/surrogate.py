@@ -217,9 +217,36 @@ def _target(row: Mapping[str, Any], target: str) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
-def fit(db: Any, *, penalty: float = 1.0, min_samples: int = 5) -> dict[str, Any]:
-    """Train all targets and persist coefficients plus quality diagnostics."""
+def training_rows(
+    db: Any,
+    *,
+    before_event_id: int | None = None,
+    before_timestamp: str | None = None,
+) -> list[dict[str, Any]]:
+    """Settled rows usable to train an **as-of** model.
+
+    A caller replaying history must pass ``before_event_id`` so the model can only learn from
+    outcomes that had actually settled before the decision it is scoring. ``outcome_event_id``
+    is the monotonic ``events.id`` of the terminal simulation result, so the filter is exact;
+    timestamps are second-granularity and tie, and are only used as an optional extra cap.
+    """
     rows = _enrich_with_parents(db, _rows(db, training=True))
+    if before_event_id is not None:
+        rows = [
+            row for row in rows
+            if isinstance(row.get("outcome_event_id"), int) and row["outcome_event_id"] < int(before_event_id)
+        ]
+    if before_timestamp is not None:
+        rows = [row for row in rows if str(row.get("outcome_at") or "") <= str(before_timestamp)]
+    return rows
+
+
+def train_model(rows: list[Mapping[str, Any]], *, penalty: float = 1.0, min_samples: int = 5) -> dict[str, Any]:
+    """Fit all targets from the given rows and return the model dict (no persistence).
+
+    Split out from :func:`fit` so an offline replay can build a model from a point-in-time
+    slice of history without overwriting the live model on disk.
+    """
     if len(rows) < min_samples:
         raise ValueError(f"need at least {min_samples} settled candidates, found {len(rows)}")
     x, feature_names = _matrix(rows)
@@ -242,11 +269,16 @@ def fit(db: Any, *, penalty: float = 1.0, min_samples: int = 5) -> dict[str, Any
             "mae": round(float(np.mean(np.abs(predictions - y))), 6),
             "mean": round(float(np.mean(y)), 6),
         }
-    model = {
+    return {
         "version": 1, "trained_at": datetime.now(timezone.utc).isoformat(),
         "samples": len(rows), "features": feature_names, "penalty": penalty,
         "targets": models, "diagnostics": diagnostics,
     }
+
+
+def fit(db: Any, *, penalty: float = 1.0, min_samples: int = 5) -> dict[str, Any]:
+    """Train all targets on the full settled history and persist the model."""
+    model = train_model([dict(row) for row in training_rows(db)], penalty=penalty, min_samples=min_samples)
     db.set_meta(MODEL_META_KEY, json.dumps(model, sort_keys=True))
     return model
 

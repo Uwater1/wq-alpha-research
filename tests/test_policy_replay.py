@@ -19,6 +19,7 @@ import compatibility
 import finding_calibration as calibration
 import policy_replay
 import research_db as rdb
+import surrogate
 import validate
 
 GROUP_ARGUMENT_FINDING = compatibility.CODE_GROUP_ARGUMENT
@@ -466,6 +467,148 @@ def test_a_policy_cannot_read_an_outcome_that_had_not_settled(db):
     # The first decision point is the first candidate's creation: nothing had settled yet.
     first_card = environment.items[0].candidate_id
     assert (first_card, False) in seen
+
+
+def test_replay_history_withholds_results_that_had_not_settled(db):
+    """A later pick in the same round must not read an earlier pick's result through history."""
+    first = db.queue_candidate("rank(ts_delta(close, 5))", {"decay": 6}, source="batch-1")
+    second = db.queue_candidate("rank(ts_delta(open, 5))", {"decay": 6}, source="batch-1")
+    for queued in (first, second):
+        db.claim_simulation("seed", candidate_id=queued.candidate_id)
+        db.record_simulation_result(
+            candidate_id=queued.candidate_id, status="DONE",
+            metrics={"sharpe": 1.4, "fitness": 1.1, "turnover": 0.06},
+            checks=[{"name": "LOW_SHARPE", "result": "PASS"}],
+            brain_alpha_id=f"LOCAL{queued.candidate_id}",
+        )
+    environment = policy_replay.ReplayEnvironment.from_db(db, budget=2)
+    seen: list[tuple[int, bool]] = []
+
+    class HistoryWatcher(policy_replay.Policy):
+        name = "history-watcher"
+
+        def order(self, available, context):
+            # The mutation under test: read the ledger of the policy's own decisions.
+            for _card, outcome in context.history:
+                seen.append((context.step, outcome is not None))
+            return [card.candidate_id for card in sorted(available, key=lambda card: card.creation_order)]
+
+    report = policy_replay.replay(environment, HistoryWatcher(environment=environment))
+
+    assert report["leakage_check"]["status"] == "passed"
+    # Both candidates arrived in one round and both settled after it opened, so the second
+    # pick cannot see the first pick's result — the history writes it down as unknown.
+    assert report["metrics"]["simulations_used"] == 2
+    assert seen and all(visible is False for _step, visible in seen)
+
+
+def test_later_lifecycle_stages_stay_hidden_until_they_settle(db):
+    """An IS pass that later failed correlation must read as an IS pass in between."""
+    candidate_id = _settle(db, "rank(close)", accepted=True)
+    db.record_correlation_check(candidate_id, 0.9, "A-other")
+    submission_id = db.enqueue_submission(candidate_id)
+    db.finish_submission(submission_id, "SELF_CORR_FAIL", message="too correlated")
+
+    environment = policy_replay.ReplayEnvironment.from_db(db)
+    item = environment.item(candidate_id)
+
+    assert item.outcome.bucket == "correlation_fail"
+    assert item.settled_clock is not None and item.advanced_clock is not None
+    assert item.advanced_clock > item.settled_clock
+
+    # At the deciding instant the later stage is not yet knowable; one event later it is.
+    assert item.outcome_at(item.advanced_clock).bucket in policy_replay.SIMULATION_STAGE_BUCKETS
+    assert item.outcome_at(item.advanced_clock + 1).bucket == "correlation_fail"
+
+    # ``self_corr`` is its own stage: hidden until the correlation check settled.
+    assert item.correlation_clock is not None
+    assert item.outcome_at(item.correlation_clock).self_corr is None
+    assert item.outcome_at(item.correlation_clock + 1).self_corr == 0.9
+
+
+def test_ranking_components_are_resolved_as_of_the_decision_clock(db):
+    outcome = db.queue_candidate("rank(close)", {"decay": 6}, source="batch-1")
+    candidate_id = outcome.candidate_id
+    creation_clock = db.query(
+        "SELECT MIN(id) AS id FROM events WHERE entity='candidate' AND CAST(entity_id AS INTEGER)=?",
+        (candidate_id,),
+    )[0]["id"]
+    db.record_ranking(candidate_id, {"expected_quality": 0.4, "novelty": 0.2, "failure_risk": 0.1},
+                      priority=7.0)
+    ranking_clock = db.query(
+        "SELECT MIN(id) AS id FROM events WHERE entity='candidate' AND event='ranked'"
+    )[0]["id"]
+
+    environment = policy_replay.ReplayEnvironment.from_db(db)
+    item = environment.item(candidate_id)
+    assert item.ranking_history  # the candidate was ranked, so its row was overwritten
+    assert item.card.priority == 7.0  # ... and the current row is the later state
+
+    before = item.card_at(int(creation_clock))
+    after = item.card_at(int(ranking_clock) + 1)
+    # Before the rank event the components were never recorded, so the honest view is "unranked".
+    assert before.priority == 0.0 and before.expected_quality is None and before.novelty_score is None
+    assert after.priority == 7.0
+    assert (after.expected_quality, after.novelty_score, after.failure_risk) == (0.4, 0.2, 0.1)
+
+
+def test_surrogate_is_trained_only_on_results_settled_before_the_clock(db):
+    """The surrogate baseline must use an as-of model, never the persisted live one."""
+    for index in range(6):
+        _settle(db, f"rank(ts_mean(close, {5 + index}))", accepted=True)
+    # A live model trained on the *whole* history — including everything after the clocks below.
+    live = surrogate.fit(db, min_samples=5)
+    assert live["samples"] == 6
+
+    environment = policy_replay.ReplayEnvironment.from_db(db)
+    clocks = sorted(item.settled_clock for item in environment.items)
+
+    # Four settled results is below the training floor, and the fifth is not yet visible at
+    # exactly its own settlement instant (the filter is strictly earlier) — so an as-of model
+    # is refused even though a live model exists that has seen all six.
+    assert environment.surrogate_model(clocks[4]) is None
+    five = environment.surrogate_model(clocks[4] + 1)
+    assert five is not None and five["samples"] == 5 and five is not live
+    # A later clock sees strictly more, never less — the window only ever grows forwards.
+    assert environment.surrogate_model(clocks[5] + 1)["samples"] == 6
+
+
+def test_leakage_check_rejects_outcomes_exposed_before_their_stage(db):
+    """The self-check must fail loudly on both leak shapes, or it is worthless."""
+    candidate_id = _settle(db, "rank(close)", accepted=True)
+    db.finish_submission(db.enqueue_submission(candidate_id), "SELF_CORR_FAIL", message="correlated")
+    environment = policy_replay.ReplayEnvironment.from_db(db)
+    item = environment.item(candidate_id)
+    assert item.advanced_clock > item.settled_clock + 1
+
+    def forged(clock, bucket):
+        return policy_replay.Decision(
+            step=0, clock=clock, as_of="", candidate_id=candidate_id, slot_cost=1,
+            cache_hit=False, considered=(candidate_id,),
+            exposed_outcomes=((candidate_id, bucket),),
+        )
+
+    unsettled = policy_replay.verify_no_leakage([forged(item.settled_clock, "is_pass")], environment)
+    assert unsettled["status"] == "failed"
+    assert any("had not settled" in problem for problem in unsettled["problems"])
+
+    early_stage = policy_replay.verify_no_leakage(
+        [forged(item.settled_clock + 1, "correlation_fail")], environment
+    )
+    assert early_stage["status"] == "failed"
+    assert any("post-IS" in problem for problem in early_stage["problems"])
+
+
+def test_campaign_replay_membership_comes_from_the_trial_ledger(db):
+    first = db.queue_candidate("rank(ts_mean(close, 10))", {"decay": 6}, campaign_id="A")
+    second = db.queue_candidate("rank(ts_mean(close, 10))", {"decay": 6}, campaign_id="B")
+    assert first.candidate_id == second.candidate_id  # one canonical candidate row
+    assert db.get_candidate(first.candidate_id)["campaign_id"] == "A"
+
+    # Campaign B still owns its own decision on the shared candidate.
+    for campaign in ("A", "B"):
+        environment = policy_replay.ReplayEnvironment.from_db(db, campaign_id=campaign)
+        assert [item.candidate_id for item in environment.items] == [first.candidate_id]
 
 
 def test_no_expression_or_outcome_leaks_into_a_card(db):
