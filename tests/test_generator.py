@@ -31,7 +31,7 @@ def test_generation_is_reproducible_and_records_lineage(db):
     assert len(outcomes) == 5
     row = db.get_candidate(outcomes[0]["candidate_id"])
     assert row["campaign_id"] == "campaign-1"
-    assert row["generator_version"] == generator.GENERATOR_VERSION
+    assert row["generator_version"] == generator.LEGACY_GENERATOR_VERSION
     assert json.loads(row["mutation_parameters_json"])["catalog_version"] == first.catalog.version
     assert row["mutation_type"] == "dataset_coverage"
 

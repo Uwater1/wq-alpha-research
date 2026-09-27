@@ -59,6 +59,39 @@ Research events are recorded in `research.db`, materialized as scoped observatio
 
 `scripts/evolve_skill.py` remains a legacy preview/reporting utility. It is not the normal learning path; do not use `--apply` or `--raw` for autonomous updates. Reviewed sanitized rules may be rendered through `scripts/skill_manager.py` after evidence and privacy checks.
 
+## Generator V3 (opt-in)
+
+The diversity-first generator is **not** the default: the template path above still runs unless
+`--strategy` (or `--motif` / `--dry-plan`) is supplied, and V3 rows are tagged
+`catalog-generator-v3`. It searches over motifs, AST structures, datasets and multi-field
+combinations instead of only field names.
+
+```bash
+# Plan a campaign across explore/exploit/mutate/crossover (no BRAIN calls, no queue writes)
+./.venv/bin/python -m wq generate --campaign dry-plan --count 100 --strategy mixed --dry-plan
+
+# Generate + queue a V3 campaign, or pin one motif for a targeted probe
+./.venv/bin/python -m wq generate --campaign v3-1 --count 50 --strategy mixed --seed 7
+./.venv/bin/python -m wq generate --campaign motif-1 --count 25 --motif normalized_difference
+
+# Explicit two-parent crossover, then measure what a campaign actually covered
+./.venv/bin/python -m wq crossover PARENT_A PARENT_B --campaign cross-1 --count 4
+./.venv/bin/python -m wq diversity-report --campaign v3-1
+```
+
+Mutation and crossover slots require archive elites: on a cold archive those slots are planned
+as exploration and say so in `reason`, so a lineage is never claimed for a child that no parent
+produced. `diversity-report` separates exact, current-skeleton, grammar and semantic diversity
+and prints `exp(Shannon entropy)` effective counts, so 20 motifs used once each cannot look like
+20 motifs used evenly.
+
+Before promoting V3 over V2, benchmark both on the same corpus at equal simulation budget with
+point-in-time-safe replay:
+
+```bash
+./.venv/bin/python scripts/policy_replay.py --compare --budget 20
+```
+
 ## Contents
 
 ```text
@@ -67,6 +100,9 @@ wq-alpha-research/
 ├── scripts/
 │   ├── evolve_skill.py
 │   ├── generator.py          # catalog coverage + failure-directed mutations
+│   ├── expression_grammar.py # typed AST, motif registry, grammar/semantic skeletons
+│   ├── generation_policy.py  # V3 campaign planner: modes, recipes, adaptive allocation
+│   ├── diversity.py          # source profiles, novelty pre-screen, diversity report
 │   ├── compatibility.py      # shared field/operator type rules
 │   ├── archive.py             # quality-diversity archive + family allocation
 │   ├── robustness.py          # search-aware advisory diagnostics (daily returns)

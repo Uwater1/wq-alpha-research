@@ -36,7 +36,18 @@ WEIGHTS: dict[str, float] = {
     "duplicate_penalty": 1.0,
     "failure_risk": 1.0,
     "portfolio_diversification": 0.5,
+    # Generator V3 terms (P8). Small, bounded weights: novelty already dominates, and these
+    # must never let a diversity bonus outrank expected quality.
+    "grammar_novelty": 0.35,
+    "semantic_novelty": 0.30,
+    "archive_sparsity": 0.20,
+    "exact_novelty": 0.0,
 }
+
+#: Correlated novelty terms are weighted and then *capped*, never summed at full weight.
+NOVELTY_WEIGHTS: dict[str, float] = {"exact": 1.0, "grammar": 0.6, "semantic": 0.6}
+#: The maximum combined novelty a single candidate may contribute.
+NOVELTY_CAP = 1.0
 
 #: Minimum observations before an empirical family pass rate outweighs the prior.
 FAMILY_EVIDENCE_MIN = 5
@@ -55,6 +66,9 @@ class RankingContext:
     family_outcomes: dict[str, tuple[int, int]] = field(default_factory=dict)  # family -> (settled, passed)
     expression_attempts: dict[str, int] = field(default_factory=dict)          # expression_hash -> rows seen
     skeleton_counts: dict[str, int] = field(default_factory=dict)              # skeleton_hash -> rows seen
+    grammar_counts: dict[str, int] = field(default_factory=dict)               # grammar_skeleton_hash -> rows seen
+    semantic_counts: dict[str, int] = field(default_factory=dict)              # semantic_skeleton_hash -> rows seen
+    motif_counts: dict[str, int] = field(default_factory=dict)                 # motif_id -> rows seen
     family_queue_counts: dict[str, int] = field(default_factory=dict)          # family -> queued now
     family_active_counts: dict[str, int] = field(default_factory=dict)         # family -> ACTIVE alphas
     field_counts: dict[str, int] = field(default_factory=dict)                 # field -> rows using it
@@ -74,6 +88,13 @@ class Score:
     family_diversity: float
     duplicate_penalty: float
     failure_risk: float
+    # -- Generator V3 components (P8); default to 0 so older callers keep working --
+    exact_novelty: float = 0.0
+    grammar_novelty: float = 0.0
+    semantic_novelty: float = 0.0
+    archive_sparsity: float = 0.0
+    portfolio_diversification: float = 0.0
+    combined_novelty: float = 0.0
     reasons: dict[str, Any] = field(default_factory=dict)
 
     def components(self) -> dict[str, float]:
@@ -84,6 +105,12 @@ class Score:
             "family_diversity": self.family_diversity,
             "duplicate_penalty": self.duplicate_penalty,
             "failure_risk": self.failure_risk,
+            "exact_novelty": self.exact_novelty,
+            "grammar_novelty": self.grammar_novelty,
+            "semantic_novelty": self.semantic_novelty,
+            "archive_sparsity": self.archive_sparsity,
+            "portfolio_diversification": self.portfolio_diversification,
+            "combined_novelty": self.combined_novelty,
         }
 
 
@@ -105,6 +132,13 @@ def build_context(db: Any) -> RankingContext:
         context.expression_attempts[str(row["expression_hash"])] = int(row["n"])
     for row in db.query("SELECT skeleton_hash, COUNT(*) AS n FROM candidates WHERE skeleton_hash IS NOT NULL GROUP BY skeleton_hash"):
         context.skeleton_counts[str(row["skeleton_hash"])] = int(row["n"])
+    for column, target in (("grammar_skeleton_hash", context.grammar_counts),
+                           ("semantic_skeleton_hash", context.semantic_counts),
+                           ("motif_id", context.motif_counts)):
+        for row in db.query(
+            f"SELECT {column} AS key, COUNT(*) AS n FROM candidates WHERE {column} IS NOT NULL GROUP BY {column}"
+        ):
+            target[str(row["key"])] = int(row["n"])
     for row in db.query("SELECT COALESCE(signal_family, '') AS family, COUNT(*) AS n FROM candidates WHERE status='QUEUED' GROUP BY family"):
         context.family_queue_counts[str(row["family"])] = int(row["n"])
     for row in db.query("SELECT COALESCE(signal_family, '') AS family, COUNT(*) AS n FROM candidates WHERE status='ACTIVE' GROUP BY family"):
@@ -177,6 +211,14 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
     reasons["expression_seen"] = seen
 
     skeleton_seen = max(context.skeleton_counts.get(skeleton_hash, 1) - 1, 0)
+    grammar_hash = str(row.get("grammar_skeleton_hash") or "")
+    semantic_hash = str(row.get("semantic_skeleton_hash") or "")
+    grammar_seen = max(context.grammar_counts.get(grammar_hash, 1) - 1, 0) if grammar_hash else 0
+    semantic_seen = max(context.semantic_counts.get(semantic_hash, 1) - 1, 0) if semantic_hash else 0
+    grammar_novelty = 1.0 / (1.0 + grammar_seen)
+    semantic_novelty = 1.0 / (1.0 + semantic_seen)
+    # Archive sparsity: how thinly the candidate's grammar niche has been explored so far.
+    archive_sparsity = 1.0 / (1.0 + grammar_seen)
     if seen == 0 and skeleton_seen == 0:
         information_gain, tier = 1.0, "new_structure"
     elif skeleton_seen == 0:
@@ -194,6 +236,25 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
         family_diversity = _clamp(1.0 - context.family_queue_counts.get(family, 0) / max(context.queued_total, 1) + 0.2)
         reasons["family_not_active"] = True
 
+    active_in_family = context.family_active_counts.get(family, 0)
+    portfolio_diversification = 1.0 / (1.0 + active_in_family)
+
+    # Correlated novelty terms are weighted, averaged, then capped: three views of "is this
+    # new?" must not add up to three times the evidence.
+    novelty_total = (
+        NOVELTY_WEIGHTS["exact"] * novelty
+        + NOVELTY_WEIGHTS["grammar"] * grammar_novelty
+        + NOVELTY_WEIGHTS["semantic"] * semantic_novelty
+    ) / sum(NOVELTY_WEIGHTS.values())
+    combined_novelty = _clamp(min(NOVELTY_CAP, novelty_total))
+    reasons.update({
+        "grammar_seen": grammar_seen, "semantic_seen": semantic_seen,
+        "grammar_novelty": round(grammar_novelty, 4), "semantic_novelty": round(semantic_novelty, 4),
+        "archive_sparsity": round(archive_sparsity, 4),
+        "portfolio_diversification": round(portfolio_diversification, 4),
+        "combined_novelty": round(combined_novelty, 4),
+    })
+
     duplicate_penalty = _clamp(skeleton_seen / DUPLICATE_SATURATION) if skeleton_seen else 0.0
 
     failure_rate = 0.0
@@ -208,11 +269,14 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
 
     priority = float(row.get("priority") or 0.0)
     priority += WEIGHTS["expected_quality"] * expected_quality
-    priority += WEIGHTS["novelty"] * novelty
+    priority += WEIGHTS["novelty"] * combined_novelty
     priority += WEIGHTS["information_gain"] * information_gain
     priority += WEIGHTS["family_diversity"] * family_diversity
     priority -= WEIGHTS["duplicate_penalty"] * duplicate_penalty
     priority -= WEIGHTS["failure_risk"] * failure_risk
+    priority += WEIGHTS["grammar_novelty"] * grammar_novelty
+    priority += WEIGHTS["semantic_novelty"] * semantic_novelty
+    priority += WEIGHTS["archive_sparsity"] * archive_sparsity
 
     return Score(
         priority=round(priority, 6),
@@ -222,6 +286,12 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
         family_diversity=round(family_diversity, 6),
         duplicate_penalty=round(duplicate_penalty, 6),
         failure_risk=round(failure_risk, 6),
+        exact_novelty=round(novelty, 6),
+        grammar_novelty=round(grammar_novelty, 6),
+        semantic_novelty=round(semantic_novelty, 6),
+        archive_sparsity=round(archive_sparsity, 6),
+        portfolio_diversification=round(portfolio_diversification, 6),
+        combined_novelty=round(combined_novelty, 6),
         reasons=reasons,
     )
 
@@ -239,6 +309,7 @@ def submission_priority(row: Mapping[str, Any], context: RankingContext) -> Scor
     return replace(
         base,
         priority=round(base.priority + WEIGHTS["portfolio_diversification"] * diversification, 6),
+        portfolio_diversification=round(diversification, 6),
         reasons={**base.reasons, "active_in_family": active_in_family,
                  "portfolio_diversification": round(diversification, 6)},
     )

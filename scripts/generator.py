@@ -26,7 +26,7 @@ import random
 import re
 import sqlite3
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -34,11 +34,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import canonical
 import compatibility
+import diversity
+import expression_grammar as grammar
+import generation_policy
 import research_db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PATH = REPO_ROOT / "references" / "wq_usa_top3000_delay1_data_fields.json"
-GENERATOR_VERSION = "catalog-generator-v2"
+#: Canonical generator identity (P11).
+GENERATOR_VERSION = "catalog-generator-v3"
+#: The template generator that produced V2 campaigns. It is still the CLI default until replay
+#: evidence justifies promotion (P16), and rows it produces are labelled honestly as V2.
+LEGACY_GENERATOR_VERSION = "catalog-generator-v2"
+#: Alias kept for callers that name the V3 identity explicitly.
+GENERATOR_VERSION_V3 = GENERATOR_VERSION
+#: Version stamps for the sub-systems that can change proposal distribution independently.
+GRAMMAR_VERSION = grammar.GRAMMAR_VERSION
+MOTIF_REGISTRY_VERSION = grammar.MOTIF_REGISTRY_VERSION
+GENERATION_POLICY_VERSION = generation_policy.GENERATION_POLICY_VERSION
+#: V3 complexity budget: the same shape limits as the recommended defaults, with room for a
+#: structured two-source motif (e.g. normalized_difference needs three binary operators).
+V3_LIMITS = grammar.ComplexityLimits(max_depth=5, max_nodes=16, max_fields=2, max_binary_ops=3)
+#: Crossover composes two complete parent trees, so it gets one extra layer of headroom.
+CROSSOVER_LIMITS = grammar.ComplexityLimits(max_depth=6, max_nodes=24, max_fields=4, max_binary_ops=3)
+#: Motifs tried, in order, when an ineligible/over-budget motif cannot be materialized.
+FALLBACK_MOTIFS = (
+    "cross_sectional_level", "change", "ranked_level", "group_relative", "time_series_level",
+    "difference_of_ranks", "spread", "confirming_signals",
+)
+#: Initial crossover forms (P6 groundwork): typed compositions of two parent expressions.
+CROSSOVER_FORMS = ("add_rank", "subtract_rank", "add_zscore", "multiply_rank")
 DEFAULT_WINDOWS = (20, 60, 126, 252)
 DEFAULT_DECAYS = (4, 6, 10, 20)
 DEFAULT_NEUTRALIZATIONS = ("SUBINDUSTRY", "INDUSTRY", "SECTOR")
@@ -128,6 +153,19 @@ class Proposal:
     reason: str = "catalog coverage"
     #: Explicit generation when the caller knows it; otherwise derived from the parents.
     generation: int | None = None
+    # -- Generator V3 provenance (all optional; V2 proposals simply leave them empty) --
+    motif_id: str = ""
+    recipe_index: int = 0
+    generation_mode: str = ""
+    strategy: str = ""
+    source_profile: Mapping[str, Any] = field(default_factory=dict)
+    grammar_skeleton_hash: str = ""
+    semantic_skeleton_hash: str = ""
+    recipe: Mapping[str, Any] = field(default_factory=dict)
+    # -- novelty pre-screen (P7); empty means "not screened" --
+    novelty_score: float = 0.0
+    novelty_decision: str = ""
+    skip_reason: str = ""
 
 
 class Catalog:
@@ -263,6 +301,56 @@ class CandidateGenerator:
             generation = proposal.generation
             if generation is None:
                 generation = self.db.next_generation(parent_ids)
+            v3 = bool(proposal.strategy)
+            if proposal.novelty_decision == diversity.SKIP_REDUNDANT:
+                # The pre-screen refused it: keep the decision auditable, spend no capacity.
+                trial_id = self.db.record_generation_decision(
+                    proposal.expression, proposal.settings, campaign_id=campaign_id,
+                    decision=proposal.novelty_decision, skip_reason=proposal.skip_reason,
+                    signal_family=proposal.family, generator_version=GENERATOR_VERSION_V3,
+                    generator_strategy=proposal.strategy or None,
+                    generation_mode=proposal.generation_mode or None,
+                    motif_id=proposal.motif_id or None, recipe=dict(proposal.recipe) or None,
+                    recipe_index=proposal.recipe_index if proposal.motif_id else None,
+                    grammar_skeleton_hash=proposal.grammar_skeleton_hash or None,
+                    semantic_skeleton_hash=proposal.semantic_skeleton_hash or None,
+                    source_profile=dict(proposal.source_profile) or None,
+                    generator_policy_version=generation_policy.GENERATION_POLICY_VERSION,
+                    grammar_version=grammar.GRAMMAR_VERSION,
+                )
+                outcomes.append({
+                    "expression": proposal.expression, "family": proposal.family,
+                    "mutation_type": proposal.mutation_type, "motif_id": proposal.motif_id,
+                    "generation_mode": proposal.generation_mode, "generation": None,
+                    "action": "skipped_redundant", "candidate_id": None, "status": None,
+                    "issues": [], "trial_id": trial_id,
+                })
+                continue
+            parameters = {**proposal.parameters, "catalog_version": self.catalog.version}
+            if proposal.motif_id:
+                parameters.setdefault("motif_id", proposal.motif_id)
+            if proposal.recipe_index:
+                parameters.setdefault("recipe_index", proposal.recipe_index)
+            if proposal.generation_mode:
+                parameters.setdefault("generation_mode", proposal.generation_mode)
+            if proposal.recipe:
+                parameters.setdefault("recipe", dict(proposal.recipe))
+            provenance: dict[str, Any] = {
+                "scope": self.catalog.scope, "seed": self.seed, "snapshot": self.catalog.snapshot,
+            }
+            if v3:
+                provenance.update({
+                    "strategy": proposal.strategy,
+                    "generation_mode": proposal.generation_mode,
+                    "motif_id": proposal.motif_id,
+                    "recipe_index": proposal.recipe_index,
+                    "source_profile": dict(proposal.source_profile),
+                    "grammar_skeleton_hash": proposal.grammar_skeleton_hash,
+                    "semantic_skeleton_hash": proposal.semantic_skeleton_hash,
+                    "policy_version": generation_policy.GENERATION_POLICY_VERSION,
+                    "grammar_version": grammar.GRAMMAR_VERSION,
+                    "motif_registry_version": grammar.MOTIF_REGISTRY_VERSION,
+                })
             outcome = self.db.queue_candidate(
                 proposal.expression,
                 proposal.settings,
@@ -273,17 +361,31 @@ class CandidateGenerator:
                 generation=generation,
                 mutation_type=proposal.mutation_type,
                 campaign_id=campaign_id,
-                mutation_parameters={**proposal.parameters, "catalog_version": self.catalog.version},
-                generator_version=GENERATOR_VERSION,
+                mutation_parameters=parameters,
+                generator_version=GENERATOR_VERSION if v3 else LEGACY_GENERATOR_VERSION,
                 reason=proposal.reason,
                 field_catalog_version=self.catalog.version,
                 operator_catalog_version=self.catalog.operator_version,
-                provenance={"scope": self.catalog.scope, "seed": self.seed, "snapshot": self.catalog.snapshot},
+                provenance=provenance,
+                generator_strategy=proposal.strategy or None,
+                generation_mode=proposal.generation_mode or None,
+                motif_id=proposal.motif_id or None,
+                recipe_index=proposal.recipe_index if proposal.motif_id else None,
+                recipe=dict(proposal.recipe) if proposal.recipe else None,
+                grammar_skeleton_hash=proposal.grammar_skeleton_hash or None,
+                semantic_skeleton_hash=proposal.semantic_skeleton_hash or None,
+                source_profile=dict(proposal.source_profile) if proposal.source_profile else None,
+                generator_policy_version=generation_policy.GENERATION_POLICY_VERSION if v3 else None,
+                grammar_version=grammar.GRAMMAR_VERSION if v3 else None,
+                decision=proposal.novelty_decision or None,
+                skip_reason=proposal.skip_reason or None,
             )
             outcomes.append({
                 "expression": proposal.expression,
                 "family": proposal.family,
                 "mutation_type": proposal.mutation_type,
+                "motif_id": proposal.motif_id,
+                "generation_mode": proposal.generation_mode,
                 "generation": generation,
                 "action": outcome.action,
                 "candidate_id": outcome.candidate_id,
@@ -291,6 +393,329 @@ class CandidateGenerator:
                 "issues": outcome.issues,
             })
         return outcomes
+
+    # -- Generator V3: campaign planning + materialization (P3/P4/P5) -------
+
+    def metadata(self) -> dict[str, Field]:
+        """Field metadata as ``name -> Field`` for the grammar parser."""
+        return dict(self.catalog._by_name)
+
+    def plan(
+        self,
+        *,
+        campaign_id: str,
+        budget: int,
+        seed: int = 0,
+        mode: str = "mixed",
+        family: str | None = None,
+        max_family_share: float = generation_policy.DEFAULT_MAX_FAMILY_SHARE,
+        exploration_reserve: float = generation_policy.DEFAULT_EXPLORATION_RESERVE,
+        parent_pool: int = 24,
+    ) -> generation_policy.Plan:
+        """Build an archive-informed, deterministic campaign plan (no BRAIN calls, no queue writes)."""
+        return generation_policy.plan_campaign(
+            self.db, self.catalog, campaign_id, budget, seed, mode,
+            family=family, max_family_share=max_family_share,
+            exploration_reserve=exploration_reserve, parent_pool=parent_pool,
+            generator_version=GENERATOR_VERSION_V3,
+        )
+
+    def _material_field_node(self, name: str) -> grammar.FieldNode:
+        field = self.catalog.get(name)
+        return grammar.field_node_from(field, fallback_id=name)
+
+    def _partner_fields(
+        self,
+        used: Sequence[grammar.FieldNode],
+        family: str,
+        count: int,
+    ) -> list[grammar.FieldNode]:
+        """Additional source fields for a two-source motif, preferring a different dataset."""
+        used_ids = {node.field_id for node in used}
+        candidates = [
+            field for field in self.catalog.select(family)
+            if field.name not in used_ids
+            and field.field_type in {compatibility.MATRIX, compatibility.VECTOR}
+        ]
+        if not candidates:
+            candidates = [
+                field for field in self.catalog.fields
+                if field.name not in used_ids
+                and field.field_type in {compatibility.MATRIX, compatibility.VECTOR}
+            ]
+        datasets = {node.dataset for node in used}
+        candidates.sort(key=lambda field: (field.dataset in datasets, field.name))
+        return [grammar.field_node_from(field) for field in candidates[: max(0, count)]]
+
+    def _fallback_motif(
+        self,
+        fields: Sequence[grammar.FieldNode],
+        failed_motif: str,
+        recipe: grammar.Recipe,
+        limits: grammar.ComplexityLimits,
+    ) -> tuple[str, grammar.CallNode] | None:
+        for candidate in FALLBACK_MOTIFS:
+            if candidate == failed_motif:
+                continue
+            if not grammar.motif_eligible(grammar.motif_by_id(candidate), fields,
+                                          distinct_datasets=candidate == "cross_dataset_composite"):
+                continue
+            try:
+                return candidate, grammar.build_motif(candidate, fields, recipe, limits=limits)
+            except grammar.GrammarError:
+                continue
+        return None
+
+    def materialize(
+        self,
+        slot: generation_policy.PlanSlot,
+        *,
+        campaign_id: str,
+        seed: int = 0,
+        limits: grammar.ComplexityLimits = V3_LIMITS,
+        force_motif: str | None = None,
+    ) -> Proposal | None:
+        """Turn one planned slot into a validated, provenance-complete proposal.
+
+        Mutation slots delegate to the existing failure-directed repair; crossover slots build
+        a typed two-parent composition; everything else samples an independent recipe and builds
+        the motif AST. A motif that cannot be realized falls back rather than dropping a slot.
+        """
+        strategy = slot.generation_mode
+        motif_id = force_motif or slot.motif_id
+        if force_motif is not None:
+            strategy = "explore"
+        if force_motif is None and slot.generation_mode == "mutate" and slot.parent_ids:
+            parent = self.db.get_candidate(int(slot.parent_ids[0]))
+            if parent:
+                # A per-slot seed keeps two mutate slots on the same parent from producing the
+                # same child (the V2 repair path is deterministic in the generator seed alone).
+                slot_seed = generation_policy.recipe_seed(campaign_id, seed, (), "mutate", slot.recipe_index, slot.parent_ids)
+                mutator = CandidateGenerator(self.db, self.catalog, seed=slot_seed % (2 ** 31))
+                repairs = mutator.mutate(parent, count=1, campaign_id=campaign_id)
+                if repairs:
+                    operation = str(repairs[0].parameters.get("operation") or repairs[0].mutation_type)
+                    return replace(
+                        repairs[0], generation_mode="mutate", strategy="mutate",
+                        motif_id=f"mutation:{operation}", recipe_index=slot.recipe_index,
+                        source_profile=diversity.derive_source_profile(repairs[0].expression, self.catalog),
+                        grammar_skeleton_hash=grammar.grammar_skeleton_hash(repairs[0].expression, self.metadata()),
+                        semantic_skeleton_hash=grammar.semantic_skeleton_hash(repairs[0].expression, self.metadata()),
+                    )
+        # When a lineage-producing mode cannot be realized, the same slot is still materialized so
+        # the planned budget equals the materialized count. The realized mode is then reported
+        # honestly as exploration with no parent ids: a report must never count a child as a
+        # crossover or a mutation of a parent that did not actually produce it.
+        planned_mode = generation_policy.resolve_strategy(slot.generation_mode)
+        realized_mode = planned_mode
+        if force_motif is None and planned_mode == "mutate" and slot.parent_ids:
+            # The repair path above declined this slot; it is exploration now.
+            realized_mode = "explore"
+        if force_motif is None and slot.generation_mode == "crossover" and len(slot.parent_ids) >= 2:
+            proposal = self._crossover_proposal(slot, campaign_id=campaign_id, seed=seed)
+            if proposal is not None:
+                return proposal
+            realized_mode = "explore"
+        lineage_fallback = realized_mode != slot.generation_mode
+
+        fields = [self._material_field_node(name) for name in slot.fields if name]
+        needed = len(grammar.motif_by_id(motif_id).input_roles) if motif_id in grammar.MOTIF_BY_ID else 1
+        if len(fields) < needed:
+            fields.extend(self._partner_fields(fields, slot.family, needed - len(fields)))
+        if not fields:
+            return None
+        rng = random.Random(generation_policy.recipe_seed(
+            campaign_id, seed, [node.field_id for node in fields], motif_id, slot.recipe_index, slot.parent_ids,
+        ))
+        recipe = generation_policy.sample_recipe(rng, motif_id)
+        try:
+            node = grammar.build_motif(motif_id, fields, recipe, limits=limits)
+        except grammar.GrammarError:
+            fallback = self._fallback_motif(fields, motif_id, recipe, limits)
+            if fallback is None:
+                return None
+            motif_id, node = fallback
+        expression = grammar.render(node)
+        settings = {"decay": recipe.decay, "neutralization": recipe.neutralization,
+                   "truncation": recipe.truncation}
+        parameters: dict[str, Any] = {
+            "field": fields[0].field_id,
+            "fields": [item.field_id for item in fields],
+            "datasets": sorted({item.dataset for item in fields}),
+            "motif_id": motif_id,
+            "recipe_index": slot.recipe_index,
+            "recipe": recipe.as_dict(),
+            "generation_mode": realized_mode,
+            "planned_family": slot.family,
+            "generator_strategy": realized_mode if force_motif is None else strategy,
+        }
+        if lineage_fallback:
+            # The planned lineage mode could not be realized here; keep the intent auditable
+            # while the realized mode and the (empty) parent ids state what actually happened.
+            parameters["planned_generation_mode"] = slot.generation_mode
+            parameters["lineage_fallback"] = True
+        parent_ids = () if lineage_fallback else tuple(slot.parent_ids)
+        return Proposal(
+            expression=expression,
+            settings=settings,
+            family=slot.family,
+            mutation_type="motif_generation",
+            parameters=parameters,
+            parent_ids=parent_ids,
+            reason=slot.reason + (" (lineage fallback)" if lineage_fallback else ""),
+            generation=None,
+            motif_id=motif_id,
+            recipe_index=slot.recipe_index,
+            generation_mode=realized_mode,
+            strategy=realized_mode if force_motif is None else strategy,
+            source_profile=diversity.derive_source_profile(expression, self.catalog),
+            grammar_skeleton_hash=grammar.grammar_skeleton_hash(expression, self.metadata()),
+            semantic_skeleton_hash=grammar.semantic_skeleton_hash(expression, self.metadata()),
+            recipe=recipe.as_dict(),
+        )
+
+    def _crossover_proposal(
+        self,
+        slot: generation_policy.PlanSlot,
+        *,
+        campaign_id: str,
+        seed: int,
+    ) -> Proposal | None:
+        """Initial crossover: a typed composition of two distant archive parents (P6 groundwork)."""
+        parents = [self.db.get_candidate(int(pid)) for pid in slot.parent_ids]
+        parents = [row for row in parents if row]
+        if len(parents) < 2:
+            return None
+        rng = random.Random(generation_policy.recipe_seed(
+            campaign_id, seed, (), "crossover", slot.recipe_index, slot.parent_ids,
+        ))
+        form = CROSSOVER_FORMS[rng.randrange(len(CROSSOVER_FORMS))]
+        metadata = self.metadata()
+        try:
+            left = grammar.parse_expression(str(parents[0].get("normalized_expression") or ""), metadata)
+            right = grammar.parse_expression(str(parents[1].get("normalized_expression") or ""), metadata)
+            left_wrapped = _crossover_leg(left, form)
+            right_wrapped = _crossover_leg(right, form)
+            if form == "multiply_rank":
+                # The local operator signature requires three positional args for multiply.
+                node = grammar.make_call("multiply", [left_wrapped, right_wrapped, grammar.literal(1)])
+            elif form == "subtract_rank":
+                node = grammar.make_call("subtract", [left_wrapped, right_wrapped])
+            else:
+                node = grammar.make_call("add", [left_wrapped, right_wrapped])
+        except grammar.GrammarError:
+            return None
+        if grammar.check_complexity(node, CROSSOVER_LIMITS):
+            return None
+        expression = grammar.render(node)
+        parent_ids = tuple(int(row["id"]) for row in parents[:2])
+        return Proposal(
+            expression=expression,
+            settings={"decay": 6},
+            family=str(parents[0].get("signal_family") or "unknown"),
+            mutation_type="crossover",
+            parameters={
+                "motif_id": f"crossover_{form}", "recipe_index": slot.recipe_index,
+                "crossover_form": form, "parent_grammar_hashes": [
+                    grammar.grammar_skeleton_hash(str(row.get("normalized_expression") or ""), metadata)
+                    for row in parents[:2]
+                ],
+                "generation_mode": "crossover", "generator_strategy": "crossover",
+            },
+            parent_ids=parent_ids,
+            reason=slot.reason,
+            motif_id=f"crossover_{form}",
+            recipe_index=slot.recipe_index,
+            generation_mode="crossover",
+            strategy="crossover",
+            source_profile=diversity.derive_source_profile(expression, self.catalog),
+            grammar_skeleton_hash=grammar.grammar_skeleton_hash(expression, metadata),
+            semantic_skeleton_hash=grammar.semantic_skeleton_hash(expression, metadata),
+        )
+
+    def generate(
+        self,
+        *,
+        campaign_id: str,
+        count: int,
+        seed: int = 0,
+        strategy: str = "mixed",
+        family: str | None = None,
+        motif: str | None = None,
+        max_family_share: float = generation_policy.DEFAULT_MAX_FAMILY_SHARE,
+        limits: grammar.ComplexityLimits = V3_LIMITS,
+        screen: bool = True,
+    ) -> tuple[generation_policy.Plan, list[Proposal]]:
+        """Plan a campaign and materialize it into proposals (no queue writes)."""
+        plan = self.plan(
+            campaign_id=campaign_id, budget=count, seed=seed, mode=strategy,
+            family=family, max_family_share=max_family_share,
+        )
+        proposals: list[Proposal] = []
+        for slot in plan.slots:
+            proposal = self.materialize(slot, campaign_id=campaign_id, seed=seed,
+                                        limits=limits, force_motif=motif)
+            if proposal is not None:
+                proposals.append(proposal)
+        if screen:
+            proposals = self.screen_proposals(proposals, campaign_id=campaign_id, seed=seed)
+        return plan, proposals
+
+    def screen_proposals(
+        self,
+        proposals: Sequence[Proposal],
+        *,
+        campaign_id: str,
+        seed: int = 0,
+    ) -> list[Proposal]:
+        """Attach a novelty decision to every proposal (P7); never drops one.
+
+        The screen is advisory except for an exact duplicate produced under an explicit
+        novelty request, which is marked ``SKIP_REDUNDANT`` and refused by :meth:`queue` while
+        still being recorded in the trial ledger. Everything else is kept, downweighted at
+        most, and the reason travels with the proposal.
+        """
+        context = diversity.novelty_context(self.db, self.catalog)
+        screened: list[Proposal] = []
+        for proposal in proposals:
+            request_novelty = proposal.generation_mode in {"explore", "exploit"}
+            report = diversity.screen_novelty(
+                proposal.expression,
+                catalog=self.catalog,
+                context=context,
+                settings=proposal.settings,
+                motif_id=proposal.motif_id or None,
+                request_novelty=request_novelty,
+            )
+            item = replace(
+                proposal,
+                novelty_score=report.score,
+                novelty_decision=report.decision,
+                skip_reason="" if report.decision != diversity.SKIP_REDUNDANT else report.reason,
+            )
+            screened.append(item)
+            # A KEEP decision makes the proposal part of the seen history for later slots in
+            # the same campaign, so one batch cannot fill itself with duplicates of itself.
+            context = _with_seen(context, item)
+        return screened
+
+    def mutate_v3(self, parents: Sequence[Mapping[str, Any]], *, count: int = 4,
+                  campaign_id: str = "mutation", seed: int = 0) -> list[Proposal]:
+        """Mutate archive elites across diverse parents, labelling each child ``mutate`` (P4.4)."""
+        proposals: list[Proposal] = []
+        seen: set[str] = set()
+        for parent in parents:
+            for child in self.mutate(parent, count=1, campaign_id=campaign_id):
+                child = replace(child, generation_mode="mutate", strategy="mutate",
+                                source_profile=diversity.derive_source_profile(child.expression, self.catalog))
+                key = canonical.canonical_key(child.expression, child.settings)
+                if key in seen:
+                    continue
+                seen.add(key)
+                proposals.append(child)
+                if len(proposals) >= count:
+                    return proposals
+        return proposals[:count]
 
     # -- mutation ----------------------------------------------------------
 
@@ -364,6 +789,10 @@ class CandidateGenerator:
         proposals = builder(parent, expression, settings, family, parent_ids, generation)
         return proposals
 
+    def _child_family(self, expression: str, parent_family: str | None = None) -> str:
+        """Family derived from the *child* expression, never blindly inherited from a parent."""
+        return diversity.derive_family(expression, self.catalog, parent_family)
+
     def _proposal(
         self,
         expression: str,
@@ -378,7 +807,7 @@ class CandidateGenerator:
         return Proposal(
             expression=expression,
             settings=settings,
-            family=family,
+            family=self._child_family(expression, family),
             mutation_type=mutation_type,
             parameters=dict(parameters),
             parent_ids=parent_ids,
@@ -686,6 +1115,27 @@ def _as_repair(proposal: Proposal, repair_type: str) -> Proposal:
     return replace(proposal, mutation_type=repair_type, parameters=parameters)
 
 
+def _with_seen(context: diversity.NoveltyContext, proposal: Proposal) -> diversity.NoveltyContext:
+    """Return the novelty context as if ``proposal`` had just been generated."""
+    datasets = frozenset(proposal.source_profile.get("datasets") or ())
+    motifs = frozenset({proposal.motif_id}) if proposal.motif_id else frozenset()
+    return diversity.NoveltyContext(
+        canonical_keys=context.canonical_keys | {canonical.canonical_key(proposal.expression, proposal.settings)},
+        skeleton_hashes=context.skeleton_hashes | {canonical.skeleton_hash(proposal.expression)},
+        grammar_hashes=context.grammar_hashes | ({proposal.grammar_skeleton_hash} if proposal.grammar_skeleton_hash else frozenset()),
+        semantic_hashes=context.semantic_hashes | ({proposal.semantic_skeleton_hash} if proposal.semantic_skeleton_hash else frozenset()),
+        datasets=context.datasets | datasets,
+        motifs=context.motifs | motifs,
+        candidate_count=context.candidate_count + 1,
+    )
+
+
+def _crossover_leg(node: grammar.ExprNode, form: str) -> grammar.ExprNode:
+    """Wrap one parent expression in the normalizer its crossover form calls for."""
+    operator = "zscore" if form == "add_zscore" else "rank"
+    return grammar.make_call(operator, [node])
+
+
 def _first_window(expression: str) -> int | None:
     for match in _WINDOW_RE.finditer(expression):
         value = int(match.group(1))
@@ -784,6 +1234,14 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--template", choices=[template.id for template in SIGNAL_TEMPLATES],
                           help="pin every proposal to one structural template (proven-recipe campaigns)")
     generate.add_argument("--truncation", type=float, help="override the truncation setting (e.g. 0.05)")
+    generate.add_argument("--strategy", choices=sorted(generation_policy.STRATEGY_ALIASES),
+                          help="Generator V3 campaign strategy (omit for the V2 template generator)")
+    generate.add_argument("--motif", choices=sorted(grammar.MOTIF_BY_ID),
+                          help="force every V3 proposal through one motif")
+    generate.add_argument("--max-family-share", type=float,
+                          default=generation_policy.DEFAULT_MAX_FAMILY_SHARE)
+    generate.add_argument("--dry-plan", action="store_true",
+                          help="materialize and print the V3 plan distribution without queueing")
     generate.add_argument("--db", type=Path)
     mutate = sub.add_parser("mutate")
     mutate.add_argument("candidate_id", type=int)
@@ -791,23 +1249,85 @@ def _build_parser() -> argparse.ArgumentParser:
     mutate.add_argument("--count", type=int, default=4)
     mutate.add_argument("--seed", type=int, default=0)
     mutate.add_argument("--db", type=Path)
+    crossover = sub.add_parser("crossover")
+    crossover.add_argument("parent_a", type=int)
+    crossover.add_argument("parent_b", type=int)
+    crossover.add_argument("--campaign", required=True)
+    crossover.add_argument("--count", type=int, default=4)
+    crossover.add_argument("--seed", type=int, default=0)
+    crossover.add_argument("--db", type=Path)
+    report = sub.add_parser("diversity-report")
+    report.add_argument("--campaign", required=True)
+    report.add_argument("--db", type=Path)
     return parser
+
+
+def _v3_distribution(plan: generation_policy.Plan, proposals: Sequence[Proposal]) -> dict[str, Any]:
+    """Distribution of a materialized V3 plan, by the dimensions the dry plan must print."""
+    def counts(values: Iterable[str]) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for value in values:
+            result[str(value)] = result.get(str(value), 0) + 1
+        return dict(sorted(result.items(), key=lambda item: (-item[1], item[0])))
+
+    return {
+        "planned_budget": plan.planned_budget,
+        "materialized": len(proposals),
+        "generation_mode": counts(proposal.generation_mode for proposal in proposals),
+        "family": counts(proposal.family for proposal in proposals),
+        "motif": counts(proposal.motif_id for proposal in proposals),
+        "dataset": counts(dataset for proposal in proposals for dataset in (proposal.source_profile.get("datasets") or ["unknown"])),
+        "grammar_skeleton": counts(proposal.grammar_skeleton_hash for proposal in proposals),
+        "semantic_skeleton": counts(proposal.semantic_skeleton_hash for proposal in proposals),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     with research_db.ResearchDB.open(args.db) as db:
+        if args.command == "diversity-report":
+            import diversity
+
+            print(json.dumps(diversity.campaign_diversity_report(db, args.campaign), indent=2, sort_keys=True))
+            return 0
         generator = CandidateGenerator(db, seed=args.seed)
-        if args.command == "generate":
+        if args.command == "generate" and (args.strategy or args.motif or args.dry_plan):
+            plan, proposals = generator.generate(
+                campaign_id=args.campaign, count=args.count, seed=args.seed,
+                strategy=args.strategy or "mixed", family=None if args.family in (None, "all") else args.family,
+                motif=args.motif, max_family_share=args.max_family_share,
+            )
+            if args.dry_plan:
+                print(json.dumps(_v3_distribution(plan, proposals), indent=2, sort_keys=True))
+                return 0
+            print(json.dumps(generator.queue(args.campaign, proposals), indent=2, sort_keys=True))
+        elif args.command == "generate":
             proposals = generator.proposals(count=args.count, family=args.family, dataset=args.dataset,
                                             all_fields=args.all_fields, template=args.template,
                                             truncation=args.truncation)
+            print(json.dumps(generator.queue(args.campaign, proposals), indent=2, sort_keys=True))
+        elif args.command == "crossover":
+            for parent_id in (args.parent_a, args.parent_b):
+                if not db.get_candidate(parent_id):
+                    raise SystemExit(f"candidate {parent_id} not found")
+            parent_ids = (int(args.parent_a), int(args.parent_b))
+            slot = generation_policy.PlanSlot(
+                slot=0, generation_mode="crossover", family="crossover", motif_id="crossover",
+                recipe_index=0, reason="explicit crossover request", parent_ids=parent_ids,
+            )
+            proposals: list[Proposal] = []
+            for index in range(max(1, args.count)):
+                proposal = generator.materialize(
+                    replace(slot, recipe_index=index), campaign_id=args.campaign, seed=args.seed)
+                if proposal is not None:
+                    proposals.append(proposal)
+            print(json.dumps(generator.queue(args.campaign, proposals), indent=2, sort_keys=True))
         else:
             parent = db.get_candidate(args.candidate_id)
             if not parent:
                 raise SystemExit(f"candidate {args.candidate_id} not found")
             proposals = generator.mutate(parent, count=args.count, campaign_id=args.campaign)
-        print(json.dumps(generator.queue(args.campaign, proposals), indent=2, sort_keys=True))
+            print(json.dumps(generator.queue(args.campaign, proposals), indent=2, sort_keys=True))
     return 0
 
 

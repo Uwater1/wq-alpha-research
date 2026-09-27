@@ -805,3 +805,81 @@ def test_cli_lists_and_compares_offline(db, tmp_path, capsys):
     assert result["clock"] == "events.id"
     assert result["corpus_size"] == 2
     assert "fifo" in result["policies"]
+
+
+# ---------------------------------------------------------------------------
+# Generator V3 policies (P14)
+# ---------------------------------------------------------------------------
+
+
+def _v3_settle(db, expression, *, family, motif, mode="explore", passed=True, grammar=None, semantic=None):
+    """Settle one candidate carrying the pre-simulation V3 structure facts on its card."""
+    import expression_grammar as grammar_module
+
+    outcome = db.queue_candidate(
+        expression, {"decay": 6}, signal_family=family, source=f"v3-{next(_RUNS)}",
+        motif_id=motif, generation_mode=mode,
+        grammar_skeleton_hash=grammar or grammar_module.grammar_skeleton_hash(expression),
+        semantic_skeleton_hash=semantic or grammar_module.semantic_skeleton_hash(expression),
+    )
+    db.claim_simulation("seed", candidate_id=outcome.candidate_id)
+    db.record_simulation_result(
+        candidate_id=outcome.candidate_id, status="DONE",
+        metrics={"sharpe": 1.4 if passed else 0.4, "fitness": 1.1 if passed else 0.3,
+                 "turnover": 0.06},
+        checks=[{"name": "LOW_SHARPE", "result": "PASS" if passed else "FAIL"}],
+        brain_alpha_id=f"V3{outcome.candidate_id}",
+    )
+    return outcome.candidate_id
+
+
+def test_v3_policies_are_registered_and_leak_free(db):
+    _v3_settle(db, "group_rank(ts_rank(close,60),subindustry)", family="pv1", motif="group_relative")
+    _v3_settle(db, "group_rank(ts_rank(open,60),subindustry)", family="pv1", motif="group_relative")
+    _v3_settle(db, "rank(ts_delta(assets,126))", family="fundamental2", motif="momentum", mode="exploit")
+
+    registry = policy_replay.POLICIES
+    for name in ("grammar_novelty", "semantic_novelty", "archive_v3", "mixed_v3"):
+        assert name in registry, name
+
+    environment = policy_replay.ReplayEnvironment.from_db(db, budget=3)
+    baseline = {item.card.grammar_skeleton_hash for item in environment.items}
+    assert len(baseline) >= 2  # the card really carries the V3 facts
+    for name in ("grammar_novelty", "semantic_novelty", "archive_v3", "mixed_v3"):
+        run = policy_replay.replay(environment, policy_replay.build_policy(name, environment=environment),
+                                   record_details=False)
+        assert run["leakage_check"]["status"] == "passed", run["leakage_check"]
+
+
+def test_grammar_novelty_prefers_an_unseen_topology(db):
+    _v3_settle(db, "group_rank(ts_rank(close,60),subindustry)", family="pv1", motif="group_relative")
+    _v3_settle(db, "group_rank(ts_rank(open,60),subindustry)", family="pv1", motif="group_relative")
+    _v3_settle(db, "rank(ts_delta(assets,126))", family="fundamental2", motif="momentum")
+    environment = policy_replay.ReplayEnvironment.from_db(db, budget=3)
+    cards = [item.card for item in environment.items]
+    shared = [card for card in cards if card.motif_id == "group_relative"]
+    distinct = [card for card in cards if card.motif_id != "group_relative"]
+    assert len(shared) == 2 and len(distinct) == 1
+    # The two same-topology candidates are already in history; only the third is unseen.
+    context = policy_replay.DecisionContext(
+        clock=10 ** 9, as_of="", step=0, remaining_budget=1,
+        history=tuple((card, None) for card in shared), settled_before={},
+    )
+    ordered = policy_replay.build_policy("grammar_novelty", environment=environment).order(cards, context)
+    assert ordered[0] == distinct[0].candidate_id
+
+
+def test_v3_replay_reports_effective_diversity(db):
+    _v3_settle(db, "group_rank(ts_rank(close,60),subindustry)", family="pv1", motif="group_relative")
+    _v3_settle(db, "rank(ts_delta(assets,126))", family="fundamental2", motif="momentum", mode="exploit")
+    _v3_settle(db, "ts_mean(free_cash_flow_reported_value,60)", family="fundamental6", motif="time_series_level")
+
+    environment = policy_replay.ReplayEnvironment.from_db(db, budget=3)
+    run = policy_replay.replay(environment, policy_replay.build_policy("mixed_v3", environment=environment),
+                               record_details=False)
+    metrics = run["metrics"]
+    assert metrics["effective_grammar_diversity"] > 1.0
+    assert metrics["effective_semantic_diversity"] > 1.0
+    assert metrics["effective_family_diversity"] > 1.0
+    assert "wasted_near_duplicate_variants" in metrics
+    assert run["leakage_check"]["status"] == "passed"

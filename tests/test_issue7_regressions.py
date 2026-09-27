@@ -70,7 +70,7 @@ def test_invalid_generated_child_preserves_lineage(db):
     assert child["generation"] == 1
     assert child["mutation_type"] == "field_swap"
     assert json.loads(child["mutation_parameters_json"])["replacement_field"] == "not_a_real_field_xyz"
-    assert child["generator_version"] == generator.GENERATOR_VERSION
+    assert child["generator_version"] == generator.LEGACY_GENERATOR_VERSION
     assert child["signal_family"] == "pv"
     assert child["generation_reason"] == "deliberate invalid child"
 

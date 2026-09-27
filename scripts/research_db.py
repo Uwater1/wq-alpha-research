@@ -84,7 +84,7 @@ META_TRIALS_BACKFILLED = "research_trials_backfilled"
 #: approval step (scripts/finding_calibration.py --approve), never automatically.
 META_VALIDATION_SEVERITY_POLICY = "validation_severity_policy"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
@@ -102,6 +102,34 @@ ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
         "corr_checked_at TEXT",
         "active_set_version INTEGER",
         "corr_status TEXT",
+        # Generator V3 provenance (P10). "candidates answers what should we work on and why",
+        # so the queryable parts of the V3 plan live here; the full recipe/source profile is JSON.
+        "generator_strategy TEXT",
+        "generation_mode TEXT",
+        "motif_id TEXT",
+        "recipe_id TEXT",
+        "recipe_index INTEGER",
+        "grammar_skeleton_hash TEXT",
+        "semantic_skeleton_hash TEXT",
+        "source_profile_json TEXT",
+        "generator_policy_version TEXT",
+        "grammar_version TEXT",
+    ),
+    # The permanent ledger carries the full V3 decision record, including the screening
+    # decision and its skip reason, so a proposal is auditable even when it never queued.
+    "research_trials": (
+        "generator_strategy TEXT",
+        "generation_mode TEXT",
+        "motif_id TEXT",
+        "recipe_json TEXT",
+        "recipe_index INTEGER",
+        "grammar_skeleton_hash TEXT",
+        "semantic_skeleton_hash TEXT",
+        "source_profile_json TEXT",
+        "decision TEXT",
+        "skip_reason TEXT",
+        "generator_policy_version TEXT",
+        "grammar_version TEXT",
     ),
     # `post_attempted_at` is the write-ahead marker that separates "never POSTed"
     # from "POST outcome unknown" after a crash; `last_error` keeps the last reconcile note.
@@ -137,6 +165,16 @@ CANDIDATE_STATUSES: tuple[str, ...] = (
     "RETRY",
     "REJECTED",
 )
+
+#: Candidate statuses that mean the request passed local validation (and may have gone further).
+VALIDATED_OR_BEYOND_STATUSES = frozenset({
+    "VALIDATED", "QUEUED", "SIMULATING", "SIMULATED", "IS_PASS", "CORR_PASS",
+    "SUBMISSION_READY", "SUBMITTING", "ACTIVE",
+})
+#: Candidate statuses that mean BRAIN actually computed the request.
+SIMULATED_OR_BEYOND_STATUSES = frozenset({
+    "SIMULATED", "IS_PASS", "CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE",
+})
 
 # Allowed one-step transitions. Multi-step moves (SIMULATING -> IS_PASS through
 # SIMULATED, for example) are resolved by RESEARCH_DB.transition_path().
@@ -301,6 +339,16 @@ SCHEMA: tuple[str, ...] = (
         mutation_parameters_json TEXT,
         generator_version     TEXT,
         generation_reason     TEXT,
+        generator_strategy    TEXT,
+        generation_mode       TEXT,
+        motif_id              TEXT,
+        recipe_id             TEXT,
+        recipe_index          INTEGER,
+        grammar_skeleton_hash TEXT,
+        semantic_skeleton_hash TEXT,
+        source_profile_json   TEXT,
+        generator_policy_version TEXT,
+        grammar_version       TEXT,
         near_duplicate_of     INTEGER REFERENCES candidates(id),
         brain_alpha_id        TEXT,
         simulation_id         TEXT,
@@ -322,6 +370,8 @@ SCHEMA: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_candidates_queue ON candidates(status, priority DESC, id)",
     "CREATE INDEX IF NOT EXISTS idx_candidates_skeleton ON candidates(skeleton_hash)",
     "CREATE INDEX IF NOT EXISTS idx_candidates_brain_alpha ON candidates(brain_alpha_id)",
+    "CREATE INDEX IF NOT EXISTS idx_candidates_grammar ON candidates(grammar_skeleton_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_candidates_motif ON candidates(motif_id)",
     """
     CREATE TABLE IF NOT EXISTS simulations (
         id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -541,11 +591,67 @@ SCHEMA: tuple[str, ...] = (
         field_catalog_version     TEXT,
         operator_catalog_version  TEXT,
         provenance_json           TEXT,
+        generator_strategy        TEXT,
+        generation_mode           TEXT,
+        motif_id                  TEXT,
+        recipe_json               TEXT,
+        recipe_index               INTEGER,
+        grammar_skeleton_hash     TEXT,
+        semantic_skeleton_hash    TEXT,
+        source_profile_json       TEXT,
+        decision                  TEXT,
+        skip_reason               TEXT,
+        generator_policy_version  TEXT,
+        grammar_version           TEXT,
         created_at                TEXT NOT NULL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_research_trials_campaign ON research_trials(campaign_id, creation_order, id)",
     "CREATE INDEX IF NOT EXISTS idx_research_trials_candidate ON research_trials(candidate_id)",
+    "CREATE INDEX IF NOT EXISTS idx_research_trials_motif ON research_trials(motif_id)",
+    # Adaptive motif/mutation allocation evidence (P9). Populated by refresh_generation_stats.
+    """
+    CREATE TABLE IF NOT EXISTS motif_stats (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope_hash         TEXT NOT NULL,
+        generator_version  TEXT NOT NULL,
+        generation_mode    TEXT NOT NULL,
+        motif_id           TEXT NOT NULL,
+        mutation_operation TEXT NOT NULL DEFAULT '',
+        source_family      TEXT NOT NULL DEFAULT '',
+        target_family      TEXT NOT NULL DEFAULT '',
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        validated          INTEGER NOT NULL DEFAULT 0,
+        simulated          INTEGER NOT NULL DEFAULT 0,
+        is_pass            INTEGER NOT NULL DEFAULT 0,
+        corr_pass          INTEGER NOT NULL DEFAULT 0,
+        active             INTEGER NOT NULL DEFAULT 0,
+        updated_at         TEXT NOT NULL,
+        UNIQUE(scope_hash, generator_version, generation_mode, motif_id, mutation_operation, source_family, target_family)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_motif_stats_key ON motif_stats(scope_hash, generator_version, motif_id)",
+    """
+    CREATE TABLE IF NOT EXISTS generation_operator_stats (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope_hash         TEXT NOT NULL,
+        generator_version  TEXT NOT NULL,
+        generation_mode    TEXT NOT NULL,
+        motif_id           TEXT NOT NULL DEFAULT '',
+        mutation_operation TEXT NOT NULL,
+        source_family      TEXT NOT NULL DEFAULT '',
+        target_family      TEXT NOT NULL DEFAULT '',
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        validated          INTEGER NOT NULL DEFAULT 0,
+        simulated          INTEGER NOT NULL DEFAULT 0,
+        is_pass            INTEGER NOT NULL DEFAULT 0,
+        corr_pass          INTEGER NOT NULL DEFAULT 0,
+        active             INTEGER NOT NULL DEFAULT 0,
+        updated_at         TEXT NOT NULL,
+        UNIQUE(scope_hash, generator_version, generation_mode, motif_id, mutation_operation, source_family, target_family)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_generation_operator_stats_key ON generation_operator_stats(scope_hash, generator_version)",
     """
     CREATE TABLE IF NOT EXISTS family_allocations (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1163,6 +1269,20 @@ class ResearchDB:
         type_policy: str | None = None,
         requeue: bool = False,
         validate: bool = True,
+        # -- Generator V3 provenance (P10). All optional so V2 callers are unchanged. --
+        generator_strategy: str | None = None,
+        generation_mode: str | None = None,
+        motif_id: str | None = None,
+        recipe_id: str | None = None,
+        recipe_index: int | None = None,
+        recipe: Mapping[str, Any] | None = None,
+        grammar_skeleton_hash: str | None = None,
+        semantic_skeleton_hash: str | None = None,
+        source_profile: Mapping[str, Any] | None = None,
+        generator_policy_version: str | None = None,
+        grammar_version: str | None = None,
+        decision: str | None = None,
+        skip_reason: str | None = None,
     ) -> QueueOutcome:
         """Register a candidate and decide whether it still needs BRAIN capacity.
 
@@ -1194,6 +1314,20 @@ class ResearchDB:
             int(value) for value in (parent_ids if parent_ids is not None else ([parent_id] if parent_id is not None else []))
         )
         resolved_generation = self.next_generation(parent_ids_tuple) if generation is None else int(generation)
+        # Keys here must match both ``_record_trial`` and ``_insert_candidate`` signatures;
+        # ``recipe_id`` is candidate-only and is derived inside ``_insert_candidate``.
+        v3: dict[str, Any] = {
+            "generator_strategy": generator_strategy,
+            "generation_mode": generation_mode,
+            "motif_id": motif_id,
+            "recipe_index": recipe_index,
+            "recipe": recipe,
+            "grammar_skeleton_hash": grammar_skeleton_hash,
+            "semantic_skeleton_hash": semantic_skeleton_hash,
+            "source_profile": source_profile,
+            "generator_policy_version": generator_policy_version,
+            "grammar_version": grammar_version,
+        }
         trial: dict[str, Any] = {
             "campaign_id": campaign_id,
             "parent_ids": parent_ids_tuple,
@@ -1208,6 +1342,21 @@ class ResearchDB:
             "operator_catalog_version": operator_catalog_version,
             "provenance": provenance,
             "record_trial": record_trial,
+            "decision": decision,
+            "skip_reason": skip_reason,
+            **v3,
+        }
+        insert_v3: dict[str, Any] = {
+            "generator_strategy": generator_strategy,
+            "generation_mode": generation_mode,
+            "motif_id": motif_id,
+            "recipe_id": recipe_id,
+            "recipe_index": recipe_index,
+            "grammar_skeleton_hash": grammar_skeleton_hash,
+            "semantic_skeleton_hash": semantic_skeleton_hash,
+            "source_profile": source_profile,
+            "generator_policy_version": generator_policy_version,
+            "grammar_version": grammar_version,
         }
         report = None
         if validate:
@@ -1256,6 +1405,7 @@ class ResearchDB:
                     reason=reason,
                     status="SIMULATED",
                     structural_json=_structural_payload(report),
+                    **insert_v3,
                 )
                 if is_new:
                     self.log_event(
@@ -1325,6 +1475,7 @@ class ResearchDB:
                     reason=reason,
                     status="QUEUED",
                     structural_json=_structural_payload(report),
+                    **insert_v3,
                 )
                 from_status = None
                 # Dedicated idempotent validation signal: exactly one per candidate
@@ -1387,6 +1538,16 @@ class ResearchDB:
         reason: str | None = None,
         status: str,
         structural_json: str | None = None,
+        generator_strategy: str | None = None,
+        generation_mode: str | None = None,
+        motif_id: str | None = None,
+        recipe_id: str | None = None,
+        recipe_index: int | None = None,
+        grammar_skeleton_hash: str | None = None,
+        semantic_skeleton_hash: str | None = None,
+        source_profile: Mapping[str, Any] | None = None,
+        generator_policy_version: str | None = None,
+        grammar_version: str | None = None,
     ) -> int:
         skeleton_hash = canonical.skeleton_hash(normalized_expression)
         duplicate = conn.execute(
@@ -1399,8 +1560,11 @@ class ResearchDB:
                 canonical_key, expression, normalized_expression, expression_hash, settings_hash,
                 settings_json, skeleton_hash, status, priority, signal_family, source, parent_id,
                 generation, mutation_type, campaign_id, parent_ids_json, mutation_parameters_json,
-                generator_version, generation_reason, near_duplicate_of, structural_json, created_at, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                generator_version, generation_reason, near_duplicate_of, structural_json, created_at, updated_at,
+                generator_strategy, generation_mode, motif_id, recipe_id, recipe_index,
+                grammar_skeleton_hash, semantic_skeleton_hash, source_profile_json,
+                generator_policy_version, grammar_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 key, expression, normalized_expression, canonical.expression_hash(normalized_expression),
@@ -1410,6 +1574,12 @@ class ResearchDB:
                 json.dumps(dict(mutation_parameters or {}), sort_keys=True, default=str),
                 generator_version, reason, duplicate["id"] if duplicate else None,
                 structural_json, timestamp, timestamp,
+                generator_strategy, generation_mode, motif_id,
+                recipe_id if recipe_id is not None else (motif_id and f"{motif_id}:{recipe_index}") or None,
+                None if recipe_index is None else int(recipe_index),
+                grammar_skeleton_hash, semantic_skeleton_hash,
+                json.dumps(dict(source_profile), sort_keys=True, default=str) if source_profile else None,
+                generator_policy_version, grammar_version,
             ),
         )
         candidate_id = int(cursor.lastrowid)
@@ -1451,6 +1621,20 @@ class ResearchDB:
         reason_text = context.get("reason")
         campaign_id = context.get("campaign_id")
         signal_family = context.get("signal_family")
+        v3_context = {
+            "generation_mode": context.get("generation_mode"),
+            "motif_id": context.get("motif_id"),
+            "recipe": context.get("recipe"),
+            "recipe_index": context.get("recipe_index"),
+            "grammar_skeleton_hash": context.get("grammar_skeleton_hash"),
+            "semantic_skeleton_hash": context.get("semantic_skeleton_hash"),
+            "source_profile": context.get("source_profile"),
+            "generator_strategy": context.get("generator_strategy"),
+            "generator_policy_version": context.get("generator_policy_version"),
+            "grammar_version": context.get("grammar_version"),
+            "decision": context.get("decision"),
+            "skip_reason": context.get("skip_reason"),
+        }
         with self._tx() as conn:
             existing = conn.execute("SELECT * FROM candidates WHERE canonical_key=?", (key,)).fetchone()
             if existing is not None:
@@ -1504,6 +1688,17 @@ class ResearchDB:
                     reason=reason_text,
                     status="REJECTED",
                     structural_json=_structural_payload(report),
+                    generator_strategy=v3_context["generator_strategy"],
+                    generation_mode=v3_context["generation_mode"],
+                    motif_id=v3_context["motif_id"],
+                    recipe_id=(v3_context["motif_id"] and v3_context["recipe_index"] is not None
+                               and f"{v3_context['motif_id']}:{v3_context['recipe_index']}") or None,
+                    recipe_index=v3_context["recipe_index"],
+                    grammar_skeleton_hash=v3_context["grammar_skeleton_hash"],
+                    semantic_skeleton_hash=v3_context["semantic_skeleton_hash"],
+                    source_profile=v3_context["source_profile"],
+                    generator_policy_version=v3_context["generator_policy_version"],
+                    grammar_version=v3_context["grammar_version"],
                 )
                 conn.execute("UPDATE candidates SET failure_reason=? WHERE id=?", (reason, candidate_id))
                 is_duplicate = False
@@ -1518,7 +1713,7 @@ class ResearchDB:
                     generator_version=generator_version, reason=reason_text, signal_family=signal_family,
                     scope=context.get("scope"), field_catalog_version=context.get("field_catalog_version"),
                     operator_catalog_version=context.get("operator_catalog_version"),
-                    provenance=context.get("provenance"),
+                    provenance=context.get("provenance"), **v3_context,
                 )
         return QueueOutcome("rejected_invalid", key, candidate_id, "REJECTED", issues=list(report.errors))
 
@@ -1571,6 +1766,19 @@ class ResearchDB:
         operator_catalog_version: str | None = None,
         provenance: Mapping[str, Any] | None = None,
         record_trial: bool = True,
+        # -- Generator V3 provenance (P10); optional for V2 callers. --
+        generator_strategy: str | None = None,
+        generation_mode: str | None = None,
+        motif_id: str | None = None,
+        recipe: Mapping[str, Any] | None = None,
+        recipe_index: int | None = None,
+        grammar_skeleton_hash: str | None = None,
+        semantic_skeleton_hash: str | None = None,
+        source_profile: Mapping[str, Any] | None = None,
+        decision: str | None = None,
+        skip_reason: str | None = None,
+        generator_policy_version: str | None = None,
+        grammar_version: str | None = None,
     ) -> int | None:
         """Append one research decision to the permanent ledger.
 
@@ -1586,8 +1794,11 @@ class ResearchDB:
                 campaign_id, candidate_id, creation_order, parent_ids_json, generation,
                 mutation_type, mutation_parameters_json, generator_version, reason,
                 validation_result, signal_family, is_duplicate, scope_json,
-                field_catalog_version, operator_catalog_version, provenance_json, created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                field_catalog_version, operator_catalog_version, provenance_json, created_at,
+                generator_strategy, generation_mode, motif_id, recipe_json, recipe_index,
+                grammar_skeleton_hash, semantic_skeleton_hash, source_profile_json, decision,
+                skip_reason, generator_policy_version, grammar_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 campaign_id, candidate_id, order,
@@ -1599,6 +1810,12 @@ class ResearchDB:
                 field_catalog_version, operator_catalog_version,
                 json.dumps(dict(provenance), sort_keys=True, default=str) if provenance else None,
                 timestamp,
+                generator_strategy, generation_mode, motif_id,
+                json.dumps(dict(recipe), sort_keys=True, default=str) if recipe else None,
+                None if recipe_index is None else int(recipe_index),
+                grammar_skeleton_hash, semantic_skeleton_hash,
+                json.dumps(dict(source_profile), sort_keys=True, default=str) if source_profile else None,
+                decision, skip_reason, generator_policy_version, grammar_version,
             ),
         )
         return int(cursor.lastrowid)
@@ -1626,6 +1843,9 @@ class ResearchDB:
             " t.generation, t.mutation_type, t.mutation_parameters_json, t.generator_version, t.reason,"
             " t.validation_result, t.signal_family, t.is_duplicate, t.scope_json, t.field_catalog_version,"
             " t.operator_catalog_version, t.provenance_json, t.created_at,"
+            " t.generation_mode, t.motif_id, t.recipe_json, t.recipe_index, t.grammar_skeleton_hash,"
+            " t.semantic_skeleton_hash, t.source_profile_json, t.decision, t.skip_reason,"
+            " t.generator_policy_version, t.grammar_version,"
             " c.status AS candidate_status, c.gate_reason, c.failure_reason, c.brain_alpha_id,"
             " c.sharpe, c.fitness, c.turnover, c.self_corr, c.is_pass, c.skeleton_hash,"
             " (SELECT s.status FROM submissions s WHERE s.candidate_id=t.candidate_id"
@@ -1636,6 +1856,186 @@ class ResearchDB:
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         return [dict(row) for row in self._conn.execute(sql, params)]
+
+    def refresh_generation_stats(self, *, generator_version: str | None = None) -> dict[str, int]:
+        """Aggregate the trial ledger into bounded motif/mutation outcome counters (P9).
+
+        Derived from ``research_trials`` joined with candidates, so an attempt is counted as
+        soon as the decision is recorded and its outcome is read from the candidate it produced.
+        Rows are upserted, never rewritten in place with older values.
+        """
+        passing = {"IS_PASS", "CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
+        corr_passing = {"CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
+        rows = self.query(
+            "SELECT t.scope_json, t.generator_version, t.generation_mode, t.motif_id,"
+            " t.mutation_type, t.signal_family,"
+            " c.status AS candidate_status"
+            " FROM research_trials t LEFT JOIN candidates c ON c.id=t.candidate_id"
+            " WHERE t.generation_mode IS NOT NULL OR t.motif_id IS NOT NULL"
+        )
+        buckets: dict[tuple, dict[str, int]] = {}
+        for row in rows:
+            try:
+                scope = json.loads(str(row["scope_json"] or "{}"))
+            except ValueError:
+                scope = {}
+            scope_key = canonical.scope_hash(scope if isinstance(scope, Mapping) else {})
+            version = str(row["generator_version"] or "unknown")
+            if generator_version and version != generator_version:
+                continue
+            status = str(row["candidate_status"] or "")
+            base = (
+                scope_key, version,
+                str(row["generation_mode"] or "none"),
+                str(row["motif_id"] or "none"),
+                str(row["mutation_type"] or ""),
+                str(row["signal_family"] or ""),
+            )
+            counters = buckets.setdefault(base, {"attempts": 0, "validated": 0, "simulated": 0,
+                                                 "is_pass": 0, "corr_pass": 0, "active": 0})
+            counters["attempts"] += 1
+            if status in VALIDATED_OR_BEYOND_STATUSES:
+                counters["validated"] += 1
+            if status in SIMULATED_OR_BEYOND_STATUSES:
+                counters["simulated"] += 1
+            if status in passing:
+                counters["is_pass"] += 1
+            if status in corr_passing:
+                counters["corr_pass"] += 1
+            if status == "ACTIVE":
+                counters["active"] += 1
+        now = now_iso()
+        with self._tx() as conn:
+            for key, counters in sorted(buckets.items()):
+                scope_key, version, mode, motif, operation, family = key
+                conn.execute(
+                    """INSERT INTO motif_stats(
+                           scope_hash, generator_version, generation_mode, motif_id, mutation_operation,
+                           source_family, target_family, attempts, validated, simulated, is_pass,
+                           corr_pass, active, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(scope_hash, generator_version, generation_mode, motif_id,
+                                   mutation_operation, source_family, target_family)
+                       DO UPDATE SET attempts=excluded.attempts, validated=excluded.validated,
+                           simulated=excluded.simulated, is_pass=excluded.is_pass,
+                           corr_pass=excluded.corr_pass, active=excluded.active,
+                           updated_at=excluded.updated_at""",
+                    (scope_key, version, mode, motif, operation, family, family,
+                     counters["attempts"], counters["validated"], counters["simulated"],
+                     counters["is_pass"], counters["corr_pass"], counters["active"], now),
+                )
+                conn.execute(
+                    """INSERT INTO generation_operator_stats(
+                           scope_hash, generator_version, generation_mode, motif_id, mutation_operation,
+                           source_family, target_family, attempts, validated, simulated, is_pass,
+                           corr_pass, active, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(scope_hash, generator_version, generation_mode, motif_id,
+                                   mutation_operation, source_family, target_family)
+                       DO UPDATE SET attempts=excluded.attempts, validated=excluded.validated,
+                           simulated=excluded.simulated, is_pass=excluded.is_pass,
+                           corr_pass=excluded.corr_pass, active=excluded.active,
+                           updated_at=excluded.updated_at""",
+                    (scope_key, version, mode, motif, operation, family, family,
+                     counters["attempts"], counters["validated"], counters["simulated"],
+                     counters["is_pass"], counters["corr_pass"], counters["active"], now),
+                )
+        return {"rows": len(buckets), "attempts": sum(c["attempts"] for c in buckets.values())}
+
+    def generation_stats(
+        self,
+        *,
+        generator_version: str | None = None,
+        scope_hash: str | None = None,
+        table: str = "motif_stats",
+    ) -> list[dict[str, Any]]:
+        """Read the bounded motif/mutation outcome counters back out (P9)."""
+        if table not in {"motif_stats", "generation_operator_stats"}:
+            raise ValueError(f"unknown generation stats table {table!r}")
+        where: list[str] = []
+        params: list[Any] = []
+        if generator_version:
+            where.append("generator_version=?")
+            params.append(generator_version)
+        if scope_hash:
+            where.append("scope_hash=?")
+            params.append(scope_hash)
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        return [dict(row) for row in self.query(sql, params)]
+
+    def record_generation_decision(
+        self,
+        expression: str,
+        settings: Mapping[str, Any] | None = None,
+        *,
+        campaign_id: str | None = None,
+        decision: str = "SKIP_REDUNDANT",
+        skip_reason: str | None = None,
+        signal_family: str | None = None,
+        generator_version: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        generator_strategy: str | None = None,
+        generation_mode: str | None = None,
+        motif_id: str | None = None,
+        recipe: Mapping[str, Any] | None = None,
+        recipe_index: int | None = None,
+        grammar_skeleton_hash: str | None = None,
+        semantic_skeleton_hash: str | None = None,
+        source_profile: Mapping[str, Any] | None = None,
+        generator_policy_version: str | None = None,
+        grammar_version: str | None = None,
+    ) -> int | None:
+        """Record a proposal the novelty pre-screen refused, without spending a slot.
+
+        The decision still lands in the permanent ``research_trials`` ledger (linked to the
+        existing candidate when one already exists), so "the generator deliberately skipped
+        this" is as auditable as anything it queued. No candidate and no simulation row is
+        created: a rejected-by-our-own-screen idea must not consume BRAIN capacity.
+        """
+        normalized_expression = canonical.normalize_expression(expression)
+        normalized_settings = canonical.normalize_settings(settings)
+        key = canonical.canonical_key(normalized_expression, normalized_settings)
+        timestamp = now_iso()
+        with self._tx() as conn:
+            existing = conn.execute("SELECT id, signal_family FROM candidates WHERE canonical_key=?", (key,)).fetchone()
+            candidate_id = int(existing["id"]) if existing is not None else None
+            resolved_family = signal_family or (existing["signal_family"] if existing is not None else None)
+            return self._record_trial(
+                conn,
+                candidate_id=candidate_id,
+                validation_result="skipped_redundant",
+                is_duplicate=candidate_id is not None,
+                timestamp=timestamp,
+                campaign_id=campaign_id,
+                reason=skip_reason,
+                signal_family=resolved_family,
+                scope=canonical.scope_from_settings(normalized_settings),
+                generator_version=generator_version,
+                provenance=provenance,
+                generator_strategy=generator_strategy,
+                generation_mode=generation_mode,
+                motif_id=motif_id,
+                recipe=recipe,
+                recipe_index=recipe_index,
+                grammar_skeleton_hash=grammar_skeleton_hash,
+                semantic_skeleton_hash=semantic_skeleton_hash,
+                source_profile=source_profile,
+                decision=decision,
+                skip_reason=skip_reason,
+                generator_policy_version=generator_policy_version,
+                grammar_version=grammar_version,
+            )
+
+    def motif_outcomes(self, *, generator_version: str | None = None) -> dict[str, tuple[int, int]]:
+        """``motif_id -> (attempts, is_pass)`` from the persisted counters (empty when unbuilt)."""
+        outcomes: dict[str, tuple[int, int]] = {}
+        for row in self.generation_stats(generator_version=generator_version):
+            motif = str(row["motif_id"])
+            attempts, passed = outcomes.get(motif, (0, 0))
+            outcomes[motif] = (attempts + int(row["attempts"]), passed + int(row["is_pass"]))
+        return outcomes
 
     # -- screening severity policy, calibration, and policy replay ---------
 

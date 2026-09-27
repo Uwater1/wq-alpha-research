@@ -71,6 +71,7 @@ from typing import Any, Callable, Mapping, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import canonical
+import diversity
 import finding_calibration
 import research_db
 import staged_search
@@ -85,6 +86,9 @@ VISIBLE_CARD_FIELDS = frozenset({
     "mutation_type", "skeleton_hash", "priority", "expected_quality", "novelty_score",
     "failure_risk", "fields", "operators", "categories", "operator_counts", "depth",
     "finding_codes", "expression_hash", "scope",
+    # Generator V3 pre-simulation structure facts (P14). All are knowable before a slot is
+    # spent, so a V3 policy can use them without seeing the future.
+    "grammar_skeleton_hash", "semantic_skeleton_hash", "motif_id", "generation_mode",
 })
 #: Metrics where a *lower* value is better, so a comparison can score deltas correctly.
 LOWER_IS_BETTER = frozenset({
@@ -159,6 +163,10 @@ class CandidateCard:
     finding_codes: tuple[str, ...]
     expression_hash: str
     scope: Mapping[str, Any]
+    grammar_skeleton_hash: str = ""
+    semantic_skeleton_hash: str = ""
+    motif_id: str = ""
+    generation_mode: str = ""
     #: Kept for policies that need the expression itself (e.g. the surrogate featurizer).
     #: Deliberately excluded from :meth:`as_dict` so it can never reach a report.
     expression: str = dataclass_field(default="", repr=False)
@@ -371,6 +379,24 @@ class DecisionContext:
                 passes[key] += 1
         return {key: (attempts[key], passes[key]) for key in attempts}
 
+    def grammar_attempts(self) -> dict[str, int]:
+        return self._counts(lambda card: card.grammar_skeleton_hash or "unknown")
+
+    def semantic_attempts(self) -> dict[str, int]:
+        return self._counts(lambda card: card.semantic_skeleton_hash or "unknown")
+
+    def motif_stats(self) -> dict[str, tuple[int, int]]:
+        """``motif -> (attempts, passes)`` among known decisions, point-in-time by construction."""
+        attempts: dict[str, int] = defaultdict(int)
+        passes: dict[str, int] = defaultdict(int)
+        for card, outcome in list(self.history) + list(self.settled_before.values()):
+            if not card.motif_id:
+                continue
+            attempts[card.motif_id] += 1
+            if outcome is not None and outcome.is_pass:
+                passes[card.motif_id] += 1
+        return {motif: (attempts[motif], passes[motif]) for motif in attempts}
+
     def _counts(self, key: Callable[[CandidateCard], str]) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)
         for card, _outcome in list(self.history) + list(self.settled_before.values()):
@@ -514,6 +540,98 @@ class CoveragePolicy(Policy):
         return [card.candidate_id for card in sorted(available, key=score)]
 
 
+class GrammarNoveltyPolicy(Policy):
+    """Prefer candidates whose expression *topology* has not been tried yet (P14).
+
+    Uses only card facts (grammar skeleton hash) and the decision history, so it is
+    point-in-time safe by construction.
+    """
+
+    name = "grammar_novelty"
+    description = "Prefer an unseen grammar skeleton (same topology, different fields collapses)."
+
+    def order(self, available, context):
+        seen = context.grammar_attempts()
+
+        def score(card: CandidateCard) -> tuple[int, int, int]:
+            key = card.grammar_skeleton_hash or f"candidate:{card.candidate_id}"
+            return (seen.get(key, 0), 0 if card.grammar_skeleton_hash else 1, card.creation_order)
+
+        return [card.candidate_id for card in sorted(available, key=score)]
+
+
+class SemanticNoveltyPolicy(Policy):
+    """Prefer an unseen *economic source combination* (dataset/category skeleton) (P14)."""
+
+    name = "semantic_novelty"
+    description = "Prefer an unseen semantic skeleton (dataset:category:type source identity)."
+
+    def order(self, available, context):
+        grammar = context.grammar_attempts()
+        semantic = context.semantic_attempts()
+
+        def score(card: CandidateCard) -> tuple[int, int, int, int]:
+            semantic_seen = semantic.get(card.semantic_skeleton_hash or "unknown", 0)
+            grammar_seen = grammar.get(card.grammar_skeleton_hash or "unknown", 0)
+            return (semantic_seen, grammar_seen, 0 if card.semantic_skeleton_hash else 1, card.creation_order)
+
+        return [card.candidate_id for card in sorted(available, key=score)]
+
+
+class ArchiveV3Policy(Policy):
+    """Sparse archive niches first: an untested family and unseen grammar, then quality (P14)."""
+
+    name = "archive_v3"
+    description = "V3 archive policy: least-tested family, then unseen grammar, then priority."
+
+    def order(self, available, context):
+        families = context.family_attempts()
+        grammar = context.grammar_attempts()
+
+        def score(card: CandidateCard) -> tuple[int, int, float, int]:
+            return (
+                families.get(card.family or "unknown", 0),
+                grammar.get(card.grammar_skeleton_hash or "unknown", 0),
+                -float(card.priority or 0.0),
+                card.creation_order,
+            )
+
+        return [card.candidate_id for card in sorted(available, key=score)]
+
+
+class MixedV3Policy(Policy):
+    """Blend stored ranking with grammar/semantic novelty and coverage (P14).
+
+    Deliberately additive and bounded, mirroring the ranking layer it is meant to represent:
+    three correlated novelty views are averaged rather than summed at full weight, and the
+    stored quality prior still leads.
+    """
+
+    name = "mixed_v3"
+    description = "V3 blend: normalized ranking quality + grammar/semantic novelty + coverage."
+
+    def order(self, available, context):
+        grammar = context.grammar_attempts()
+        semantic = context.semantic_attempts()
+        families = context.family_attempts()
+        fields = context.field_attempts()
+        total = max(1, len(available))
+
+        def score(card: CandidateCard) -> tuple[float, int]:
+            grammar_seen = grammar.get(card.grammar_skeleton_hash or "unknown", 0)
+            semantic_seen = semantic.get(card.semantic_skeleton_hash or "unknown", 0)
+            novelty = (
+                (1.0 / (1.0 + grammar_seen))
+                + (1.0 / (1.0 + semantic_seen))
+                + (1.0 / (1.0 + families.get(card.family or "unknown", 0)))
+            ) / 3.0
+            coverage = 1.0 / (1.0 + sum(fields.get(name, 0) for name in card.fields))
+            quality = float(card.expected_quality if card.expected_quality is not None else 0.5)
+            return (-(quality + 0.5 * novelty + 0.25 * coverage), card.creation_order)
+
+        return [card.candidate_id for card in sorted(available, key=score)]
+
+
 class CalibratedPolicy(Policy):
     """Skip or demote candidates whose findings history says BRAIN refuses.
 
@@ -590,6 +708,7 @@ class FindingGatePolicy(Policy):
 POLICY_CLASSES: tuple[type[Policy], ...] = (
     FifoPolicy, RankingPolicy, StagedSearchPolicy, SurrogatePolicy, CoveragePolicy,
     CalibratedPolicy, CalibratedSkipPolicy, FindingGatePolicy,
+    GrammarNoveltyPolicy, SemanticNoveltyPolicy, ArchiveV3Policy, MixedV3Policy,
 )
 POLICIES: dict[str, type[Policy]] = {policy.name: policy for policy in POLICY_CLASSES}
 BASELINE_POLICIES: tuple[str, ...] = tuple(policy.name for policy in POLICY_CLASSES if policy.is_baseline)
@@ -945,6 +1064,10 @@ def _item_from_row(
         finding_codes=tuple(report.finding_codes),
         expression_hash=str(row.get("expression_hash") or ""),
         scope=canonical.scope_from_settings(settings),
+        grammar_skeleton_hash=str(row.get("grammar_skeleton_hash") or ""),
+        semantic_skeleton_hash=str(row.get("semantic_skeleton_hash") or ""),
+        motif_id=str(row.get("motif_id") or ""),
+        generation_mode=str(row.get("generation_mode") or ""),
         expression=expression,
         settings=settings,
     )
@@ -1149,6 +1272,14 @@ def metrics(decisions: Sequence[Decision], environment: ReplayEnvironment, *, bu
     ])
     families = {environment.item(decision.candidate_id).card.family for decision in decisions}
     datasets = {environment.item(decision.candidate_id).card.dataset for decision in decisions}
+    grammar_counts: dict[str, int] = defaultdict(int)
+    semantic_counts: dict[str, int] = defaultdict(int)
+    family_counts: dict[str, int] = defaultdict(int)
+    for decision in decisions:
+        card = environment.item(decision.candidate_id).card
+        grammar_counts[card.grammar_skeleton_hash or f"legacy:{card.candidate_id}"] += 1
+        semantic_counts[card.semantic_skeleton_hash or f"legacy:{card.candidate_id}"] += 1
+        family_counts[card.family or "unknown"] += 1
     return {
         "decisions": len(decisions),
         "simulations_used": simulations_used,
@@ -1172,6 +1303,12 @@ def metrics(decisions: Sequence[Decision], environment: ReplayEnvironment, *, bu
         "family_diversity": len(families),
         "dataset_diversity": len({dataset for dataset in datasets if dataset}),
         "niche_diversity": len(skeletons_seen),
+        # Entropy-based effective counts (P14): "12 motifs exist but one is 95% of the picks"
+        # cannot look diverse.
+        "effective_grammar_diversity": diversity.effective_count(grammar_counts),
+        "effective_semantic_diversity": diversity.effective_count(semantic_counts),
+        "effective_family_diversity": diversity.effective_count(family_counts),
+        "wasted_near_duplicate_variants": duplicate_simulations,
         "correlation_failure_rate": round(correlation_failures / simulations_used, 6) if simulations_used else None,
         "turnover_failure_rate": round(turnover_failures / simulations_used, 6) if simulations_used else None,
         "robustness_adjusted_quality": adjusted.get("deflated_sharpe_proxy"),
@@ -1501,7 +1638,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     window = {key: value for key, value in (("from", args.window_from), ("to", args.window_to)) if value}
     names = list(args.run)
     if args.compare or not names:
-        names = [name for name in BASELINE_POLICIES] + [name for name in ("coverage", "calibrated_rank", "calibrated_skip") if name not in BASELINE_POLICIES]
+        names = [name for name in BASELINE_POLICIES] + [
+            name for name in ("coverage", "calibrated_rank", "calibrated_skip",
+                              "grammar_novelty", "semantic_novelty", "archive_v3", "mixed_v3")
+            if name not in BASELINE_POLICIES
+        ]
     names = [name for name in dict.fromkeys(names)]
     with research_db.ResearchDB.open(args.db) as db:
         result = compare(

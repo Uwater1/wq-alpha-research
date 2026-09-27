@@ -22,9 +22,13 @@ from typing import Any, Mapping, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import canonical
+import diversity
+import expression_grammar as grammar
 import research_db
 
 REWARD_VERSION = "is-pass-v1"
+#: Bumped whenever the niche definition changes, so old cells can be told apart from new ones.
+NICHE_VERSION = "archive-niche-v3"
 PASSING = {"IS_PASS", "CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
 
 
@@ -39,8 +43,22 @@ def _bucket_turnover(value: Any) -> str:
     return "high"
 
 
+def _parameters(row: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(row.get("mutation_parameters_json") or "{}"))
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, Mapping) else {}
+
+
 def niche(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Stable niche dimensions; no raw expression or private alpha data is included."""
+    """Stable, topology-preserving niche dimensions; no raw expression or alpha id.
+
+    The main structural identity is now the grammar/semantic skeleton hash and the derived
+    source profile, not a sorted operator set: two different ASTs can share an operator set,
+    while the same topology with different fields is genuinely the same hypothesis. The
+    operator set is retained only as descriptive metadata.
+    """
     expression = str(row.get("normalized_expression") or "")
     structural = {}
     try:
@@ -49,14 +67,24 @@ def niche(row: Mapping[str, Any]) -> dict[str, Any]:
         pass
     operators = tuple(structural.get("operators") or canonical.operators_of(expression))
     fields = tuple(structural.get("fields") or canonical.fields_of(expression))
+    profile = diversity.derive_source_profile(expression)
+    parameters = _parameters(row)
     return {
-        "family": str(row.get("signal_family") or "unknown"),
-        "operator_skeleton": ",".join(operators),
-        "field_category": str(row.get("signal_family") or "unknown").split("_")[0],
+        "niche_version": NICHE_VERSION,
+        "primary_family": str(profile.get("primary_family") or "unknown"),
+        "dataset_set": "+".join(profile.get("datasets") or []),
+        "category_set": "+".join(profile.get("categories") or []),
+        "motif_id": str(parameters.get("motif_id") or "none"),
+        "grammar_skeleton_hash": grammar.grammar_skeleton_hash(expression),
+        "semantic_skeleton_hash": grammar.semantic_skeleton_hash(expression),
         "depth_bucket": min(canonical.expression_depth(expression), 8),
+        "field_count": len(profile.get("field_ids") or fields),
+        "cross_dataset": bool(profile.get("cross_dataset")),
         "turnover_bucket": _bucket_turnover(row.get("turnover")),
         "mutation_type": str(row.get("mutation_type") or "manual"),
-        "field_count": len(fields),
+        "generation_mode": str(parameters.get("generation_mode") or row.get("source") or "legacy"),
+        # Descriptive only: a sorted operator set is not a structural identity.
+        "operator_set": ",".join(operators),
     }
 
 
@@ -124,7 +152,8 @@ def parents(db: research_db.ResearchDB, *, count: int = 10, seed: int = 0) -> li
     selection. Selection is now explicitly diversity-aware.
     """
     rows = db.query(
-        "SELECT a.*, c.signal_family, c.sharpe, c.fitness, c.turnover, c.self_corr, c.generation "
+        "SELECT a.*, c.signal_family, c.sharpe, c.fitness, c.turnover, c.self_corr, c.generation, "
+        "       c.normalized_expression, c.motif_id, c.generation_mode "
         "FROM archive_cells a JOIN candidates c ON c.id=a.elite_candidate_id ORDER BY a.cell_key"
     )
     wanted = max(0, int(count))
