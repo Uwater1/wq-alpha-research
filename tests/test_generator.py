@@ -36,6 +36,18 @@ def test_generation_is_reproducible_and_records_lineage(db):
     assert row["mutation_type"] == "dataset_coverage"
 
 
+def test_pinned_template_and_truncation_apply_to_every_proposal(db):
+    proposals = generator.CandidateGenerator(db, seed=3).proposals(
+        count=4, family="all", template="winsorized_delta", truncation=0.05,
+    )
+    assert len(proposals) == 4
+    for proposal in proposals:
+        assert proposal.expression.startswith("winsorize(zscore(ts_delta(")
+        assert proposal.settings["truncation"] == 0.05
+        assert proposal.parameters["template"] == "winsorized_delta"
+        assert proposal.parameters["truncation"] == 0.05
+
+
 def test_numeric_turnover_diagnosis_selects_repair_even_without_named_check(db):
     outcome = db.queue_candidate("rank(close)", {"decay": 4}, signal_family="technical")
     parent = db.get_candidate(outcome.candidate_id)

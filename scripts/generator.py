@@ -73,6 +73,51 @@ class Field:
 
 
 @dataclass(frozen=True)
+class SignalTemplate:
+    """One structural shape a signal value can be rendered into.
+
+    ``marker`` is the operator substring that identifies the shape inside an
+    existing expression, so a correlation repair can pick a template the parent
+    does not already use.
+    """
+
+    id: str
+    marker: str
+    pattern: str
+
+    def render(self, value: str, window: int) -> str:
+        return self.pattern.format(v=value, w=window)
+
+
+#: Structural shapes used across generation and repair. A book built from one
+#: template correlates with itself no matter which fields it consumes, so field
+#: choice alone cannot clear the self-correlation gate; shapes rotate with it.
+#: Every operator here is in the local catalog and every group argument is a
+#: valid ``Unit[Group]`` literal, so rendered expressions pass static validation.
+SIGNAL_TEMPLATES = (
+    SignalTemplate("group_ts_rank", "group_rank(ts_rank(",
+                   "group_rank(ts_rank({v}, {w}), subindustry)"),
+    SignalTemplate("group_ts_mean_zscore", "group_zscore(",
+                   "group_zscore(ts_mean({v}, {w}), subindustry)"),
+    SignalTemplate("neutral_ts_zscore", "ts_zscore(",
+                   "group_neutralize(ts_zscore({v}, {w}), subindustry)"),
+    SignalTemplate("group_ts_av_diff", "ts_av_diff(",
+                   "group_rank(ts_av_diff({v}, {w}), subindustry)"),
+    SignalTemplate("winsorized_delta", "winsorize(",
+                   "winsorize(zscore(ts_delta({v}, {w})), std=4)"),
+    SignalTemplate("smoothed_rank", "ts_decay_linear(",
+                   "rank(ts_decay_linear({v}, {w}))"),
+)
+
+
+def _template_by_id(template_id: str) -> SignalTemplate:
+    for template in SIGNAL_TEMPLATES:
+        if template.id == template_id:
+            return template
+    raise ValueError(f"unknown signal template {template_id!r}")
+
+
+@dataclass(frozen=True)
 class Proposal:
     expression: str
     settings: Mapping[str, Any]
@@ -164,14 +209,18 @@ class CandidateGenerator:
         family: str = "all",
         dataset: str | None = None,
         all_fields: bool = False,
+        template: str | None = None,
+        truncation: float | None = None,
     ) -> list[Proposal]:
+        """``template``/``truncation`` pin the recipe (e.g. a proven structure applied
+        to fresh drivers); both are recorded in the lineage parameters."""
         fields = self.catalog.select(family, dataset)
         fields = self.coverage_ordered(fields, rng=random.Random(self.seed))
         if not all_fields:
             fields = fields[: max(0, int(count))]
         proposals: list[Proposal] = []
         for field in fields:
-            proposal = self._field_proposal(field)
+            proposal = self._field_proposal(field, template=template, truncation=truncation)
             if proposal:
                 proposals.append(proposal)
             if not all_fields and len(proposals) >= count:
@@ -454,9 +503,40 @@ class CandidateGenerator:
         return proposals
 
     def _correlation_repair(self, parent, expression, settings, family, parent_ids, generation) -> list[Proposal]:
-        proposals = self._combine_signals(
-            parent, expression, settings, family, parent_ids, generation, count=2,
-        )
+        """Escape a correlation trap by changing the driver *and* the signal shape.
+
+        Window, transform, or neutralization tweaks inside one economic family
+        usually preserve the correlation, so a repair child takes a never-tested
+        field from a different dataset and renders it through a structural
+        template the parent expression does not already use. A re-shaped existing
+        driver and an orthogonal combine leg are the fallbacks.
+        """
+        used = set(canonical.fields_of(expression))
+        fresh = self._fresh_templates(expression)
+        proposals: list[Proposal] = []
+        for index, field in enumerate(self._alternatives(used, parent=parent, limit=3)):
+            template = fresh[index % len(fresh)] if fresh else self._template_for(field.name)
+            window = DEFAULT_WINDOWS[(self.seed + index) % len(DEFAULT_WINDOWS)]
+            proposals.append(self._proposal(
+                template.render(self._field_reference(field), window), settings, family, "field_swap",
+                {"replacement_field": field.name, "replacement_dataset": field.dataset,
+                 "replaced_field": self._first_used_field(expression, used),
+                 "template": template.id, "window": window},
+                parent_ids, generation,
+                "change the underlying driver and signal shape to escape correlation",
+            ))
+        target = self._first_used_field(expression, used)
+        parent_field = self.catalog.get(target) if target else None
+        if parent_field is not None and fresh:
+            template = fresh[0]
+            window = DEFAULT_WINDOWS[(self.seed + len(fresh)) % len(DEFAULT_WINDOWS)]
+            proposals.append(self._proposal(
+                template.render(self._field_reference(parent_field), window), settings, family,
+                "template_change",
+                {"field": parent_field.name, "template": template.id, "window": window},
+                parent_ids, generation,
+                "re-shape an existing driver through a different structural template",
+            ))
         if not proposals:
             return self._field_swaps(
                 parent, expression, settings, family, parent_ids, generation, count=2,
@@ -505,12 +585,16 @@ class CandidateGenerator:
         count: int,
     ) -> list[Proposal]:
         used = set(canonical.fields_of(expression))
+        fresh = self._fresh_templates(expression)
         proposals: list[Proposal] = []
-        for field in self._alternatives(used, parent=parent, limit=count):
+        for index, field in enumerate(self._alternatives(used, parent=parent, limit=count)):
+            template = fresh[index % len(fresh)] if fresh else SIGNAL_TEMPLATES[0]
+            leg = template.render(self._field_reference(field), 126)
             proposals.append(self._proposal(
-                f"add({expression}, group_rank(ts_rank({self._field_reference(field)}, 126), subindustry))",
+                f"add({expression}, {leg})",
                 settings, family, "combine_signals",
-                {"added_field": field.name, "added_dataset": field.dataset, "window": 126},
+                {"added_field": field.name, "added_dataset": field.dataset, "window": 126,
+                 "template": template.id},
                 parent_ids, generation, "combine an orthogonal data source to lower correlation",
             ))
         return proposals
@@ -539,7 +623,23 @@ class CandidateGenerator:
             ordered.sort(key=lambda field: (field.dataset == preferred_dataset,))
         return ordered[: max(1, limit)]
 
-    def _field_proposal(self, field: Field) -> Proposal | None:
+    def _template_for(self, field_name: str) -> SignalTemplate:
+        """Deterministic shape rotation; no field is tied to a single template."""
+        offset = int(hashlib.sha256(field_name.encode("utf-8")).hexdigest()[:8], 16)
+        return SIGNAL_TEMPLATES[(self.seed + offset) % len(SIGNAL_TEMPLATES)]
+
+    @staticmethod
+    def _fresh_templates(expression: str) -> list[SignalTemplate]:
+        """Templates whose marker does not already appear in ``expression``."""
+        return [template for template in SIGNAL_TEMPLATES if template.marker not in expression]
+
+    def _field_proposal(
+        self,
+        field: Field,
+        *,
+        template: str | None = None,
+        truncation: float | None = None,
+    ) -> Proposal | None:
         window = DEFAULT_WINDOWS[(self.seed + len(field.name)) % len(DEFAULT_WINDOWS)]
         decay = DEFAULT_DECAYS[(self.seed + len(field.dataset)) % len(DEFAULT_DECAYS)]
         value = field.name
@@ -547,14 +647,22 @@ class CandidateGenerator:
             value = f"vec_avg({value})"
         elif field.field_type in {"GROUP", "UNIVERSE", "SYMBOL"}:
             return None
-        expression = f"group_rank(ts_rank({value}, {window}), subindustry)"
+        selected = self._template_for(field.name) if template is None else _template_by_id(template)
+        expression = selected.render(value, window)
+        settings: dict[str, Any] = {"decay": decay}
+        parameters: dict[str, Any] = {
+            "field": field.name, "dataset": field.dataset, "field_type": field.field_type,
+            "window": window, "decay": decay, "template": selected.id,
+        }
+        if truncation is not None:
+            settings["truncation"] = float(truncation)
+            parameters["truncation"] = float(truncation)
         return Proposal(
             expression,
-            {"decay": decay},
+            settings,
             field.dataset,
             "dataset_coverage",
-            {"field": field.name, "dataset": field.dataset, "field_type": field.field_type,
-             "window": window, "decay": decay},
+            parameters,
             reason="catalog coverage across supplied BRAIN datasets",
             generation=0,
         )
@@ -673,6 +781,9 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--dataset")
     generate.add_argument("--seed", type=int, default=0)
     generate.add_argument("--all-fields", action="store_true", help="cover every compatible field in the catalog")
+    generate.add_argument("--template", choices=[template.id for template in SIGNAL_TEMPLATES],
+                          help="pin every proposal to one structural template (proven-recipe campaigns)")
+    generate.add_argument("--truncation", type=float, help="override the truncation setting (e.g. 0.05)")
     generate.add_argument("--db", type=Path)
     mutate = sub.add_parser("mutate")
     mutate.add_argument("candidate_id", type=int)
@@ -688,7 +799,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     with research_db.ResearchDB.open(args.db) as db:
         generator = CandidateGenerator(db, seed=args.seed)
         if args.command == "generate":
-            proposals = generator.proposals(count=args.count, family=args.family, dataset=args.dataset, all_fields=args.all_fields)
+            proposals = generator.proposals(count=args.count, family=args.family, dataset=args.dataset,
+                                            all_fields=args.all_fields, template=args.template,
+                                            truncation=args.truncation)
         else:
             parent = db.get_candidate(args.candidate_id)
             if not parent:
