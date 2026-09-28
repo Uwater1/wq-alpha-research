@@ -210,6 +210,10 @@ class Proposal:
     novelty_score: float = 0.0
     novelty_decision: str = ""
     skip_reason: str = ""
+    #: Distance to each known parent, in parent order (P7). ``parameters['operation']``-
+    #: style provenance for a two-parent crossover: one branch can be far while the other
+    #: is a near-clone, so the screen keeps both numbers.
+    parent_distances: tuple[float, ...] = ()
 
 
 class Catalog:
@@ -366,6 +370,11 @@ class CandidateGenerator:
                     generation=generation,
                     mutation_type=proposal.mutation_type,
                     mutation_parameters=dict(proposal.parameters) or None,
+                    provenance={
+                        "novelty_score": proposal.novelty_score,
+                        "novelty_decision": proposal.novelty_decision,
+                        "parent_distances": [round(float(value), 6) for value in proposal.parent_distances],
+                    },
                 )
                 outcomes.append({
                     "expression": proposal.expression, "family": proposal.family,
@@ -401,6 +410,11 @@ class CandidateGenerator:
                     "policy_version": generation_policy.GENERATION_POLICY_VERSION,
                     "grammar_version": grammar.GRAMMAR_VERSION,
                     "motif_registry_version": grammar.MOTIF_REGISTRY_VERSION,
+                    # Both parent distances travel with the decision, so a two-parent
+                    # crossover's novelty is auditable after the fact (P7).
+                    "novelty_score": proposal.novelty_score,
+                    "novelty_decision": proposal.novelty_decision,
+                    "parent_distances": [round(float(value), 6) for value in proposal.parent_distances],
                 })
             outcome = self.db.queue_candidate(
                 proposal.expression,
@@ -762,22 +776,25 @@ class CandidateGenerator:
             # Every V3 proposal asks for novelty: an exact duplicate is wasted capacity
             # whatever produced it, and a skipped child still keeps its full lineage (P10).
             request_novelty = bool(proposal.strategy)
-            parent_row: Mapping[str, Any] | None = None
-            if proposal.parent_ids:
-                parent_id = int(proposal.parent_ids[0])
+            # Evaluate every parent, not just the first (P7): a two-parent crossover child
+            # can look novel against parent A while being a near-clone of parent B.
+            parent_expressions: list[str] = []
+            for raw_id in proposal.parent_ids:
+                parent_id = int(raw_id)
                 if parent_id not in parent_cache:
                     parent_cache[parent_id] = self.db.get_candidate(parent_id)
                 parent_row = parent_cache.get(parent_id)
-            parent_expression = str(
-                (parent_row or {}).get("normalized_expression") or ""
-            ) or None
+                expression = str((parent_row or {}).get("normalized_expression") or "")
+                if expression:
+                    parent_expressions.append(expression)
             report = diversity.screen_novelty(
                 proposal.expression,
                 catalog=self.catalog,
                 context=context,
                 settings=proposal.settings,
                 motif_id=proposal.motif_id or None,
-                parent=parent_expression,
+                parent=parent_expressions[0] if parent_expressions else None,
+                parents=parent_expressions[1:],
                 request_novelty=request_novelty,
             )
             item = replace(
@@ -785,6 +802,7 @@ class CandidateGenerator:
                 novelty_score=report.score,
                 novelty_decision=report.decision,
                 skip_reason="" if report.decision != diversity.SKIP_REDUNDANT else report.reason,
+                parent_distances=tuple(report.parent_distances),
             )
             screened.append(item)
             # A KEEP decision makes the proposal part of the seen history for later slots in

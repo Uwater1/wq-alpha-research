@@ -557,8 +557,11 @@ class NoveltyReport:
     category_novel: bool = False
     #: ``1/(1 + archive members in this grammar niche)``: real cell occupancy (P7).
     archive_sparsity: float = 0.0
-    #: Numeric ``grammar_distance(parent, child)`` when a parent is known (P7).
+    #: Numeric ``grammar_distance(parent, child)`` when a parent is known (P7). For a
+    #: two-parent child this is the *minimum* distance to either parent (clone protection).
     parent_distance: float | None = None
+    #: Every parent distance in parent order, so a two-parent decision is auditable (P7).
+    parent_distances: tuple[float, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -574,6 +577,7 @@ class NoveltyReport:
             "category_novel": self.category_novel,
             "archive_sparsity": self.archive_sparsity,
             "parent_distance": self.parent_distance,
+            "parent_distances": list(self.parent_distances),
         }
 
 
@@ -616,6 +620,7 @@ def screen_novelty(
     settings: Mapping[str, Any] | None = None,
     motif_id: str | None = None,
     parent: Any = None,
+    parents: Sequence[Any] | None = None,
     parent_grammar_hash: str | None = None,
     parent_source_profile: Mapping[str, Any] | None = None,
     request_novelty: bool = False,
@@ -648,7 +653,21 @@ def screen_novelty(
     # Real archive-cell occupancy, not a grammar-frequency proxy (P7/P8).
     archive_sparsity = round(1.0 / (1.0 + context.archive_occupancy.get(grammar_hash, 0)), 6)
 
-    parent_distance = _parent_distance(parent, expression, metadata, parent_source_profile, profile)
+    # A two-parent child can be far from one lineage branch and a near-clone of the other, so
+    # clone protection uses the minimum distance across all known parents (P7); the full
+    # vector is kept for diagnostics.
+    parent_distances: list[float] = []
+    if parent is not None:
+        first = _parent_distance(parent, expression, metadata, parent_source_profile, profile)
+        if first is not None:
+            parent_distances.append(first)
+    for extra in (parents or ()):
+        if extra is None:
+            continue
+        distance = _parent_distance(extra, expression, metadata, None, profile)
+        if distance is not None:
+            parent_distances.append(distance)
+    parent_distance = min(parent_distances) if parent_distances else None
     if parent_distance is None and parent_grammar_hash is not None:
         parent_distance = 0.0 if grammar_hash == parent_grammar_hash else 1.0
 
@@ -669,8 +688,11 @@ def screen_novelty(
 
     components = (exact_novel, skeleton_novel, grammar_novel, semantic_novel, dataset_novel,
                   motif_novel, category_novel, archive_sparsity, parent_distance)
+    distances = tuple(parent_distances)
     if not exact_novel and request_novelty:
-        return NoveltyReport(score, SKIP_REDUNDANT, "exact duplicate under an explicit novelty request", *components)
+        return NoveltyReport(score, SKIP_REDUNDANT, "exact duplicate under an explicit novelty request",
+                             *components, parent_distances=distances)
     if score < DOWNWEIGHT_SCORE and not exact_novel:
-        return NoveltyReport(score, DOWNWEIGHT, "closely related to existing work", *components)
-    return NoveltyReport(score, KEEP, "distinct research hypothesis", *components)
+        return NoveltyReport(score, DOWNWEIGHT, "closely related to existing work",
+                             *components, parent_distances=distances)
+    return NoveltyReport(score, KEEP, "distinct research hypothesis", *components, parent_distances=distances)

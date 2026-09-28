@@ -334,6 +334,46 @@ def test_crossover_distance_is_a_selection_objective_not_only_a_filter():
         assert set(pair) == {1, 3}, f"seed {seed} chose {pair} instead of the most distant pair"
 
 
+def test_two_parent_crossover_novelty_reflects_the_closest_parent(db):
+    """P7/P15: a crossover child close to parent B must be judged against B, not only A."""
+    parent_a = db.queue_candidate(
+        "group_rank(ts_rank(close,60),subindustry)", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    parent_b = db.queue_candidate(
+        "ts_delta(assets,126)", {"decay": 6}, signal_family="fundamental6",
+    ).candidate_id
+    service = generator.CandidateGenerator(db, seed=4)
+    context = diversity.novelty_context(db, service.catalog)
+    child = "ts_delta(assets,252)"  # near-clone of parent B, far from parent A
+
+    only_a = diversity.screen_novelty(
+        child, catalog=service.catalog, context=context,
+        parent="group_rank(ts_rank(close,60),subindustry)",
+    )
+    both = diversity.screen_novelty(
+        child, catalog=service.catalog, context=context,
+        parent="group_rank(ts_rank(close,60),subindustry)", parents=["ts_delta(assets,126)"],
+    )
+    assert both.parent_distance == 0.0, "the child is a clone of the second parent"
+    assert both.parent_distance < only_a.parent_distance
+    assert both.score < only_a.score, "the close parent must reduce the novelty score"
+    assert len(both.parent_distances) == 2 and min(both.parent_distances) == both.parent_distance
+
+    # The generator screen persists both parent distances for a two-parent child (P7).
+    proposal = generator.Proposal(
+        expression=child, settings={"decay": 6}, family="fundamental6",
+        mutation_type="crossover", parameters={"operation": "crossover"},
+        parent_ids=(parent_a, parent_b), strategy="crossover", generation_mode="crossover",
+    )
+    screened = service.screen_proposals([proposal], campaign_id="v3-two-parent", seed=4)[0]
+    assert len(screened.parent_distances) == 2
+    assert screened.parent_distances[0] > screened.parent_distances[1] == 0.0
+    assert service.queue("v3-two-parent", [screened])[0]["action"] == "queued"
+    provenance = json.loads(db.trials("v3-two-parent")[-1]["provenance_json"])
+    assert provenance["novelty_decision"] == screened.novelty_decision
+    assert len(provenance["parent_distances"]) == 2
+
+
 def test_crossover_distance_uses_real_dataset_and_category_metadata():
     """P6/P15: without catalog metadata same-topology pairs collapse; with it the
     cross-dataset pair is strictly farther and wins selection."""
