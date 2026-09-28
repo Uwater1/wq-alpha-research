@@ -561,6 +561,9 @@ def plan_campaign(
     resolved_weights = {name: float((weights or STRATEGY_WEIGHTS).get(name, 0.0)) for name in GENERATION_MODES}
     families = _families(catalog, family)
     scope = getattr(catalog, "scope", None)
+    # Real field metadata for structural identities: without it every source parses as
+    # dataset/category ``unknown`` (P6).
+    metadata = diversity.catalog_metadata(catalog)
 
     allocation: list[Mapping[str, Any]] = []
     if db is not None and budget > 0:
@@ -656,7 +659,7 @@ def plan_campaign(
                         0, remaining_mutation_budget.get(mutation_operation, 0) - 1,
                     )
         elif generation_mode == "crossover":
-            pair = _pick_crossover_pair(parents, used_parents, slot_rng)
+            pair = _pick_crossover_pair(parents, used_parents, slot_rng, metadata=metadata)
             if len(pair) < 2:
                 effective_mode, substitution = "explore", "no distant parent pair in the archive"
             else:
@@ -797,22 +800,34 @@ def _pick_parent(
     return parent_id
 
 
-def _parent_grammar_hash(row: Mapping[str, Any]) -> str:
+def _parent_grammar_hash(row: Mapping[str, Any], metadata: Mapping[str, Any] | None = None) -> str:
     """The elite's own grammar skeleton hash (topology + field types, fields masked)."""
     expression = str(row.get("normalized_expression") or "")
     if not expression:
         return str((row.get("dimensions_json") and row.get("cell_key")) or "")
-    return grammar.grammar_skeleton_hash(expression)
+    return grammar.grammar_skeleton_hash(expression, metadata)
 
 
-def _pair_distance(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
-    """Structural distance between two archive elites, motif ids included when known."""
+def _pair_distance(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> float:
+    """Structural distance between two archive elites, motif ids included when known.
+
+    ``metadata`` is the field catalog (``name -> FieldInfo``). Without it the source fields
+    parse as ``dataset/category = unknown`` and the dataset/category Jaccard components
+    collapse to zero, so parent selection cannot tell a same-dataset pair from a
+    cross-dataset one (P6).
+    """
     motif_left = str(left.get("motif_id") or "") or None
     motif_right = str(right.get("motif_id") or "") or None
     try:
         return grammar.grammar_distance(
             str(left.get("normalized_expression") or ""),
             str(right.get("normalized_expression") or ""),
+            fields=metadata,
             motif_left=motif_left, motif_right=motif_right,
         )
     except grammar.GrammarError:
@@ -825,6 +840,7 @@ def _pick_crossover_pair(
     rng: random.Random,
     *,
     min_distance: float = 0.0,
+    metadata: Mapping[str, Any] | None = None,
 ) -> tuple[int, ...]:
     """Two parents from different families/niches, rejecting near-identical pairs by default.
 
@@ -843,9 +859,9 @@ def _pick_crossover_pair(
         for right in ordered[index + 1:]:
             if str(left.get("signal_family") or "") == str(right.get("signal_family") or ""):
                 continue
-            if _parent_grammar_hash(left) == _parent_grammar_hash(right):
+            if _parent_grammar_hash(left, metadata) == _parent_grammar_hash(right, metadata):
                 continue
-            distance = _pair_distance(left, right)
+            distance = _pair_distance(left, right, metadata=metadata)
             if distance < min_distance:
                 continue
             candidates.append((distance, left, right))
@@ -858,7 +874,7 @@ def _pick_crossover_pair(
             for right in ordered[index + 1:]:
                 if str(left.get("signal_family") or "") == str(right.get("signal_family") or ""):
                     continue
-                distance = _pair_distance(left, right)
+                distance = _pair_distance(left, right, metadata=metadata)
                 if distance > best_distance:
                     best, best_distance = (left, right), distance
         candidates = [(best_distance, *best)] if best is not None else []

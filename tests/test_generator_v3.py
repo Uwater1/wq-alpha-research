@@ -298,6 +298,31 @@ def test_crossover_distance_is_a_selection_objective_not_only_a_filter():
         assert set(pair) == {1, 3}, f"seed {seed} chose {pair} instead of the most distant pair"
 
 
+def test_crossover_distance_uses_real_dataset_and_category_metadata():
+    """P6/P15: without catalog metadata same-topology pairs collapse; with it the
+    cross-dataset pair is strictly farther and wins selection."""
+    import random as _random
+
+    metadata = diversity.load_field_metadata()
+    alpha = {"elite_candidate_id": 1, "cell_key": "a", "signal_family": "alpha",
+             "normalized_expression": "ts_rank(close,60)"}      # pv1 / pv
+    beta = {"elite_candidate_id": 2, "cell_key": "b", "signal_family": "beta",
+            "normalized_expression": "ts_rank(returns,60)"}    # pv1 / pv (same dataset)
+    gamma = {"elite_candidate_id": 3, "cell_key": "c", "signal_family": "gamma",
+             "normalized_expression": "ts_rank(assets,60)"}    # fundamental6 / fundamental
+
+    # Blind: the same topology and the same masked field type make every pair identical.
+    assert policy._pair_distance(alpha, gamma) == policy._pair_distance(alpha, beta) == 0.0
+    assert policy._pair_distance(alpha, gamma, metadata=metadata) > policy._pair_distance(
+        alpha, beta, metadata=metadata)
+
+    for seed in range(8):
+        blind = policy._pick_crossover_pair([alpha, beta, gamma], {}, _random.Random(seed))
+        aware = policy._pick_crossover_pair([alpha, beta, gamma], {}, _random.Random(seed), metadata=metadata)
+        assert set(blind) == {1, 2}, f"seed {seed}: metadata-free selection cannot see datasets"
+        assert 3 in aware, f"seed {seed} chose {aware}: the cross-dataset pair must win"
+
+
 def test_novelty_screen_skips_duplicates_and_records_the_decision(db):
     generator_service = generator.CandidateGenerator(db, seed=13)
     _, first = generator_service.generate(campaign_id="v3-novel", count=12, seed=13, strategy="explore")
