@@ -805,6 +805,20 @@ def _parent_grammar_hash(row: Mapping[str, Any]) -> str:
     return grammar.grammar_skeleton_hash(expression)
 
 
+def _pair_distance(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+    """Structural distance between two archive elites, motif ids included when known."""
+    motif_left = str(left.get("motif_id") or "") or None
+    motif_right = str(right.get("motif_id") or "") or None
+    try:
+        return grammar.grammar_distance(
+            str(left.get("normalized_expression") or ""),
+            str(right.get("normalized_expression") or ""),
+            motif_left=motif_left, motif_right=motif_right,
+        )
+    except grammar.GrammarError:
+        return 0.0
+
+
 def _pick_crossover_pair(
     parents: Sequence[Mapping[str, Any]],
     used: dict[int, int],
@@ -824,20 +838,17 @@ def _pick_crossover_pair(
         parent = _pick_parent(parents, used, rng, ())
         return (parent,) if parent is not None else ()
     ordered = sorted(parents, key=lambda row: (str(row.get("cell_key")), int(row["elite_candidate_id"])))
-    candidates: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    candidates: list[tuple[float, Mapping[str, Any], Mapping[str, Any]]] = []
     for index, left in enumerate(ordered):
         for right in ordered[index + 1:]:
             if str(left.get("signal_family") or "") == str(right.get("signal_family") or ""):
                 continue
             if _parent_grammar_hash(left) == _parent_grammar_hash(right):
                 continue
-            distance = grammar.grammar_distance(
-                str(left.get("normalized_expression") or ""),
-                str(right.get("normalized_expression") or ""),
-            )
+            distance = _pair_distance(left, right)
             if distance < min_distance:
                 continue
-            candidates.append((left, right))
+            candidates.append((distance, left, right))
     if not candidates:
         # Nothing distant enough: still allow a distinct-family pair so a planned crossover
         # slot is not silently dropped, but prefer the most distant one available.
@@ -847,17 +858,18 @@ def _pick_crossover_pair(
             for right in ordered[index + 1:]:
                 if str(left.get("signal_family") or "") == str(right.get("signal_family") or ""):
                     continue
-                distance = grammar.grammar_distance(
-                    str(left.get("normalized_expression") or ""),
-                    str(right.get("normalized_expression") or ""),
-                )
+                distance = _pair_distance(left, right)
                 if distance > best_distance:
                     best, best_distance = (left, right), distance
-        candidates = [best] if best is not None else []
+        candidates = [(best_distance, *best)] if best is not None else []
     if not candidates:
         parent = _pick_parent(parents, used, rng, ())
         return (parent,) if parent is not None else ()
-    left, right = candidates[rng.randrange(len(candidates))]
+    # Distance is a real selection objective (P6.2), not only a filter: the structurally
+    # most distant eligible pair is chosen, with the seeded rng breaking exact ties only.
+    top = max(distance for distance, _left, _right in candidates)
+    tied = [(left, right) for distance, left, right in candidates if distance == top]
+    left, right = tied[rng.randrange(len(tied))]
     pair = sorted({int(left["elite_candidate_id"]), int(right["elite_candidate_id"])})
     for parent_id in pair:
         used[parent_id] = used.get(parent_id, 0) + 1

@@ -269,6 +269,35 @@ def test_near_identical_parents_are_not_chosen_for_crossover():
     assert len(fallback) == 2
 
 
+def test_crossover_distance_is_a_selection_objective_not_only_a_filter():
+    """P6.2: the structurally most distant eligible pair wins deterministically."""
+    rows = [
+        {"elite_candidate_id": 1, "cell_key": "a", "signal_family": "alpha",
+         "normalized_expression": "ts_rank(close,60)", "motif_id": "momentum"},
+        {"elite_candidate_id": 2, "cell_key": "b", "signal_family": "beta",
+         "normalized_expression": "ts_rank(ts_mean(close,20),60)", "motif_id": "momentum"},
+        {"elite_candidate_id": 3, "cell_key": "c", "signal_family": "gamma",
+         "normalized_expression": "group_rank(winsorize(zscore(ts_delta(assets,126)),std=4),subindustry)",
+         "motif_id": "reversal"},
+    ]
+    import random as _random
+
+    # Pairwise distances are strict: d(1,3) > d(2,3) > d(1,2), so the most distant eligible
+    # pair (1,3) is a unique argmax. Every seed must pick it: a filter-then-shuffle
+    # implementation would vary across seeds even with a unique best pair.
+    distances = {
+        frozenset((left["elite_candidate_id"], right["elite_candidate_id"])):
+            policy._pair_distance(left, right)
+        for index, left in enumerate(rows)
+        for right in rows[index + 1:]
+    }
+    assert distances[frozenset((1, 3))] > distances[frozenset((2, 3))]
+    assert distances[frozenset((2, 3))] > distances[frozenset((1, 2))]
+    for seed in range(8):
+        pair = policy._pick_crossover_pair(rows, {}, _random.Random(seed))
+        assert set(pair) == {1, 3}, f"seed {seed} chose {pair} instead of the most distant pair"
+
+
 def test_novelty_screen_skips_duplicates_and_records_the_decision(db):
     generator_service = generator.CandidateGenerator(db, seed=13)
     _, first = generator_service.generate(campaign_id="v3-novel", count=12, seed=13, strategy="explore")
