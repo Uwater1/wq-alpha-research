@@ -192,6 +192,9 @@ def render(node: ExprNode) -> str:
             return f'"{node.value}"' if _needs_quotes(str(node.value)) else str(node.value)
         return _format_number(node.value)
     if isinstance(node, CallNode):
+        if node.operator in COMPARISON_INFIX and len(node.args) == 2 and not node.keywords:
+            # Comparisons are parsed from infix form, so render them back the same way.
+            return f"({render(node.args[0])}{COMPARISON_INFIX[node.operator]}{render(node.args[1])})"
         parts = [render(argument) for argument in node.args]
         parts.extend(f"{name}={render(value)}" for name, value in node.keywords)
         return f"{node.operator}({','.join(parts)})"
@@ -200,6 +203,11 @@ def render(node: ExprNode) -> str:
 
 def _needs_quotes(text: str) -> bool:
     return not _IDENT_RE.fullmatch(text)
+
+
+#: Bare identifiers and numeric literals, used only by the skeleton fallback path.
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_NUMBER_TOKEN_RE = re.compile(r"\d+\.?\d*(?:[eE][+-]?\d+)?")
 
 
 def literal(value: Any, literal_type: str | None = None) -> LiteralNode:
@@ -278,8 +286,20 @@ _TOKEN_RE = re.compile(
     r"\s*(?:(?P<number>\d+\.\d*|\.\d+|\d+(?:[eE][+-]?\d+)?)"
     r"|(?P<string>\"[^\"]*\"|'[^']*')"
     r"|(?P<ident>[A-Za-z_][A-Za-z0-9_]*)"
-    r"|(?P<op>[()+\-*/,=<>!]))"
+    r"|(?P<op>>=|<=|==|!=|<>|[()+\-*/,=<>=!]))"
 )
+
+#: Comparison spellings -> the catalog operator that carries the same meaning. The skeleton
+#: only needs a stable, comparable name; rendering turns them back into infix form.
+COMPARISON_OPERATORS: dict[str, str] = {
+    ">": "greater", "<": "less", ">=": "greater_equal", "<=": "less_equal",
+    "==": "equal", "=": "equal", "!=": "not_equal", "<>": "not_equal",
+}
+#: Infix spelling for the comparison operators, used when rendering an AST back to FASTEXPR.
+COMPARISON_INFIX: dict[str, str] = {
+    "greater": ">", "less": "<", "greater_equal": ">=", "less_equal": "<=",
+    "equal": "==", "not_equal": "!=",
+}
 
 
 def _tokenize(text: str) -> list[tuple[str, str]]:
@@ -326,9 +346,27 @@ class _Parser:
 
     # -- grammar -----------------------------------------------------------
     def parse(self) -> ExprNode:
-        node = self.expression()
+        node = self.comparison()
         if self.peek() is not None:
             raise GrammarError(f"trailing tokens at {self.peek()!r}")
+        return node
+
+    def comparison(self) -> ExprNode:
+        """Comparison/equality level.
+
+        Existing expressions legitimately contain ``a > b`` (``trade_when(volume>ts_mean(volume,60),...)``),
+        and the tolerant parser must hash those rather than refuse them. These map to the
+        published comparison operators so the skeleton keeps the real topology; they are only
+        ever produced by parsing, never chosen as a generation motif.
+        """
+        node = self.expression()
+        token = self.peek()
+        if token is None:
+            return node
+        if token[1] in {"<", ">", "<=", ">=", "==", "!=", "<>", "="}:
+            self.next()
+            operator = COMPARISON_OPERATORS[token[1]]
+            return make_call(operator, [node, self.expression()], validate=False)
         return node
 
     def expression(self) -> ExprNode:
@@ -360,7 +398,7 @@ class _Parser:
         kind, value = token
         if value == "(":
             self.next()
-            node = self.expression()
+            node = self.comparison()
             self.expect("op", ")")
             return node
         if value in {"-", "+"}:
@@ -390,9 +428,10 @@ class _Parser:
                             and self.tokens[self.index + 1][1] == "="):
                         name = self.next()[1]
                         self.expect("op", "=")
-                        keywords.append((name.lower(), self.expression()))
+                        keywords.append((name.lower(), self.comparison()))
                     else:
-                        args.append(self.expression())
+                        # Arguments may contain a comparison: trade_when(volume>adv20,...).
+                        args.append(self.comparison())
                     if self.peek() is not None and self.peek()[1] == ",":
                         self.next()
                         continue
@@ -477,16 +516,53 @@ def _masked_tokens(node: ExprNode, *, semantic: bool) -> str:
     raise TypeError(f"not an expression node: {node!r}")
 
 
+def _fallback_skeleton(expression: str, fields: Mapping[str, Any] | None, *, semantic: bool) -> str:
+    """Masked-token skeleton for an expression the tolerant parser cannot model.
+
+    These helpers hash *everything already in the database*, including hand-typed CSV rows and
+    legacy expressions, so one unmodelled shape must never break a campaign plan. The fallback
+    keeps operator calls and token order verbatim, masks literals, and masks source names using
+    the catalog when the name is known. It is coarser than the AST skeleton — it cannot see
+    nesting — but it is still deterministic and comparable, and it only runs for a shape the
+    parser already refused.
+    """
+    metadata = fields or {}
+
+    def mask(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        if str(expression or "")[match.end():match.end() + 1].lstrip().startswith("("):
+            return token  # operator name: part of the topology, keep it
+        info = metadata.get(token) or metadata.get(token.lower())
+        if info is None:
+            return "<FIELD>"
+        node = field_node_from(info, fallback_id=token)
+        if node.value_type == GROUP:
+            return "<GROUP>"
+        if semantic:
+            return f"<{node.dataset}:{node.category}:{node.value_type}>"
+        return f"<FIELD:{node.value_type}>"
+
+    text = _IDENT_TOKEN_RE.sub(mask, str(expression or ""))
+    return _NUMBER_TOKEN_RE.sub("#", text)
+
+
+def _node_or_fallback(expression: str | ExprNode, fields: Mapping[str, Any] | None, *, semantic: bool) -> str:
+    if isinstance(expression, (FieldNode, LiteralNode, CallNode)):
+        return _masked_tokens(expression, semantic=semantic)
+    try:
+        return _masked_tokens(parse_expression(str(expression), fields), semantic=semantic)
+    except GrammarError:
+        return _fallback_skeleton(str(expression), fields, semantic=semantic)
+
+
 def grammar_skeleton(expression: str | ExprNode, fields: Mapping[str, Any] | None = None) -> str:
     """Operator topology + field type, with exact fields and literals masked."""
-    node = expression if isinstance(expression, (FieldNode, LiteralNode, CallNode)) else parse_expression(str(expression), fields)
-    return _masked_tokens(node, semantic=False)
+    return _node_or_fallback(expression, fields, semantic=False)
 
 
 def semantic_skeleton(expression: str | ExprNode, fields: Mapping[str, Any] | None = None) -> str:
     """Operator topology + ``<dataset:category:type>`` source identity, literals masked."""
-    node = expression if isinstance(expression, (FieldNode, LiteralNode, CallNode)) else parse_expression(str(expression), fields)
-    return _masked_tokens(node, semantic=True)
+    return _node_or_fallback(expression, fields, semantic=True)
 
 
 def _sha256(text: str) -> str:

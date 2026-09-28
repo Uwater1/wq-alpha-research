@@ -135,3 +135,58 @@ def test_parser_masks_literals_in_skeletons():
     a = grammar.grammar_skeleton("ts_mean(close, 20)", fields)
     b = grammar.grammar_skeleton("ts_mean(return_assets, 252)", fields)
     assert a == b == "ts_mean(<FIELD:MATRIX>,#)"
+
+
+# ---------------------------------------------------------------------------
+# Real-world tolerance: comparisons inside call arguments (live database shapes)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("expression", [
+    "trade_when(volume>ts_mean(volume,60),rank(ts_rank(est_ptp/close,126)),-1)",
+    "trade_when(ts_std_dev(returns,20)>ts_mean(ts_std_dev(returns,20),120),rank(close),-1)",
+    "trade_when(returns<0,rank(close),-1)",
+    "trade_when(volume<=adv20,rank(close),-1)",
+    "trade_when(volume!=0,rank(close),-1)",
+])
+def test_comparison_arguments_parse_and_hash(expression):
+    """`trade_when(a>b, ...)` is a real BRAIN shape; skeleton hashing must not refuse it."""
+    node = grammar.parse_expression(expression)
+    skeleton = grammar.grammar_skeleton(node)
+    semantic = grammar.semantic_skeleton(node)
+    assert skeleton.startswith("trade_when(")
+    assert ">" in skeleton or "<" in skeleton or "greater" in skeleton or "less" in skeleton
+    assert semantic  # never empty, never raises
+    assert grammar.render(node)  # renderable back to FASTEXPR
+    assert grammar.grammar_skeleton_hash(expression) == grammar.grammar_skeleton_hash(node)
+
+
+def test_comparison_topology_is_preserved_but_field_identity_is_not():
+    greater = grammar.grammar_skeleton_hash(
+        "trade_when(ts_rank(close,60)>ts_mean(close,120),rank(close),-1)"
+    )
+    same_shape_other_field = grammar.grammar_skeleton_hash(
+        "trade_when(ts_rank(open,60)>ts_mean(open,120),rank(open),-1)"
+    )
+    less_not_greater = grammar.grammar_skeleton_hash(
+        "trade_when(ts_rank(close,60)<ts_mean(close,120),rank(close),-1)"
+    )
+    assert greater == same_shape_other_field  # fields masked
+    assert greater != less_not_greater  # direction is part of the topology
+
+
+def test_malformed_expression_falls_back_instead_of_raising():
+    """A single unmodelled row in the database must not break a campaign plan."""
+    broken = "trade_when(volume>adv20,"
+    skeleton = grammar.grammar_skeleton(broken)
+    assert skeleton
+    assert grammar.grammar_skeleton_hash(broken)  # deterministic, no exception
+    assert grammar.semantic_skeleton(broken)
+    assert grammar.grammar_skeleton_hash(broken) == grammar.grammar_skeleton_hash(broken)
+
+
+def test_fallback_skeleton_keeps_operator_names_and_masks_sources():
+    broken = "trade_when(volume>adv20,"
+    skeleton = grammar.grammar_skeleton(broken)
+    assert "trade_when" in skeleton
+    assert "volume" not in skeleton and "adv20" not in skeleton
