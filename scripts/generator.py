@@ -629,10 +629,13 @@ class CandidateGenerator:
             return None
         expression = grammar.render(node)
         parent_ids = tuple(int(row["id"]) for row in parents[:2])
+        # The child family comes from the *child's* final sources (P0.1/P6.3): a crossover
+        # of two families must never keep the first parent's stale label.
+        profile = diversity.derive_source_profile(expression, self.catalog)
         return Proposal(
             expression=expression,
             settings={"decay": 6},
-            family=str(parents[0].get("signal_family") or "unknown"),
+            family=str(profile.get("primary_family") or "unknown"),
             mutation_type="crossover",
             parameters={
                 "motif_id": f"crossover_{form}", "recipe_index": slot.recipe_index,
@@ -648,7 +651,7 @@ class CandidateGenerator:
             recipe_index=slot.recipe_index,
             generation_mode="crossover",
             strategy="crossover",
-            source_profile=diversity.derive_source_profile(expression, self.catalog),
+            source_profile=profile,
             grammar_skeleton_hash=grammar.grammar_skeleton_hash(expression, metadata),
             semantic_skeleton_hash=grammar.semantic_skeleton_hash(expression, metadata),
         )

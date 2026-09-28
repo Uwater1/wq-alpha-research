@@ -363,3 +363,33 @@ def test_crossover_budget_scales_with_its_parents(db):
     # The cap is absolute: the child never exceeds the fixed ceiling, whatever the parents.
     assert grammar.node_depth(node) <= generator.CROSSOVER_LIMITS.max_depth
     assert grammar.node_count(node) <= generator.CROSSOVER_LIMITS.max_nodes
+
+
+def test_crossover_child_family_matches_its_own_source_profile(db):
+    """P0.1/P6.3: a cross-family pair must not leave the first parent's label on the child."""
+    parent_a = db.queue_candidate(
+        "group_rank(ts_rank(close,60),subindustry)", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    parent_b = db.queue_candidate(
+        "group_rank(ts_rank(assets,60),industry)", {"decay": 6}, signal_family="fundamental6",
+    ).candidate_id
+    slot = policy.PlanSlot(
+        slot=0, generation_mode="crossover", family="crossover", motif_id="crossover",
+        recipe_index=0, reason="explicit crossover request", parent_ids=(parent_a, parent_b),
+    )
+    service = generator.CandidateGenerator(db, seed=1)
+    proposal = service.materialize(slot, campaign_id="v3-x-fam")
+    assert proposal is not None
+    profile = diversity.derive_source_profile(proposal.expression, catalog=generator.Catalog())
+    assert profile["cross_dataset"], "the fixture pair must genuinely span two datasets"
+    assert proposal.family == profile["primary_family"]
+    assert proposal.family == "multi:" + "+".join(profile["datasets"])
+    assert proposal.family != "pv1", "the first parent's family must not leak onto the child"
+    assert proposal.source_profile == profile
+
+    outcomes = service.queue("v3-x-fam", [proposal])
+    assert outcomes[0]["action"] == "queued"
+    row = db.get_candidate(outcomes[0]["candidate_id"])
+    assert row["signal_family"] == proposal.family
+    trial = db.trials("v3-x-fam")[-1]
+    assert trial["signal_family"] == proposal.family
