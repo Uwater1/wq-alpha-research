@@ -94,10 +94,11 @@ SMOOTHING_WINDOWS = (5, 10, 22)
 #: Concrete V3 structural mutation operations (P4.4). Every one is a typed AST edit that is
 #: re-validated against the operator catalog and a parent-scaled complexity budget before a
 #: child exists, and every child records which edit produced it in ``parameters["operation"]``.
-V3_MUTATION_OPERATIONS = (
-    "dataset_swap", "motif_change", "normalization_change", "group_change",
-    "subtree_replace", "add_component",
-)
+#: The vocabulary lives in :mod:`generation_policy` (planning allocates budget across it);
+#: re-exported here because this module realizes the edits.
+V3_MUTATION_OPERATIONS = generation_policy.V3_MUTATION_OPERATIONS
+#: Legacy operation spellings normalized into the stable vocabulary before aggregation.
+MUTATION_OPERATION_ALIASES = canonical.MUTATION_OPERATION_ALIASES
 #: Normalizers ``normalization_change`` flips between (same arity, so the swap is type-safe).
 NORMALIZATION_SWAPS: dict[str, str] = {
     "rank": "zscore", "zscore": "rank",
@@ -554,7 +555,10 @@ class CandidateGenerator:
                 # same child (the repair path is deterministic in the generator seed alone).
                 slot_seed = generation_policy.recipe_seed(campaign_id, seed, (), "mutate", slot.recipe_index, slot.parent_ids)
                 mutator = CandidateGenerator(self.db, self.catalog, seed=slot_seed % (2 ** 31))
-                child = mutator._mutate_child(parent, campaign_id=campaign_id)
+                child = mutator._mutate_child(
+                    parent, campaign_id=campaign_id,
+                    operation=slot.mutation_operation or None,
+                )
                 if child is not None:
                     operation = str(child.parameters.get("operation") or child.mutation_type)
                     return replace(
@@ -799,10 +803,26 @@ class CandidateGenerator:
                 return proposals
         return proposals[:count]
 
-    def _mutate_child(self, parent: Mapping[str, Any], *, campaign_id: str) -> Proposal | None:
+    def _mutate_child(
+        self,
+        parent: Mapping[str, Any],
+        *,
+        campaign_id: str,
+        operation: str | None = None,
+    ) -> Proposal | None:
         """One V3 mutation child: failure-directed repair when a failure is diagnosed,
-        otherwise a concrete structural edit (P4.4), and finally the structural field swap."""
-        repairs = self.mutate(parent, count=1, campaign_id=campaign_id) if self.diagnose(parent) else []
+        otherwise a concrete structural edit (P4.4), and finally the structural field swap.
+
+        ``operation`` pins the edit the adaptive mutation allocation budgeted (P9.2); a
+        diagnosed failure still gets its repair first, because repair answers an observed
+        problem while the allocation governs exploratory edits.
+        """
+        diagnosed = self.diagnose(parent)
+        if operation and not diagnosed:
+            child = self.structural_mutation(parent, operation=operation, campaign_id=campaign_id)
+            if child is not None:
+                return child
+        repairs = self.mutate(parent, count=1, campaign_id=campaign_id) if diagnosed else []
         child = repairs[0] if repairs else self.structural_mutation(parent, campaign_id=campaign_id)
         if child is None:
             fallback = self.mutate(parent, count=1, campaign_id=campaign_id)

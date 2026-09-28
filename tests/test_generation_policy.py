@@ -154,3 +154,53 @@ def test_plan_records_the_bounded_motif_allocation(db, catalog):
     assert max(plan.motif_allocation.values()) <= int(math.ceil(40 * policy.DEFAULT_MOTIF_MAX_SHARE)) + 1
     # The planner consumes the allocation: exploit/mutate/crossover motifs come from the plan.
     assert plan.distribution("motif_id")
+
+
+# ---------------------------------------------------------------------------
+# Bounded adaptive mutation allocation (P9.2)
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_allocation_rewards_success_and_reserves_exploration():
+    operations = list(policy.V3_MUTATION_OPERATIONS)
+    stats = {
+        "dataset_swap": (10, 8),        # the edit that pays
+        "motif_change": (10, 2),        # tried and failing
+        "normalization_change": (10, 5),
+        "group_change": (10, 4),
+        "subtree_replace": (10, 3),
+        "add_component": (0, 0),        # untested: must retain exploration
+    }
+    totals = {name: 0 for name in operations}
+    for seed in range(16):
+        allocation = policy.allocate_mutation_operations(operations, 12, stats, seed=seed)
+        assert sum(allocation.values()) == 12
+        assert set(allocation) == set(operations)
+        assert allocation["add_component"] >= 1, "an untested edit must retain exploration"
+        for name, value in allocation.items():
+            totals[name] += value
+    assert totals["dataset_swap"] == max(totals.values()), f"the successful edit earns the budget: {totals}"
+    assert totals["dataset_swap"] > totals["motif_change"], "a failing edit must not lead"
+
+
+def test_mutation_allocation_responds_to_new_evidence():
+    operations = list(policy.V3_MUTATION_OPERATIONS)
+    cold_total = 0
+    proven_total = 0
+    for seed in range(16):
+        cold = policy.allocate_mutation_operations(operations, 12, {}, seed=seed)
+        proven = policy.allocate_mutation_operations(operations, 12, {"group_change": (10, 9)}, seed=seed)
+        assert sum(proven.values()) == 12
+        others = sum(value for name, value in proven.items() if name != "group_change")
+        assert others >= 3, "the exploration reserve survives even for a proven edit"
+        cold_total += cold["group_change"]
+        proven_total += proven["group_change"]
+    assert proven_total > cold_total, "evidence must move budget toward the proven edit"
+
+
+def test_plan_records_the_bounded_mutation_allocation(db, catalog):
+    plan = policy.plan_campaign(db, catalog, "plan-ops", budget=20, seed=3, mode="mixed")
+    planned_mutations = policy.mode_allocation(20, "mixed").count("mutate")
+    assert sum(plan.mutation_allocation.values()) == planned_mutations
+    assert set(plan.mutation_allocation) == set(policy.V3_MUTATION_OPERATIONS)
+    assert plan.as_dict()["mutation_allocation"] == dict(plan.mutation_allocation)

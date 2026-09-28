@@ -4,6 +4,7 @@ and the V2 regressions that must keep passing.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -352,6 +353,76 @@ def test_skipped_crossover_preserves_both_parents(db):
     parameters = json.loads(trial["mutation_parameters_json"])
     assert parameters["operation"] == "crossover"
     assert parameters["crossover_form"]
+
+
+def test_generation_stats_preserve_cross_family_mutation_lineage(db):
+    """P9.2: source family is the parent's, target family the child-derived one."""
+    parent_id = db.queue_candidate(
+        "rank(ts_delta(close,20))", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    service = generator.CandidateGenerator(db, seed=4)
+    proposal = service.structural_mutation(
+        db.get_candidate(parent_id), operation="dataset_swap", campaign_id="v3-gstats",
+    )
+    assert proposal is not None and proposal.family != "pv1"
+    outcomes = service.queue("v3-gstats", [proposal])
+    assert outcomes[0]["action"] == "queued"
+    settled = db.claim_simulation("gstats", candidate_id=outcomes[0]["candidate_id"])
+    db.record_simulation_result(
+        candidate_id=settled["id"], status="DONE",
+        metrics={"sharpe": 1.4, "fitness": 1.1, "turnover": 0.08},
+        checks=[{"name": "IS", "result": "PASS"}], brain_alpha_id="A-gstats",
+    )
+    db.refresh_generation_stats(generator_version=generator.GENERATOR_VERSION_V3)
+    rows = [row for row in db.generation_stats(
+        generator_version=generator.GENERATOR_VERSION_V3, table="generation_operator_stats",
+    ) if row["mutation_operation"] == "dataset_swap"]
+    assert rows
+    row = rows[0]
+    assert row["source_family"] == "pv1"
+    assert row["target_family"] == proposal.family
+    assert row["source_family"] != row["target_family"], "a cross-family mutation must not collapse both sides"
+
+
+def test_generation_stats_learn_concrete_operations_apart_from_repair_class(db):
+    """P9.2: the concrete edit is aggregated separately from the broad repair class."""
+    parent_id = db.queue_candidate("ts_rank(close,60)", {"decay": 6}, signal_family="pv1").candidate_id
+    parent = dict(db.get_candidate(parent_id), failure_reason="HIGH_TURNOVER")
+    proposals = generator.CandidateGenerator(db, seed=9).mutate(parent, count=3)
+    assert {p.mutation_type for p in proposals} == {"turnover_repair"}
+    assert len({p.parameters["operation"] for p in proposals}) >= 2  # hump_smoothing + window_change
+    service = generator.CandidateGenerator(db, seed=9)
+    labelled = [replace(p, generation_mode="mutate", strategy="mutate") for p in proposals]
+    outcomes = service.queue("v3-op-class", labelled)
+    assert all(outcome["action"] == "queued" for outcome in outcomes)
+    db.refresh_generation_stats(generator_version=generator.GENERATOR_VERSION_V3)
+    rows = [row for row in db.generation_stats(
+        generator_version=generator.GENERATOR_VERSION_V3, table="generation_operator_stats",
+    ) if row["mutation_type"] == "turnover_repair"]
+    operations = {row["mutation_operation"] for row in rows}
+    assert {"hump_smoothing", "window_change"} <= operations, (
+        "one repair class with two concrete edits must aggregate into separate operations"
+    )
+    learned = db.mutation_operation_outcomes(generator_version=generator.GENERATOR_VERSION_V3)
+    assert {"hump_smoothing", "window_change"} <= set(learned)
+
+
+def test_planned_mutation_operations_are_budgeted_and_realized(db):
+    """P9.2: the allocation lands on mutate slots and materialization honors the pin."""
+    _settle(db, "group_rank(ts_rank(close,60),subindustry)", "pv1", 1.7)
+    _settle(db, "group_rank(ts_rank(assets,60),industry)", "fundamental6", 1.5)
+    archive.rebuild(db)
+    service = generator.CandidateGenerator(db, seed=2)
+    plan = service.plan(campaign_id="v3-ops-plan", budget=24, seed=2, mode="mixed")
+    planned = [slot for slot in plan.slots if slot.generation_mode == "mutate"]
+    assert planned
+    assert all(slot.mutation_operation in generator.V3_MUTATION_OPERATIONS for slot in planned)
+    assert plan.mutation_allocation and sum(plan.mutation_allocation.values()) >= len(planned)
+
+    pinned = replace(planned[0], mutation_operation="group_change")
+    proposal = service.materialize(pinned, campaign_id="v3-ops-plan")
+    assert proposal is not None
+    assert proposal.parameters["operation"] == "group_change"
 
 
 def test_v3_structure_columns_are_queryable(db):

@@ -427,3 +427,21 @@ def _expression_depth(text: str) -> int:
         elif char == ")":
             depth = max(0, depth - 1)
     return maximum
+
+
+# ---------------------------------------------------------------------------
+# Mutation operation vocabulary (Generator V3 P9.2)
+# ---------------------------------------------------------------------------
+
+#: Legacy operation spellings normalized into the stable vocabulary before aggregation, so
+#: ledger rows written before the rename still count as the same concrete edit.
+MUTATION_OPERATION_ALIASES: dict[str, str] = {
+    "combine_signals": "add_component",
+    "signal_combination": "add_component",
+}
+
+
+def normalize_mutation_operation(name: Any) -> str:
+    """Stable concrete-edit name for a mutation operation (``""`` when unknown)."""
+    text = str(name or "").strip()
+    return MUTATION_OPERATION_ALIASES.get(text, text)

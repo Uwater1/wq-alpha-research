@@ -626,6 +626,7 @@ SCHEMA: tuple[str, ...] = (
         generation_mode    TEXT NOT NULL,
         motif_id           TEXT NOT NULL,
         mutation_operation TEXT NOT NULL DEFAULT '',
+        mutation_type      TEXT NOT NULL DEFAULT '',
         source_family      TEXT NOT NULL DEFAULT '',
         target_family      TEXT NOT NULL DEFAULT '',
         attempts           INTEGER NOT NULL DEFAULT 0,
@@ -635,7 +636,7 @@ SCHEMA: tuple[str, ...] = (
         corr_pass          INTEGER NOT NULL DEFAULT 0,
         active             INTEGER NOT NULL DEFAULT 0,
         updated_at         TEXT NOT NULL,
-        UNIQUE(scope_hash, generator_version, generation_mode, motif_id, mutation_operation, source_family, target_family)
+        UNIQUE(scope_hash, generator_version, generation_mode, motif_id, mutation_operation, mutation_type, source_family, target_family)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_motif_stats_key ON motif_stats(scope_hash, generator_version, motif_id)",
@@ -647,6 +648,7 @@ SCHEMA: tuple[str, ...] = (
         generation_mode    TEXT NOT NULL,
         motif_id           TEXT NOT NULL DEFAULT '',
         mutation_operation TEXT NOT NULL,
+        mutation_type      TEXT NOT NULL DEFAULT '',
         source_family      TEXT NOT NULL DEFAULT '',
         target_family      TEXT NOT NULL DEFAULT '',
         attempts           INTEGER NOT NULL DEFAULT 0,
@@ -656,7 +658,7 @@ SCHEMA: tuple[str, ...] = (
         corr_pass          INTEGER NOT NULL DEFAULT 0,
         active             INTEGER NOT NULL DEFAULT 0,
         updated_at         TEXT NOT NULL,
-        UNIQUE(scope_hash, generator_version, generation_mode, motif_id, mutation_operation, source_family, target_family)
+        UNIQUE(scope_hash, generator_version, generation_mode, motif_id, mutation_operation, mutation_type, source_family, target_family)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_generation_operator_stats_key ON generation_operator_stats(scope_hash, generator_version)",
@@ -1031,6 +1033,7 @@ class ResearchDB:
 
     def _init_schema(self) -> None:
         with self._tx() as conn:
+            self._migrate_generation_stats(conn)
             for statement in SCHEMA:
                 conn.execute(statement)
             self._ensure_columns(conn)
@@ -1086,6 +1089,20 @@ class ResearchDB:
                 column = definition.split()[0]
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    def _migrate_generation_stats(self, conn: sqlite3.Connection) -> None:
+        """Rebuild the derived generation-stats aggregates for the corrected P9.2 key.
+
+        The old key conflated the concrete edit with the broad repair class and wrote the
+        child family on both sides. These tables are derived entirely from
+        ``research_trials`` and recomputed in full by ``refresh_generation_stats``, so an
+        existing file drops the stale aggregates and rebuilds them from the ledger on the
+        next refresh. The ledger itself is never rewritten.
+        """
+        for table in ("motif_stats", "generation_operator_stats"):
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if existing and "mutation_type" not in existing:
+                conn.execute(f"DROP TABLE {table}")
 
     def _migrate_field_coverage(self, conn: sqlite3.Connection) -> None:
         """Rebuild a pre-scope ``field_coverage`` table so scope is part of its identity.
@@ -1869,28 +1886,63 @@ class ResearchDB:
             sql += f" LIMIT {int(limit)}"
         return [dict(row) for row in self._conn.execute(sql, params)]
 
+    def _source_families(self, rows: Sequence[Mapping[str, Any]]) -> list[str]:
+        """Source family per trial row: the first parent's family ("" for roots) (P9.2)."""
+        first_parents: list[int | None] = []
+        wanted: set[int] = set()
+        for row in rows:
+            try:
+                parents = json.loads(str(row["parent_ids_json"] or "[]"))
+            except ValueError:
+                parents = []
+            parent_id = int(parents[0]) if parents else None
+            first_parents.append(parent_id)
+            if parent_id is not None:
+                wanted.add(parent_id)
+        family_by_id: dict[int, str] = {}
+        if wanted:
+            placeholders = ",".join("?" for _ in wanted)
+            for prow in self.query(
+                f"SELECT id, signal_family FROM candidates WHERE id IN ({placeholders})",
+                tuple(sorted(wanted)),
+            ):
+                family_by_id[int(prow["id"])] = str(prow["signal_family"] or "")
+        return [family_by_id.get(parent_id, "") if parent_id is not None else "" for parent_id in first_parents]
+
     def refresh_generation_stats(self, *, generator_version: str | None = None) -> dict[str, int]:
         """Aggregate the trial ledger into bounded motif/mutation outcome counters (P9).
 
         Derived from ``research_trials`` joined with candidates, so an attempt is counted as
         soon as the decision is recorded and its outcome is read from the candidate it produced.
-        Rows are upserted, never rewritten in place with older values.
+        Rows are upserted, never rewritten in place with older values. The dimensions are
+        kept separate (P9.2): ``mutation_operation`` is the concrete structural edit from
+        ``mutation_parameters['operation']`` (alias-normalized), ``mutation_type`` is the
+        broad repair class, ``source_family`` is the parent's family and ``target_family``
+        is the child-derived family.
         """
         passing = {"IS_PASS", "CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
         corr_passing = {"CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
         rows = self.query(
             "SELECT t.scope_json, t.generator_version, t.generation_mode, t.motif_id,"
-            " t.mutation_type, t.signal_family,"
+            " t.mutation_type, t.mutation_parameters_json, t.parent_ids_json, t.signal_family,"
             " c.status AS candidate_status"
             " FROM research_trials t LEFT JOIN candidates c ON c.id=t.candidate_id"
             " WHERE t.generation_mode IS NOT NULL OR t.motif_id IS NOT NULL"
         )
+        source_families = self._source_families(rows)
         buckets: dict[tuple, dict[str, int]] = {}
-        for row in rows:
+        for index, row in enumerate(rows):
             try:
                 scope = json.loads(str(row["scope_json"] or "{}"))
             except ValueError:
                 scope = {}
+            try:
+                parameters = json.loads(str(row["mutation_parameters_json"] or "{}"))
+            except ValueError:
+                parameters = {}
+            operation = ""
+            if isinstance(parameters, Mapping):
+                operation = canonical.normalize_mutation_operation(parameters.get("operation"))
             scope_key = canonical.scope_hash(scope if isinstance(scope, Mapping) else {})
             version = str(row["generator_version"] or "unknown")
             if generator_version and version != generator_version:
@@ -1900,7 +1952,9 @@ class ResearchDB:
                 scope_key, version,
                 str(row["generation_mode"] or "none"),
                 str(row["motif_id"] or "none"),
+                operation,
                 str(row["mutation_type"] or ""),
+                source_families[index],
                 str(row["signal_family"] or ""),
             )
             counters = buckets.setdefault(base, {"attempts": 0, "validated": 0, "simulated": 0,
@@ -1919,39 +1973,28 @@ class ResearchDB:
         now = now_iso()
         with self._tx() as conn:
             for key, counters in sorted(buckets.items()):
-                scope_key, version, mode, motif, operation, family = key
-                conn.execute(
-                    """INSERT INTO motif_stats(
-                           scope_hash, generator_version, generation_mode, motif_id, mutation_operation,
-                           source_family, target_family, attempts, validated, simulated, is_pass,
-                           corr_pass, active, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(scope_hash, generator_version, generation_mode, motif_id,
-                                   mutation_operation, source_family, target_family)
-                       DO UPDATE SET attempts=excluded.attempts, validated=excluded.validated,
-                           simulated=excluded.simulated, is_pass=excluded.is_pass,
-                           corr_pass=excluded.corr_pass, active=excluded.active,
-                           updated_at=excluded.updated_at""",
-                    (scope_key, version, mode, motif, operation, family, family,
-                     counters["attempts"], counters["validated"], counters["simulated"],
-                     counters["is_pass"], counters["corr_pass"], counters["active"], now),
+                scope_key, version, mode, motif, operation, mutation_type, source_family, target_family = key
+                values = (
+                    scope_key, version, mode, motif, operation, mutation_type,
+                    source_family, target_family,
+                    counters["attempts"], counters["validated"], counters["simulated"],
+                    counters["is_pass"], counters["corr_pass"], counters["active"], now,
                 )
-                conn.execute(
-                    """INSERT INTO generation_operator_stats(
-                           scope_hash, generator_version, generation_mode, motif_id, mutation_operation,
-                           source_family, target_family, attempts, validated, simulated, is_pass,
-                           corr_pass, active, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(scope_hash, generator_version, generation_mode, motif_id,
-                                   mutation_operation, source_family, target_family)
-                       DO UPDATE SET attempts=excluded.attempts, validated=excluded.validated,
-                           simulated=excluded.simulated, is_pass=excluded.is_pass,
-                           corr_pass=excluded.corr_pass, active=excluded.active,
-                           updated_at=excluded.updated_at""",
-                    (scope_key, version, mode, motif, operation, family, family,
-                     counters["attempts"], counters["validated"], counters["simulated"],
-                     counters["is_pass"], counters["corr_pass"], counters["active"], now),
-                )
+                for table in ("motif_stats", "generation_operator_stats"):
+                    conn.execute(
+                        f"""INSERT INTO {table}(
+                               scope_hash, generator_version, generation_mode, motif_id,
+                               mutation_operation, mutation_type, source_family, target_family,
+                               attempts, validated, simulated, is_pass, corr_pass, active, updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(scope_hash, generator_version, generation_mode, motif_id,
+                                       mutation_operation, mutation_type, source_family, target_family)
+                           DO UPDATE SET attempts=excluded.attempts, validated=excluded.validated,
+                               simulated=excluded.simulated, is_pass=excluded.is_pass,
+                               corr_pass=excluded.corr_pass, active=excluded.active,
+                               updated_at=excluded.updated_at""",
+                        values,
+                    )
         return {"rows": len(buckets), "attempts": sum(c["attempts"] for c in buckets.values())}
 
     def generation_stats(
@@ -2057,6 +2100,21 @@ class ResearchDB:
             motif = str(row["motif_id"])
             attempts, passed = outcomes.get(motif, (0, 0))
             outcomes[motif] = (attempts + int(row["attempts"]), passed + int(row["is_pass"]))
+        return outcomes
+
+    def mutation_operation_outcomes(self, *, generator_version: str | None = None) -> dict[str, tuple[int, int]]:
+        """``mutation_operation -> (attempts, is_pass)`` from the persisted counters (P9.2).
+
+        The concrete structural edit, kept separate from the broad repair class so the
+        adaptive mutation allocation learns which *edit* pays, not which diagnosis fired.
+        """
+        outcomes: dict[str, tuple[int, int]] = {}
+        for row in self.generation_stats(generator_version=generator_version, table="generation_operator_stats"):
+            operation = canonical.normalize_mutation_operation(row["mutation_operation"])
+            if not operation:
+                continue
+            attempts, passed = outcomes.get(operation, (0, 0))
+            outcomes[operation] = (attempts + int(row["attempts"]), passed + int(row["is_pass"]))
         return outcomes
 
     # -- screening severity policy, calibration, and policy replay ---------

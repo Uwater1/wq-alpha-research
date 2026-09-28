@@ -65,6 +65,13 @@ GROUP_LEVELS = ("subindustry", "industry", "sector")
 TRUNCATIONS = (0.05, 0.1, 0.15)
 NORMALIZATIONS = ("rank", "zscore")
 
+#: Concrete V3 structural mutation operations (P4.4). The planning vocabulary for adaptive
+#: mutation allocation (P9.2); the typed edits that realize them live in the generator.
+V3_MUTATION_OPERATIONS = (
+    "dataset_swap", "motif_change", "normalization_change", "group_change",
+    "subtree_replace", "add_component",
+)
+
 DEFAULT_MAX_FAMILY_SHARE = 0.45
 DEFAULT_EXPLORATION_RESERVE = 0.20
 #: Bounded adaptive motif allocation (P9): under-tested motifs keep a floor of the budget and
@@ -87,6 +94,8 @@ class PlanSlot:
     datasets: tuple[str, ...] = ()
     parent_ids: tuple[int, ...] = ()
     target_family: str = ""
+    #: Concrete structural edit pinned by the adaptive mutation allocation (P9.2).
+    mutation_operation: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +109,7 @@ class PlanSlot:
             "datasets": list(self.datasets),
             "parent_ids": list(self.parent_ids),
             "target_family": self.target_family,
+            "mutation_operation": self.mutation_operation,
         }
 
 
@@ -120,6 +130,8 @@ class Plan:
     motif_registry_version: str = grammar.MOTIF_REGISTRY_VERSION
     max_family_share: float = DEFAULT_MAX_FAMILY_SHARE
     motif_allocation: Mapping[str, int] = dataclass_field(default_factory=dict)
+    #: Bounded adaptive mutation allocation across concrete edits (P9.2).
+    mutation_allocation: Mapping[str, int] = dataclass_field(default_factory=dict)
 
     @property
     def planned_budget(self) -> int:
@@ -153,6 +165,7 @@ class Plan:
             "motif_registry_version": self.motif_registry_version,
             "max_family_share": self.max_family_share,
             "motif_allocation": dict(self.motif_allocation),
+            "mutation_allocation": dict(self.mutation_allocation),
             "slots": [slot.as_dict() for slot in self.slots],
         }
 
@@ -367,6 +380,41 @@ def allocate_motifs(
     return allocation
 
 
+def mutation_operation_outcome_stats(db: Any, *, generator_version: str | None = None) -> dict[str, tuple[int, int]]:
+    """``mutation_operation -> (attempts, passes)`` from the persisted counters (P9.2)."""
+    if db is None:
+        return {}
+    reader = getattr(db, "mutation_operation_outcomes", None)
+    if reader is None:
+        return {}
+    try:
+        return dict(reader(generator_version=generator_version))
+    except Exception:  # pragma: no cover - advisory only
+        return {}
+
+
+def allocate_mutation_operations(
+    operations: Sequence[str],
+    budget: int,
+    stats: Mapping[str, tuple[int, int]] | None = None,
+    *,
+    seed: int = 0,
+    exploration_floor: float = DEFAULT_MOTIF_EXPLORATION_FLOOR,
+    max_share: float = DEFAULT_MOTIF_MAX_SHARE,
+) -> dict[str, int]:
+    """Bounded adaptive allocation of mutate slots across concrete operations (P9.2).
+
+    Same guarantees as :func:`allocate_motifs`, for the structural mutation vocabulary:
+    slots sum to exactly ``budget``, untested operations keep an exploration floor so a new
+    edit can still be discovered, and a successful operation earns more budget without ever
+    monopolizing the campaign.
+    """
+    return allocate_motifs(
+        operations, budget, stats,
+        seed=seed, exploration_floor=exploration_floor, max_share=max_share,
+    )
+
+
 def _proven_motifs(db: Any, families: Sequence[str]) -> dict[str, set[str]]:
     """Motifs with at least one settled pass, per family — the exploit prior."""
     proven: dict[str, set[str]] = {family: set() for family in families}
@@ -562,9 +610,19 @@ def plan_campaign(
     motif_budget = allocate_motifs(list(grammar.MOTIF_BY_ID), budget, motif_stats,
                                    seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share)
     remaining_motif_budget = dict(motif_budget)
+    # Bounded adaptive mutation allocation (P9.2): mutate slots are budgeted across the
+    # concrete structural edits from their corrected historical outcomes, so a successful
+    # operation earns more budget while an untested one keeps an exploration floor.
+    mutation_stats = mutation_operation_outcome_stats(db, generator_version=generator_version or None)
+    mutation_budget = allocate_mutation_operations(
+        list(V3_MUTATION_OPERATIONS), sum(1 for mode in modes if mode == "mutate"), mutation_stats,
+        seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share,
+    )
+    remaining_mutation_budget = dict(mutation_budget)
 
     slots: list[PlanSlot] = []
     used_motifs: dict[str, int] = {}
+    used_operations: dict[str, int] = {}
     used_parents: dict[int, int] = {}
     for index, (slot_family, generation_mode) in enumerate(zip(family_slots, modes)):
         slot_rng = random.Random(recipe_seed(campaign_id, seed, (), generation_mode, index, ()))
@@ -578,6 +636,7 @@ def plan_campaign(
         effective_mode = generation_mode
         parent_ids: tuple[int, ...] = ()
         target_family = ""
+        mutation_operation = ""
         substitution = ""
         if generation_mode == "mutate":
             parent = _pick_parent(parents, used_parents, slot_rng, families)
@@ -586,6 +645,16 @@ def plan_campaign(
             else:
                 parent_ids = (int(parent),)
                 target_family = str(slot_family)
+                if remaining_mutation_budget:
+                    mutation_operation = max(
+                        sorted(remaining_mutation_budget),
+                        key=lambda name: (remaining_mutation_budget.get(name, 0),
+                                          -used_operations.get(name, 0), name),
+                    )
+                    used_operations[mutation_operation] = used_operations.get(mutation_operation, 0) + 1
+                    remaining_mutation_budget[mutation_operation] = max(
+                        0, remaining_mutation_budget.get(mutation_operation, 0) - 1,
+                    )
         elif generation_mode == "crossover":
             pair = _pick_crossover_pair(parents, used_parents, slot_rng)
             if len(pair) < 2:
@@ -679,6 +748,7 @@ def plan_campaign(
             datasets=tuple(sorted({node.dataset for node in field_nodes})),
             parent_ids=parent_ids,
             target_family=target_family,
+            mutation_operation=mutation_operation,
         ))
 
     # Never plan fewer slots than requested: repeat the last slot family deterministically if
@@ -707,6 +777,7 @@ def plan_campaign(
         generator_version=generator_version,
         max_family_share=float(max_family_share),
         motif_allocation=dict(motif_budget),
+        mutation_allocation=dict(mutation_budget),
     )
 
 
