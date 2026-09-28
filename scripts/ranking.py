@@ -35,6 +35,8 @@ WEIGHTS: dict[str, float] = {
     "family_diversity": 0.5,
     "duplicate_penalty": 1.0,
     "failure_risk": 1.0,
+    # Submission-stage only: this term is added in `submission_priority`, never in the
+    # simulation priority computed by `score_candidate` (P8 contract, see below).
     "portfolio_diversification": 0.5,
     # Generator V3 terms (P8). Small, bounded weights: novelty already dominates, and these
     # must never let a diversity bonus outrank expected quality.
@@ -72,6 +74,8 @@ class RankingContext:
     family_queue_counts: dict[str, int] = field(default_factory=dict)          # family -> queued now
     family_active_counts: dict[str, int] = field(default_factory=dict)         # family -> ACTIVE alphas
     field_counts: dict[str, int] = field(default_factory=dict)                 # field -> rows using it
+    #: Real archive niche occupancy (P8): grammar skeleton hash -> archive member count.
+    archive_occupancy: dict[str, int] = field(default_factory=dict)
     queued_total: int = 0
     total_candidates: int = 0
     surrogate_model: dict[str, Any] | None = None
@@ -92,7 +96,10 @@ class Score:
     exact_novelty: float = 0.0
     grammar_novelty: float = 0.0
     semantic_novelty: float = 0.0
+    #: Real archive-cell occupancy of the candidate's grammar niche (P8), not a frequency proxy.
     archive_sparsity: float = 0.0
+    #: Submission-stage only (P8 contract): computed for every candidate but applied to
+    #: priority only by :func:`submission_priority`.
     portfolio_diversification: float = 0.0
     combined_novelty: float = 0.0
     reasons: dict[str, Any] = field(default_factory=dict)
@@ -147,6 +154,12 @@ def build_context(db: Any) -> RankingContext:
     for row in db.query("SELECT normalized_expression FROM candidates"):
         for data_field in canonical.fields_of(str(row["normalized_expression"])):
             context.field_counts[data_field] = context.field_counts.get(data_field, 0) + 1
+    try:
+        import diversity
+
+        context.archive_occupancy = diversity.archive_occupancy(db)
+    except Exception:  # pragma: no cover - advisory only
+        context.archive_occupancy = {}
 
     context.queued_total = int(db.query("SELECT COUNT(*) AS n FROM candidates WHERE status='QUEUED'")[0]["n"])
     context.total_candidates = int(db.query("SELECT COUNT(*) AS n FROM candidates")[0]["n"])
@@ -156,6 +169,20 @@ def build_context(db: Any) -> RankingContext:
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
+
+
+def _derived_grammar_hash(row: Mapping[str, Any]) -> str:
+    """Grammar skeleton hash for rows written before the V3 columns existed."""
+    expression = str(row.get("normalized_expression") or "")
+    if not expression:
+        return ""
+    try:
+        import diversity
+        import expression_grammar
+
+        return expression_grammar.grammar_skeleton_hash(expression, diversity.load_field_metadata())
+    except Exception:  # pragma: no cover - advisory only
+        return ""
 
 
 def structural_prior(row: Mapping[str, Any]) -> tuple[float, dict[str, Any]]:
@@ -217,8 +244,11 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
     semantic_seen = max(context.semantic_counts.get(semantic_hash, 1) - 1, 0) if semantic_hash else 0
     grammar_novelty = 1.0 / (1.0 + grammar_seen)
     semantic_novelty = 1.0 / (1.0 + semantic_seen)
-    # Archive sparsity: how thinly the candidate's grammar niche has been explored so far.
-    archive_sparsity = 1.0 / (1.0 + grammar_seen)
+    # Archive sparsity (P8): real niche occupancy from archive cells, deliberately separate
+    # from grammar frequency — a topology tried twice but never settled is still sparse, and
+    # a topology with one row but ten archived members is crowded.
+    occupancy_key = grammar_hash or _derived_grammar_hash(row)
+    archive_sparsity = 1.0 / (1.0 + context.archive_occupancy.get(occupancy_key, 0))
     if seen == 0 and skeleton_seen == 0:
         information_gain, tier = 1.0, "new_structure"
     elif skeleton_seen == 0:
@@ -300,7 +330,9 @@ def submission_priority(row: Mapping[str, Any], context: RankingContext) -> Scor
     """Order the submission queue: quality + novelty + portfolio diversification.
 
     A family that already owns ACTIVE alphas scores lower, so the queue spreads across
-    economic ideas instead of stacking near-clones of the same signal.
+    economic ideas instead of stacking near-clones of the same signal. This is the *only*
+    stage where ``portfolio_diversification`` materially affects priority (P8 contract):
+    simulation scheduling uses :func:`score_candidate`, whose priority excludes the term.
     """
     base = score_candidate(row, context)
     family = str(row.get("signal_family") or "")

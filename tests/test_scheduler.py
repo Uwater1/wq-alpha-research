@@ -379,6 +379,73 @@ def test_ranking_uses_observed_family_outcomes_and_attempts(db):
     assert bad_score.failure_risk > good_score.failure_risk
 
 
+def test_archive_sparsity_is_real_occupancy_not_grammar_frequency():
+    """P8: equal grammar frequency but different archive occupancy -> different sparsity."""
+    context = ranking.RankingContext()
+    context.grammar_counts = {"gh-a": 2, "gh-b": 2}          # identical grammar frequency
+    context.archive_occupancy = {"gh-a": 0, "gh-b": 8}       # different niche occupancy
+    row_a = {"id": 1, "normalized_expression": "ts_mean(close,20)", "grammar_skeleton_hash": "gh-a",
+             "semantic_skeleton_hash": "sh", "skeleton_hash": "sk", "signal_family": "momentum",
+             "settings_json": '{"decay": 6}'}
+    row_b = {**row_a, "id": 2, "grammar_skeleton_hash": "gh-b"}
+    score_a = ranking.score_candidate(row_a, context)
+    score_b = ranking.score_candidate(row_b, context)
+    assert score_a.grammar_novelty == score_b.grammar_novelty  # frequency is the same
+    assert score_a.archive_sparsity == 1.0
+    assert score_b.archive_sparsity == pytest.approx(1.0 / 9.0)
+    assert score_a.priority > score_b.priority
+
+
+def test_build_context_reads_archive_occupancy(db):
+    """P8: the sparsity signal is fed by real archive cells, not by candidate counts."""
+    import archive
+
+    for window in (20, 60, 126):
+        outcome = db.queue_candidate(f"ts_mean(close,{window})", {"decay": 6}, signal_family="momentum")
+        db.claim_simulation("seed", candidate_id=outcome.candidate_id)
+        db.record_simulation_result(
+            candidate_id=outcome.candidate_id, status="DONE",
+            metrics={"sharpe": 1.2, "fitness": 1.0, "turnover": 0.05},
+            checks=[{"name": "IS", "result": "PASS"}], brain_alpha_id=f"A{outcome.candidate_id}",
+        )
+    assert archive.rebuild(db)["cells"] == 1  # one grammar niche, three members
+    context = ranking.build_context(db)
+    key = next(iter(context.archive_occupancy))
+    assert context.archive_occupancy[key] == 3
+    assert context.archive_occupancy == archive.structure_occupancy(db)
+
+
+def test_portfolio_diversification_is_submission_stage_only():
+    """P8 contract: the portfolio term moves submission order, never simulation priority."""
+    context = ranking.RankingContext()
+    context.family_active_counts = {"momentum": 3}
+    context.family_queue_counts = {"momentum": 1}
+    context.queued_total = 4
+    row = {"id": 1, "normalized_expression": "rank(close)", "signal_family": "momentum",
+           "settings_json": '{"decay": 6}', "grammar_skeleton_hash": "gh",
+           "semantic_skeleton_hash": "sh", "skeleton_hash": "sk"}
+    score = ranking.score_candidate(row, context)
+    without_portfolio = (
+        ranking.WEIGHTS["expected_quality"] * score.expected_quality
+        + ranking.WEIGHTS["novelty"] * score.combined_novelty
+        + ranking.WEIGHTS["information_gain"] * score.information_gain
+        + ranking.WEIGHTS["family_diversity"] * score.family_diversity
+        - ranking.WEIGHTS["duplicate_penalty"] * score.duplicate_penalty
+        - ranking.WEIGHTS["failure_risk"] * score.failure_risk
+        + ranking.WEIGHTS["grammar_novelty"] * score.grammar_novelty
+        + ranking.WEIGHTS["semantic_novelty"] * score.semantic_novelty
+        + ranking.WEIGHTS["archive_sparsity"] * score.archive_sparsity
+        + float(row.get("priority") or 0.0)
+    )
+    assert score.priority == pytest.approx(without_portfolio, abs=1e-5)
+    sub = ranking.submission_priority(row, context)
+    assert sub.portfolio_diversification == pytest.approx(1.0 / (1.0 + 3))
+    assert sub.priority == pytest.approx(
+        score.priority + ranking.WEIGHTS["portfolio_diversification"] * sub.portfolio_diversification,
+        abs=1e-5,
+    )
+
+
 def test_scheduler_persists_ranking_components(db):
     ids = _queue(db, 2, family="fundamental")
     client = FakeBrain(polls_to_finish=1)

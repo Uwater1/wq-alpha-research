@@ -161,11 +161,12 @@ def test_parent_child_distance_is_numeric_not_equality_only():
 
 
 def test_archive_niche_preserves_topology_and_source_identity():
+    metadata = diversity.load_field_metadata()
     same_a = archive.niche({"normalized_expression": "ts_mean(close,20)"})
     same_b = archive.niche({"normalized_expression": "ts_mean(open,126)"})
     different = archive.niche({"normalized_expression": "ts_std_dev(close,20)"})
     # Same topology, different exact fields and numeric parameters -> one niche.
-    assert same_a["grammar_skeleton_hash"] == same_b["grammar_skeleton_hash"] == grammar.grammar_skeleton_hash("ts_mean(close,20)")
+    assert same_a["grammar_skeleton_hash"] == same_b["grammar_skeleton_hash"] == grammar.grammar_skeleton_hash("ts_mean(close,20)", metadata)
     assert same_a == same_b
     # Different topology -> a different niche even though the operator count is similar.
     assert different["grammar_skeleton_hash"] != same_a["grammar_skeleton_hash"]

@@ -28,7 +28,7 @@ import research_db
 
 REWARD_VERSION = "is-pass-v1"
 #: Bumped whenever the niche definition changes, so old cells can be told apart from new ones.
-NICHE_VERSION = "archive-niche-v3"
+NICHE_VERSION = "archive-niche-v4"
 PASSING = {"IS_PASS", "CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
 
 
@@ -69,14 +69,17 @@ def niche(row: Mapping[str, Any]) -> dict[str, Any]:
     fields = tuple(structural.get("fields") or canonical.fields_of(expression))
     profile = diversity.derive_source_profile(expression)
     parameters = _parameters(row)
+    # Hash in the canonical metadata space (field types and dataset:category identities), so
+    # niche occupancy lines up with the generator columns and the planner's lookups.
+    metadata = diversity.load_field_metadata()
     return {
         "niche_version": NICHE_VERSION,
         "primary_family": str(profile.get("primary_family") or "unknown"),
         "dataset_set": "+".join(profile.get("datasets") or []),
         "category_set": "+".join(profile.get("categories") or []),
         "motif_id": str(parameters.get("motif_id") or "none"),
-        "grammar_skeleton_hash": grammar.grammar_skeleton_hash(expression),
-        "semantic_skeleton_hash": grammar.semantic_skeleton_hash(expression),
+        "grammar_skeleton_hash": grammar.grammar_skeleton_hash(expression, metadata),
+        "semantic_skeleton_hash": grammar.semantic_skeleton_hash(expression, metadata),
         "depth_bucket": min(canonical.expression_depth(expression), 8),
         "field_count": len(profile.get("field_ids") or fields),
         "cross_dataset": bool(profile.get("cross_dataset")),
