@@ -561,6 +561,57 @@ def test_skipped_rediscovery_does_not_create_simulated_or_pass_evidence(db):
         assert after[key] == before[key], f"skipped rediscovery inflated {key}"
 
 
+def test_pinned_inapplicable_mutation_operation_records_an_honest_fallback(db):
+    """P4.4/P9.2/P15: a pinned edit that cannot apply is reported, and the edit that actually
+    ran is the one statistics learn from."""
+    parent_id = db.queue_candidate("ts_rank(close,60)", {"decay": 6}, signal_family="pv1").candidate_id
+    slot = policy.PlanSlot(
+        slot=0, generation_mode="mutate", family="pv1", motif_id="mutation", recipe_index=0,
+        reason="pinned", parent_ids=(parent_id,), mutation_operation="group_change",
+    )
+    service = generator.CandidateGenerator(db, seed=3)
+    proposal = service.materialize(slot, campaign_id="v3-op-fallback")
+    assert proposal is not None
+    realized = proposal.parameters["operation"]
+    assert realized != "group_change", "group_change cannot apply to a parent with no group field"
+    assert proposal.parameters["planned_operation"] == "group_change"
+    assert proposal.parameters["realized_operation"] == realized
+    assert proposal.parameters["operation_fallback"] is True
+
+    plan = policy.Plan(campaign_id="v3-op-fallback", mode="mutate", budget=1, seed=0,
+                       slots=(slot,), weights={})
+    distribution = generator._v3_distribution(plan, [proposal])
+    assert distribution["mutation_operation_fallback_count"] == 1
+    assert distribution["mutation_operation_fallback"] == {f"group_change->{realized}": 1}
+
+    outcomes = service.queue("v3-op-fallback", [proposal])
+    assert outcomes[0]["action"] == "queued"
+    db.refresh_generation_stats(generator_version=generator.GENERATOR_VERSION_V3)
+    rows = db.generation_stats(generator_version=generator.GENERATOR_VERSION_V3,
+                               table="generation_operator_stats")
+    assert any(row["mutation_operation"] == realized and int(row["attempts"]) >= 1 for row in rows)
+    assert not [row for row in rows if row["mutation_operation"] == "group_change"], (
+        "the inapplicable pinned edit must not be credited with an attempt"
+    )
+
+
+def test_applicable_pinned_mutation_operation_is_recorded_without_a_fallback(db):
+    """P4.4: when the pinned edit can apply, planned and realized agree."""
+    parent_id = db.queue_candidate(
+        "group_rank(ts_rank(close,60),subindustry)", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    slot = policy.PlanSlot(
+        slot=0, generation_mode="mutate", family="pv1", motif_id="mutation", recipe_index=0,
+        reason="pinned", parent_ids=(parent_id,), mutation_operation="group_change",
+    )
+    proposal = generator.CandidateGenerator(db, seed=3).materialize(slot, campaign_id="v3-op-direct")
+    assert proposal is not None
+    assert proposal.parameters["operation"] == "group_change"
+    assert proposal.parameters["realized_operation"] == "group_change"
+    assert proposal.parameters["planned_operation"] == "group_change"
+    assert "operation_fallback" not in proposal.parameters
+
+
 def test_v3_structure_columns_are_queryable(db):
     _, proposals = generator.CandidateGenerator(db, seed=21).generate(
         campaign_id="v3-columns", count=8, seed=21, strategy="mixed",

@@ -561,8 +561,17 @@ class CandidateGenerator:
                 )
                 if child is not None:
                     operation = str(child.parameters.get("operation") or child.mutation_type)
+                    # Honest fallback accounting (P4.4/P9.2): the concrete edit that actually
+                    # ran is the one statistics and future allocation must learn from. The
+                    # pinned edit is retained only for diagnostics, never as if it had run.
+                    parameters = dict(child.parameters)
+                    parameters["realized_operation"] = operation
+                    if slot.mutation_operation:
+                        parameters["planned_operation"] = slot.mutation_operation
+                        if slot.mutation_operation != operation:
+                            parameters["operation_fallback"] = True
                     return replace(
-                        child, generation_mode="mutate", strategy="mutate",
+                        child, generation_mode="mutate", strategy="mutate", parameters=parameters,
                         motif_id=f"mutation:{operation}", recipe_index=slot.recipe_index,
                         source_profile=diversity.derive_source_profile(child.expression, self.catalog),
                         grammar_skeleton_hash=grammar.grammar_skeleton_hash(child.expression, self.metadata()),
@@ -1697,6 +1706,10 @@ def _v3_distribution(plan: generation_policy.Plan, proposals: Sequence[Proposal]
             result[str(value)] = result.get(str(value), 0) + 1
         return dict(sorted(result.items(), key=lambda item: (-item[1], item[0])))
 
+    fallbacks = [
+        (str(proposal.parameters.get("planned_operation") or ""), str(proposal.parameters.get("realized_operation") or ""))
+        for proposal in proposals if proposal.parameters.get("operation_fallback")
+    ]
     return {
         "planned_budget": plan.planned_budget,
         "materialized": len(proposals),
@@ -1706,6 +1719,10 @@ def _v3_distribution(plan: generation_policy.Plan, proposals: Sequence[Proposal]
         "dataset": counts(dataset for proposal in proposals for dataset in (proposal.source_profile.get("datasets") or ["unknown"])),
         "grammar_skeleton": counts(proposal.grammar_skeleton_hash for proposal in proposals),
         "semantic_skeleton": counts(proposal.semantic_skeleton_hash for proposal in proposals),
+        # A pinned mutation edit that could not apply to its parent is reported, not hidden
+        # (P4.4): the campaign can see how much of a planned operation budget was realized.
+        "mutation_operation_fallback": counts(f"{planned}->{realized}" for planned, realized in fallbacks),
+        "mutation_operation_fallback_count": len(fallbacks),
     }
 
 
