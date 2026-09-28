@@ -282,8 +282,10 @@ Recommended order:
 Items 1–9 are complete. Item 10 (equal-budget replay + small live V3 campaigns) remains a promotion gate, not an implementation gap.
 
 - [x] Keep V2 as live default until the implementation gaps are closed (gaps are now closed; V2 remains the default until replay/live evidence justifies promotion).
-- [ ] Run equal-budget V2 vs V3 replay after P15 closes.
-- [ ] Run small explicitly named live V3 campaigns after replay is clean.
+- [x] Run equal-budget V2 vs V3 replay after P15 closes.  
+  Equal-budget replay (`policy_replay.py --run archive_v2 --run archive_v3 --run mixed_v3 --budget 100`) passes the leakage check for every arm and shows V3 at parity on IS/CORR pass rate (0.07/simulation) with slightly higher effective family diversity (53.96 vs 53.09).
+- [x] Run small explicitly named live V3 campaigns after replay is clean.  
+  Live campaigns `v3-live-20260928` and `v3-novelty-20260928b` were planned, materialized, queued and simulated on BRAIN. Result: **0 IS passes from 138 V3 simulations** (explore 72, exploit 46, mutate 13, crossover 7). 137 were accepted by BRAIN and failed the IS gate (`LOW_FITNESS`/`LOW_SHARPE` dominate; 85 rejects had turnover already inside 0.01–0.20), so this is weak-signal output, not a validation or turnover artefact.
 
 ---
 
@@ -317,6 +319,11 @@ without material degradation in:
 - [ ] CORR_PASS rate
 - [ ] robustness-adjusted quality
 
+**Observed evidence (2026-09-28):** equal-budget replay is at parity on IS/CORR pass
+rate with better family diversity; the live V3 campaigns produced 0 IS passes from 138
+simulations (0% vs the historical ~23%). V3 is implementation-complete but its current
+motif output is not competitive, so promotion gates stay open and V2 stays the default.
+
 ---
 
 # Final acceptance
@@ -331,7 +338,7 @@ Generator V3 is implementation-complete when:
 - [x] Two-parent crossover works under bounded complexity.
 - [x] V3 is auditable and reproducible.
 - [x] Point-in-time replay exists.
-- [ ] Equal-budget replay and small live campaigns justify promotion.
+- [ ] Equal-budget replay and small live campaigns justify promotion. Replay is at parity, and the live V3 campaigns produced 0 IS passes, so promotion is **not** justified and V2 stays the default.
 - [x] Until then, V2 remains the default.
 
 > **Core rule: search over hypotheses, not merely field names.**
