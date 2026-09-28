@@ -331,3 +331,35 @@ def test_generation_stats_refresh_aggregates_the_ledger(db):
     assert stats and all(row["generator_version"] == generator.GENERATOR_VERSION_V3 for row in stats)
     outcomes_by_motif = db.motif_outcomes(generator_version=generator.GENERATOR_VERSION_V3)
     assert sum(passes for _attempts, passes in outcomes_by_motif.values()) >= 1
+
+
+# ---------------------------------------------------------------------------
+# P6 tolerance for real, already-evolved parents
+# ---------------------------------------------------------------------------
+
+
+def test_crossover_budget_scales_with_its_parents(db):
+    """Two mutated elites must still be combinable, without an unbounded child."""
+    deep_a = (
+        "trade_when(ts_std_dev(returns,20)>ts_mean(ts_std_dev(returns,20),120),"
+        "rank(ts_rank(est_ptp/close,126)),-1)"
+    )
+    deep_b = "group_rank(ts_zscore(implied_volatility_mean_10 - ts_std_dev(returns,60),120),sector)"
+    parent_a = db.queue_candidate(deep_a, {"decay": 6}, signal_family="analyst4").candidate_id
+    parent_b = db.queue_candidate(deep_b, {"decay": 6}, signal_family="option8").candidate_id
+
+    slot = policy.PlanSlot(
+        slot=0, generation_mode="crossover", family="crossover", motif_id="crossover",
+        recipe_index=0, reason="explicit crossover request", parent_ids=(parent_a, parent_b),
+    )
+    proposal = generator.CandidateGenerator(db, seed=5).materialize(slot, campaign_id="v3-deep")
+    assert proposal is not None, "an evolved parent pair must not be silently refused"
+    assert proposal.generation_mode == "crossover"
+    assert sorted(proposal.parent_ids) == sorted((parent_a, parent_b))
+    assert proposal.mutation_type == "crossover"
+
+    node = grammar.parse_expression(proposal.expression)
+    assert not grammar.check_complexity(node, generator.CROSSOVER_LIMITS)
+    # The cap is absolute: the child never exceeds the fixed ceiling, whatever the parents.
+    assert grammar.node_depth(node) <= generator.CROSSOVER_LIMITS.max_depth
+    assert grammar.node_count(node) <= generator.CROSSOVER_LIMITS.max_nodes

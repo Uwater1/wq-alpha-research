@@ -56,7 +56,27 @@ GENERATION_POLICY_VERSION = generation_policy.GENERATION_POLICY_VERSION
 #: structured two-source motif (e.g. normalized_difference needs three binary operators).
 V3_LIMITS = grammar.ComplexityLimits(max_depth=5, max_nodes=16, max_fields=2, max_binary_ops=3)
 #: Crossover composes two complete parent trees, so it gets one extra layer of headroom.
-CROSSOVER_LIMITS = grammar.ComplexityLimits(max_depth=6, max_nodes=24, max_fields=4, max_binary_ops=3)
+#: Absolute ceiling for a crossover child, whatever its parents look like. The relative budget
+#: below lets two evolved elites be combined; this cap keeps the result bounded.
+CROSSOVER_LIMITS = grammar.ComplexityLimits(max_depth=8, max_nodes=40, max_fields=6, max_binary_ops=6)
+
+
+def _crossover_limits(left: grammar.ExprNode, right: grammar.ExprNode) -> grammar.ComplexityLimits:
+    """Budget a crossover child against its parents instead of a fresh-generation budget.
+
+    Archive elites have usually been mutated once or twice, so a fixed 16-node budget refuses
+    almost every real pair and silently turns the whole crossover allocation into exploration.
+    The child is allowed what its parents need plus a small margin, never more than
+    ``CROSSOVER_LIMITS``.
+    """
+    return grammar.ComplexityLimits(
+        max_depth=min(CROSSOVER_LIMITS.max_depth, max(grammar.node_depth(left), grammar.node_depth(right)) + 2),
+        max_nodes=min(CROSSOVER_LIMITS.max_nodes, grammar.node_count(left) + grammar.node_count(right) + 4),
+        max_fields=min(CROSSOVER_LIMITS.max_fields,
+                       len(grammar.source_fields(left)) + len(grammar.source_fields(right))),
+        max_binary_ops=min(CROSSOVER_LIMITS.max_binary_ops,
+                           grammar.binary_op_count(left) + grammar.binary_op_count(right) + 2),
+    )
 #: Motifs tried, in order, when an ineligible/over-budget motif cannot be materialized.
 FALLBACK_MOTIFS = (
     "cross_sectional_level", "change", "ranked_level", "group_relative", "time_series_level",
@@ -605,7 +625,7 @@ class CandidateGenerator:
                 node = grammar.make_call("add", [left_wrapped, right_wrapped])
         except grammar.GrammarError:
             return None
-        if grammar.check_complexity(node, CROSSOVER_LIMITS):
+        if grammar.check_complexity(node, _crossover_limits(left, right)):
             return None
         expression = grammar.render(node)
         parent_ids = tuple(int(row["id"]) for row in parents[:2])
