@@ -1925,7 +1925,7 @@ class ResearchDB:
         rows = self.query(
             "SELECT t.scope_json, t.generator_version, t.generation_mode, t.motif_id,"
             " t.mutation_type, t.mutation_parameters_json, t.parent_ids_json, t.signal_family,"
-            " c.status AS candidate_status"
+            " t.decision, t.validation_result, c.status AS candidate_status"
             " FROM research_trials t LEFT JOIN candidates c ON c.id=t.candidate_id"
             " WHERE t.generation_mode IS NOT NULL OR t.motif_id IS NOT NULL"
         )
@@ -1960,6 +1960,13 @@ class ResearchDB:
             counters = buckets.setdefault(base, {"attempts": 0, "validated": 0, "simulated": 0,
                                                  "is_pass": 0, "corr_pass": 0, "active": 0})
             counters["attempts"] += 1
+            # A SKIP_REDUNDANT rediscovery points at an existing candidate, so joining that
+            # candidate's status would let a repeated skipped lookalike inherit its
+            # simulated/IS_PASS/CORR_PASS/ACTIVE evidence. It is a generator attempt but it
+            # produced no new simulation, so it contributes zero outcome evidence (P9.2/P15).
+            if (str(row["decision"] or "") == "SKIP_REDUNDANT"
+                    or str(row["validation_result"] or "") == "skipped_redundant"):
+                continue
             if status in VALIDATED_OR_BEYOND_STATUSES:
                 counters["validated"] += 1
             if status in SIMULATED_OR_BEYOND_STATUSES:

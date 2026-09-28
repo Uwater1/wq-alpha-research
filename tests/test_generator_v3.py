@@ -454,6 +454,52 @@ def test_planned_mutation_operations_are_budgeted_and_realized(db):
     assert proposal.parameters["operation"] == "group_change"
 
 
+def test_skipped_rediscovery_does_not_create_simulated_or_pass_evidence(db):
+    """P9.2/P15: a skipped duplicate is a generator attempt, never fresh pass evidence."""
+    service = generator.CandidateGenerator(db, seed=13)
+    _, first = service.generate(campaign_id="v3-skip-evidence", count=6, seed=13, strategy="explore")
+    outcomes = service.queue("v3-skip-evidence", first)
+    assert all(outcome["action"] == "queued" for outcome in outcomes)
+    settled = db.claim_simulation("skip-evidence", candidate_id=outcomes[0]["candidate_id"])
+    db.record_simulation_result(
+        candidate_id=settled["id"], status="DONE",
+        metrics={"sharpe": 1.6, "fitness": 1.2, "turnover": 0.08},
+        checks=[{"name": "IS", "result": "PASS"}], brain_alpha_id="A-skip-evidence",
+    )
+    assert db.get_candidate(outcomes[0]["candidate_id"])["status"] in {"IS_PASS", "SUBMISSION_READY"}
+    target = first[0]
+    db.refresh_generation_stats(generator_version=generator.GENERATOR_VERSION_V3)
+
+    def bucket_totals() -> dict[str, int]:
+        rows = [
+            row for row in db.generation_stats(generator_version=generator.GENERATOR_VERSION_V3)
+            if row["motif_id"] == target.motif_id and row["generation_mode"] == target.generation_mode
+        ]
+        return {
+            key: sum(int(row[key]) for row in rows)
+            for key in ("attempts", "simulated", "is_pass", "corr_pass", "active")
+        }
+
+    before = bucket_totals()
+    assert before["is_pass"] == 1  # the one real pass of this motif/mode
+
+    # Rediscover and refuse the exact same proposal three times: three recorded trials, no
+    # new simulation, and no inherited pass evidence from the existing candidate.
+    for _ in range(3):
+        screened = generator.CandidateGenerator(db, seed=13).screen_proposals(
+            [target], campaign_id="v3-skip-evidence", seed=13,
+        )
+        assert screened[0].novelty_decision == diversity.SKIP_REDUNDANT
+        skipped = generator.CandidateGenerator(db, seed=13).queue("v3-skip-evidence", screened)
+        assert skipped[0]["action"] == "skipped_redundant"
+
+    db.refresh_generation_stats(generator_version=generator.GENERATOR_VERSION_V3)
+    after = bucket_totals()
+    assert after["attempts"] == before["attempts"] + 3
+    for key in ("simulated", "is_pass", "corr_pass", "active"):
+        assert after[key] == before[key], f"skipped rediscovery inflated {key}"
+
+
 def test_v3_structure_columns_are_queryable(db):
     _, proposals = generator.CandidateGenerator(db, seed=21).generate(
         campaign_id="v3-columns", count=8, seed=21, strategy="mixed",
