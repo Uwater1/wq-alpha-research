@@ -131,20 +131,11 @@ def rebuild(db: research_db.ResearchDB) -> dict[str, int]:
 def structure_occupancy(db: research_db.ResearchDB) -> dict[str, int]:
     """``grammar_skeleton_hash -> total archive member count`` across niche cells.
 
-    This is real niche occupancy, not a frequency proxy: it counts how many settled
-    candidates ever occupied each topology-preserving structure (P4.2/P8). Used by the
+    This is real niche occupancy, not a frequency proxy (P4.2/P8): it counts how many
+    settled candidates ever occupied each topology-preserving structure. Used by the
     planner to reserve exploration for sparse cells and by ranking as archive sparsity.
     """
-    occupancy: dict[str, int] = defaultdict(int)
-    for row in db.query("SELECT dimensions_json, member_count FROM archive_cells"):
-        try:
-            dimensions = json.loads(str(row["dimensions_json"] or "{}"))
-        except ValueError:
-            continue
-        key = str((dimensions or {}).get("grammar_skeleton_hash") or "")
-        if key:
-            occupancy[key] += max(0, int(row["member_count"] or 0))
-    return dict(occupancy)
+    return diversity.archive_occupancy(db)
 
 
 def parent_score(row: Mapping[str, Any]) -> float:

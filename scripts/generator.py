@@ -346,7 +346,8 @@ class CandidateGenerator:
                 generation = self.db.next_generation(parent_ids)
             v3 = bool(proposal.strategy)
             if proposal.novelty_decision == diversity.SKIP_REDUNDANT:
-                # The pre-screen refused it: keep the decision auditable, spend no capacity.
+                # The pre-screen refused it: keep the decision *and its full lineage*
+                # auditable (parents, generation, mutation type/operation), spend no capacity.
                 trial_id = self.db.record_generation_decision(
                     proposal.expression, proposal.settings, campaign_id=campaign_id,
                     decision=proposal.novelty_decision, skip_reason=proposal.skip_reason,
@@ -360,13 +361,19 @@ class CandidateGenerator:
                     source_profile=dict(proposal.source_profile) or None,
                     generator_policy_version=generation_policy.GENERATION_POLICY_VERSION,
                     grammar_version=grammar.GRAMMAR_VERSION,
+                    parent_ids=parent_ids,
+                    generation=generation,
+                    mutation_type=proposal.mutation_type,
+                    mutation_parameters=dict(proposal.parameters) or None,
                 )
                 outcomes.append({
                     "expression": proposal.expression, "family": proposal.family,
                     "mutation_type": proposal.mutation_type, "motif_id": proposal.motif_id,
-                    "generation_mode": proposal.generation_mode, "generation": None,
+                    "generation_mode": proposal.generation_mode, "generation": generation,
                     "action": "skipped_redundant", "candidate_id": None, "status": None,
                     "issues": [], "trial_id": trial_id,
+                    "parent_ids": list(parent_ids),
+                    "operation": proposal.parameters.get("operation"),
                 })
                 continue
             parameters = {**proposal.parameters, "catalog_version": self.catalog.version}
@@ -674,6 +681,7 @@ class CandidateGenerator:
             family=str(profile.get("primary_family") or "unknown"),
             mutation_type="crossover",
             parameters={
+                "operation": "crossover",
                 "motif_id": f"crossover_{form}", "recipe_index": slot.recipe_index,
                 "crossover_form": form, "parent_grammar_hashes": [
                     grammar.grammar_skeleton_hash(str(row.get("normalized_expression") or ""), metadata)
@@ -736,14 +744,27 @@ class CandidateGenerator:
         """
         context = diversity.novelty_context(self.db, self.catalog)
         screened: list[Proposal] = []
+        parent_cache: dict[int, Mapping[str, Any] | None] = {}
         for proposal in proposals:
-            request_novelty = proposal.generation_mode in {"explore", "exploit"}
+            # Every V3 proposal asks for novelty: an exact duplicate is wasted capacity
+            # whatever produced it, and a skipped child still keeps its full lineage (P10).
+            request_novelty = bool(proposal.strategy)
+            parent_row: Mapping[str, Any] | None = None
+            if proposal.parent_ids:
+                parent_id = int(proposal.parent_ids[0])
+                if parent_id not in parent_cache:
+                    parent_cache[parent_id] = self.db.get_candidate(parent_id)
+                parent_row = parent_cache.get(parent_id)
+            parent_expression = str(
+                (parent_row or {}).get("normalized_expression") or ""
+            ) or None
             report = diversity.screen_novelty(
                 proposal.expression,
                 catalog=self.catalog,
                 context=context,
                 settings=proposal.settings,
                 motif_id=proposal.motif_id or None,
+                parent=parent_expression,
                 request_novelty=request_novelty,
             )
             item = replace(
@@ -844,10 +865,12 @@ class CandidateGenerator:
                 "operation": name, "previous_operation": str(parent.get("mutation_type") or ""),
                 **parameters,
             }
-            return self._proposal(
+            proposal = self._proposal(
                 child_expression, settings, family, name, operation_parameters,
                 parent_ids, generation, reason,
             )
+            # Structural edits are V3-only: label them as the mutate-mode children they are.
+            return replace(proposal, generation_mode="mutate", strategy="mutate")
         return None
 
     def _structural_edit(
@@ -1426,6 +1449,7 @@ def _as_repair(proposal: Proposal, repair_type: str) -> Proposal:
 def _with_seen(context: diversity.NoveltyContext, proposal: Proposal) -> diversity.NoveltyContext:
     """Return the novelty context as if ``proposal`` had just been generated."""
     datasets = frozenset(proposal.source_profile.get("datasets") or ())
+    categories = frozenset(proposal.source_profile.get("categories") or ())
     motifs = frozenset({proposal.motif_id}) if proposal.motif_id else frozenset()
     return diversity.NoveltyContext(
         canonical_keys=context.canonical_keys | {canonical.canonical_key(proposal.expression, proposal.settings)},
@@ -1435,6 +1459,8 @@ def _with_seen(context: diversity.NoveltyContext, proposal: Proposal) -> diversi
         datasets=context.datasets | datasets,
         motifs=context.motifs | motifs,
         candidate_count=context.candidate_count + 1,
+        categories=context.categories | categories,
+        archive_occupancy=dict(context.archive_occupancy),
     )
 
 

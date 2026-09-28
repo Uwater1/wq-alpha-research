@@ -299,6 +299,61 @@ def test_novelty_screen_skips_duplicates_and_records_the_decision(db):
     assert any(proposal.novelty_decision != diversity.SKIP_REDUNDANT for proposal in second)
 
 
+def test_skipped_mutation_preserves_generation_parent_and_operation(db):
+    """P7/P10: a novelty-skipped mutation keeps its full lineage in the ledger."""
+    parent_id = db.queue_candidate(
+        "rank(ts_delta(close,20))", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    parent = db.get_candidate(parent_id)
+    service = generator.CandidateGenerator(db, seed=8)
+    proposal = service.structural_mutation(parent, operation="dataset_swap", campaign_id="v3-skip-mut")
+    assert proposal is not None
+    service.queue("v3-skip-mut", [proposal])  # the child now exists
+    screened = generator.CandidateGenerator(db, seed=8).screen_proposals(
+        [proposal], campaign_id="v3-skip-mut",
+    )
+    assert screened[0].novelty_decision == diversity.SKIP_REDUNDANT
+    outcomes = generator.CandidateGenerator(db, seed=8).queue("v3-skip-mut", screened)
+    assert outcomes[0]["action"] == "skipped_redundant"
+    assert outcomes[0]["parent_ids"] == [parent_id]
+    trial = [row for row in db.trials("v3-skip-mut") if row["decision"] == diversity.SKIP_REDUNDANT][-1]
+    assert json.loads(trial["parent_ids_json"]) == [parent_id]
+    assert trial["generation"] == 1
+    assert trial["mutation_type"] == "dataset_swap"
+    assert json.loads(trial["mutation_parameters_json"])["operation"] == "dataset_swap"
+
+
+def test_skipped_crossover_preserves_both_parents(db):
+    """P7/P10: a novelty-skipped crossover keeps both parents and its operation."""
+    parent_a = db.queue_candidate(
+        "group_rank(ts_rank(close,60),subindustry)", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    parent_b = db.queue_candidate(
+        "group_rank(ts_rank(assets,60),industry)", {"decay": 6}, signal_family="fundamental6",
+    ).candidate_id
+    slot = policy.PlanSlot(
+        slot=0, generation_mode="crossover", family="crossover", motif_id="crossover",
+        recipe_index=0, reason="explicit crossover request", parent_ids=(parent_a, parent_b),
+    )
+    service = generator.CandidateGenerator(db, seed=2)
+    proposal = service.materialize(slot, campaign_id="v3-skip-x")
+    assert proposal is not None and len(proposal.parent_ids) == 2
+    service.queue("v3-skip-x", [proposal])  # the child now exists
+    screened = generator.CandidateGenerator(db, seed=2).screen_proposals(
+        [proposal], campaign_id="v3-skip-x",
+    )
+    assert screened[0].novelty_decision == diversity.SKIP_REDUNDANT
+    outcomes = generator.CandidateGenerator(db, seed=2).queue("v3-skip-x", screened)
+    assert outcomes[0]["action"] == "skipped_redundant"
+    assert sorted(outcomes[0]["parent_ids"]) == sorted([parent_a, parent_b])
+    trial = [row for row in db.trials("v3-skip-x") if row["decision"] == diversity.SKIP_REDUNDANT][-1]
+    assert sorted(json.loads(trial["parent_ids_json"])) == sorted([parent_a, parent_b])
+    assert trial["mutation_type"] == "crossover"
+    parameters = json.loads(trial["mutation_parameters_json"])
+    assert parameters["operation"] == "crossover"
+    assert parameters["crossover_form"]
+
+
 def test_v3_structure_columns_are_queryable(db):
     _, proposals = generator.CandidateGenerator(db, seed=21).generate(
         campaign_id="v3-columns", count=8, seed=21, strategy="mixed",

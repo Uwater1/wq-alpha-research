@@ -98,6 +98,68 @@ def test_novelty_screen_keeps_new_work_and_skips_only_requested_duplicates():
     assert fresh.exact_novel is True
 
 
+def test_category_novelty_is_tracked_separately_from_datasets():
+    """P7: a known dataset with an unseen category is still category-novel."""
+    context = diversity.NoveltyContext(
+        canonical_keys=frozenset(), skeleton_hashes=frozenset(), grammar_hashes=frozenset(),
+        semantic_hashes=frozenset(), datasets=frozenset({"pv1", "fundamental6"}),
+        motifs=frozenset(), candidate_count=2, categories=frozenset({"pv"}),
+    )
+    same = diversity.screen_novelty("rank(close)", context=context)    # pv1 / pv
+    new = diversity.screen_novelty("rank(assets)", context=context)   # fundamental6 / fundamental
+    assert same.dataset_novel is False and new.dataset_novel is False
+    assert same.category_novel is False
+    assert new.category_novel is True
+    assert new.score > same.score
+    assert "category_novel" in new.as_dict()
+
+
+def test_archive_sparsity_reads_cell_occupancy_not_grammar_frequency():
+    """P7/P8: equal grammar frequency, different archive occupancy -> different sparsity."""
+    metadata = diversity.load_field_metadata()
+    sparse_expr = "ts_mean(close,20)"
+    crowded_expr = "ts_std_dev(close,20)"
+    hash_a = grammar.grammar_skeleton_hash(sparse_expr, metadata)
+    hash_b = grammar.grammar_skeleton_hash(crowded_expr, metadata)
+    assert hash_a != hash_b
+    context = diversity.NoveltyContext(
+        canonical_keys=frozenset(), skeleton_hashes=frozenset(),
+        grammar_hashes=frozenset({hash_a, hash_b}),  # equal history frequency for both
+        semantic_hashes=frozenset(), datasets=frozenset({"pv1"}), categories=frozenset({"pv"}),
+        motifs=frozenset(), candidate_count=2,
+        archive_occupancy={hash_a: 0, hash_b: 9},
+    )
+    sparse = diversity.screen_novelty(sparse_expr, context=context)
+    crowded = diversity.screen_novelty(crowded_expr, context=context)
+    assert sparse.archive_sparsity == 1.0
+    assert crowded.archive_sparsity == pytest.approx(0.1)
+    assert sparse.score > crowded.score
+
+
+def test_parent_child_distance_is_numeric_not_equality_only():
+    """P7: the parent penalty is graded by grammar_distance, not an equality bit."""
+    metadata = diversity.load_field_metadata()
+    parent = "group_rank(ts_rank(close,60),subindustry)"
+    near = diversity.screen_novelty(
+        "group_rank(ts_rank(close,60),subindustry)", context=diversity.NoveltyContext.empty(), parent=parent,
+    )
+    mid = diversity.screen_novelty(
+        "group_rank(ts_rank(assets,60),subindustry)", context=diversity.NoveltyContext.empty(), parent=parent,
+    )
+    far = diversity.screen_novelty(
+        "rank(ts_delta(assets,126))", context=diversity.NoveltyContext.empty(), parent=parent,
+    )
+    assert near.parent_distance == 0.0
+    assert 0.0 < mid.parent_distance < far.parent_distance <= 1.0
+    assert near.score < mid.score < far.score
+    # The equality-only fallback still works when only a hash is known.
+    by_hash = diversity.screen_novelty(
+        parent, context=diversity.NoveltyContext.empty(),
+        parent_grammar_hash=grammar.grammar_skeleton_hash(parent, metadata),
+    )
+    assert by_hash.parent_distance == 0.0
+
+
 def test_archive_niche_preserves_topology_and_source_identity():
     same_a = archive.niche({"normalized_expression": "ts_mean(close,20)"})
     same_b = archive.niche({"normalized_expression": "ts_mean(open,126)"})

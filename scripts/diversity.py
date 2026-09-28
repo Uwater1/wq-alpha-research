@@ -23,6 +23,7 @@ import json
 import math
 import sys
 from dataclasses import dataclass
+from dataclasses import field as dataclasses_field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -251,7 +252,7 @@ def effective_count(counts: Mapping[str, int] | Sequence[int]) -> float:
 
 @dataclass(frozen=True)
 class NoveltyContext:
-    """Sets of what local research has already seen, plus archive sparsity."""
+    """Sets of what local research has already seen, plus archive niche occupancy."""
 
     canonical_keys: frozenset[str]
     skeleton_hashes: frozenset[str]
@@ -260,6 +261,10 @@ class NoveltyContext:
     datasets: frozenset[str]
     motifs: frozenset[str]
     candidate_count: int = 0
+    #: Category history tracked separately from datasets (P7).
+    categories: frozenset[str] = frozenset()
+    #: ``grammar_skeleton_hash -> archive member count``: real niche occupancy (P7/P8).
+    archive_occupancy: Mapping[str, int] = dataclasses_field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "NoveltyContext":
@@ -270,6 +275,8 @@ class NoveltyContext:
             return False
         if field == "datasets":
             return value in self.datasets
+        if field == "categories":
+            return value in self.categories
         container = {
             "skeleton_hash": self.skeleton_hashes,
             "grammar_hash": self.grammar_hashes,
@@ -466,6 +473,28 @@ def _median_pairwise_correlation(
     return _median(values)
 
 
+def archive_occupancy(db: Any) -> dict[str, int]:
+    """``grammar_skeleton_hash -> archive member count`` from the niche cells (P7/P8).
+
+    Real archive-cell occupancy, not a frequency proxy; read with a tolerant query so a
+    store without the archive tables simply reports an empty occupancy.
+    """
+    occupancy: dict[str, int] = {}
+    try:
+        rows = db.query("SELECT dimensions_json, member_count FROM archive_cells")
+    except Exception:  # pragma: no cover - advisory only
+        return occupancy
+    for row in rows:
+        try:
+            dimensions = json.loads(str(row["dimensions_json"] or "{}"))
+        except ValueError:
+            continue
+        key = str((dimensions or {}).get("grammar_skeleton_hash") or "")
+        if key:
+            occupancy[key] = occupancy.get(key, 0) + max(0, int(row["member_count"] or 0))
+    return occupancy
+
+
 def novelty_context(db: Any, catalog: Any = None) -> NoveltyContext:
     """Read the local history once: exact keys, skeleton hashes, sources and motifs."""
     metadata = catalog_metadata(catalog) if catalog is not None else load_field_metadata()
@@ -474,6 +503,7 @@ def novelty_context(db: Any, catalog: Any = None) -> NoveltyContext:
     grammar_hashes: set[str] = set()
     semantic_hashes: set[str] = set()
     datasets: set[str] = set()
+    categories: set[str] = set()
     motifs: set[str] = set()
     rows = db.query(
         "SELECT canonical_key, skeleton_hash, normalized_expression, mutation_parameters_json, signal_family FROM candidates"
@@ -488,6 +518,7 @@ def novelty_context(db: Any, catalog: Any = None) -> NoveltyContext:
             semantic_hashes.add(grammar.semantic_skeleton_hash(expression, metadata))
         profile = derive_source_profile(expression, metadata)
         datasets.update(profile["datasets"])
+        categories.update(profile["categories"])
         if row["signal_family"]:
             datasets.add(str(row["signal_family"]))
         try:
@@ -504,6 +535,8 @@ def novelty_context(db: Any, catalog: Any = None) -> NoveltyContext:
         datasets=frozenset(datasets),
         motifs=frozenset(motifs),
         candidate_count=len(rows),
+        categories=frozenset(categories),
+        archive_occupancy=archive_occupancy(db),
     )
 
 
@@ -520,6 +553,12 @@ class NoveltyReport:
     semantic_novel: bool
     dataset_novel: bool
     motif_novel: bool
+    #: Category history is tracked separately from datasets (P7).
+    category_novel: bool = False
+    #: ``1/(1 + archive members in this grammar niche)``: real cell occupancy (P7).
+    archive_sparsity: float = 0.0
+    #: Numeric ``grammar_distance(parent, child)`` when a parent is known (P7).
+    parent_distance: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -532,7 +571,40 @@ class NoveltyReport:
             "semantic_novel": self.semantic_novel,
             "dataset_novel": self.dataset_novel,
             "motif_novel": self.motif_novel,
+            "category_novel": self.category_novel,
+            "archive_sparsity": self.archive_sparsity,
+            "parent_distance": self.parent_distance,
         }
+
+
+def _parent_distance(
+    parent: Any,
+    expression: str,
+    metadata: Mapping[str, Any],
+    parent_source_profile: Mapping[str, Any] | None,
+    child_profile: Mapping[str, Any],
+) -> float | None:
+    """Numeric structural distance between parent and child (P7).
+
+    Uses :func:`expression_grammar.grammar_distance` when the parent is parseable, and falls
+    back to source-profile overlap (dataset/category Jaccard) when only metadata is known.
+    """
+    if parent is not None:
+        try:
+            return grammar.grammar_distance(parent, expression, fields=metadata)
+        except grammar.GrammarError:
+            pass
+    if parent_source_profile:
+        def jaccard(left: Iterable[str], right: Iterable[str]) -> float:
+            left_set, right_set = set(left), set(right)
+            if not left_set and not right_set:
+                return 1.0
+            return len(left_set & right_set) / max(1, len(left_set | right_set))
+
+        parent_sources = list(parent_source_profile.get("datasets") or []) + list(parent_source_profile.get("categories") or [])
+        child_sources = list(child_profile.get("datasets") or []) + list(child_profile.get("categories") or [])
+        return round(1.0 - jaccard(parent_sources, child_sources), 6)
+    return None
 
 
 def screen_novelty(
@@ -543,7 +615,9 @@ def screen_novelty(
     canonical_key: str | None = None,
     settings: Mapping[str, Any] | None = None,
     motif_id: str | None = None,
+    parent: Any = None,
     parent_grammar_hash: str | None = None,
+    parent_source_profile: Mapping[str, Any] | None = None,
     request_novelty: bool = False,
 ) -> NoveltyReport:
     """Pre-screen a generated proposal against local history.
@@ -567,24 +641,36 @@ def screen_novelty(
     grammar_novel = grammar_hash not in context.grammar_hashes
     semantic_novel = semantic_hash not in context.semantic_hashes
     dataset_novel = bool(profile["datasets"]) and any(dataset not in context.datasets for dataset in profile["datasets"])
+    category_novel = bool(profile["categories"]) and any(
+        category not in context.categories for category in profile["categories"]
+    )
     motif_novel = bool(motif) and motif not in context.motifs
+    # Real archive-cell occupancy, not a grammar-frequency proxy (P7/P8).
+    archive_sparsity = round(1.0 / (1.0 + context.archive_occupancy.get(grammar_hash, 0)), 6)
+
+    parent_distance = _parent_distance(parent, expression, metadata, parent_source_profile, profile)
+    if parent_distance is None and parent_grammar_hash is not None:
+        parent_distance = 0.0 if grammar_hash == parent_grammar_hash else 1.0
 
     score = 0.0
-    score += 0.35 if exact_novel else 0.0
-    score += 0.15 if skeleton_novel else 0.0
-    score += 0.20 if grammar_novel else 0.0
-    score += 0.15 if semantic_novel else 0.0
-    score += 0.10 if dataset_novel else 0.0
+    score += 0.30 if exact_novel else 0.0
+    score += 0.12 if skeleton_novel else 0.0
+    score += 0.18 if grammar_novel else 0.0
+    score += 0.12 if semantic_novel else 0.0
+    score += 0.08 if dataset_novel else 0.0
+    score += 0.05 if category_novel else 0.0
     score += 0.05 if motif_novel else 0.0
-    if parent_grammar_hash is not None and grammar_hash == parent_grammar_hash:
-        score -= 0.10  # a parent-child clone is the least informative kind of attempt
+    score += 0.05 * archive_sparsity
+    if parent_distance is not None:
+        # Graded, not equality-only (P7): a parent-child clone is the least informative
+        # attempt and pays the full penalty; a structurally distant child pays none.
+        score += 0.10 * (parent_distance - 1.0)
     score = round(max(0.0, min(1.0, score)), 6)
 
+    components = (exact_novel, skeleton_novel, grammar_novel, semantic_novel, dataset_novel,
+                  motif_novel, category_novel, archive_sparsity, parent_distance)
     if not exact_novel and request_novelty:
-        return NoveltyReport(score, SKIP_REDUNDANT, "exact duplicate under an explicit novelty request",
-                             exact_novel, skeleton_novel, grammar_novel, semantic_novel, dataset_novel, motif_novel)
+        return NoveltyReport(score, SKIP_REDUNDANT, "exact duplicate under an explicit novelty request", *components)
     if score < DOWNWEIGHT_SCORE and not exact_novel:
-        return NoveltyReport(score, DOWNWEIGHT, "closely related to existing work",
-                             exact_novel, skeleton_novel, grammar_novel, semantic_novel, dataset_novel, motif_novel)
-    return NoveltyReport(score, KEEP, "distinct research hypothesis",
-                         exact_novel, skeleton_novel, grammar_novel, semantic_novel, dataset_novel, motif_novel)
+        return NoveltyReport(score, DOWNWEIGHT, "closely related to existing work", *components)
+    return NoveltyReport(score, KEEP, "distinct research hypothesis", *components)

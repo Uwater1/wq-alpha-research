@@ -1998,13 +1998,19 @@ class ResearchDB:
         source_profile: Mapping[str, Any] | None = None,
         generator_policy_version: str | None = None,
         grammar_version: str | None = None,
+        parent_ids: Sequence[int] = (),
+        generation: int = 0,
+        mutation_type: str | None = None,
+        mutation_parameters: Mapping[str, Any] | None = None,
     ) -> int | None:
         """Record a proposal the novelty pre-screen refused, without spending a slot.
 
         The decision still lands in the permanent ``research_trials`` ledger (linked to the
         existing candidate when one already exists), so "the generator deliberately skipped
         this" is as auditable as anything it queued. No candidate and no simulation row is
-        created: a rejected-by-our-own-screen idea must not consume BRAIN capacity.
+        created: a rejected-by-our-own-screen idea must not consume BRAIN capacity. The full
+        lineage — parents, generation, mutation type and parameters — is preserved exactly
+        like a queued child's (P10), so a skipped mutation or crossover stays reviewable.
         """
         normalized_expression = canonical.normalize_expression(expression)
         normalized_settings = canonical.normalize_settings(settings)
@@ -2021,6 +2027,10 @@ class ResearchDB:
                 is_duplicate=candidate_id is not None,
                 timestamp=timestamp,
                 campaign_id=campaign_id,
+                parent_ids=[int(value) for value in parent_ids],
+                generation=generation,
+                mutation_type=mutation_type,
+                mutation_parameters=dict(mutation_parameters) if mutation_parameters else None,
                 reason=skip_reason,
                 signal_family=resolved_family,
                 scope=canonical.scope_from_settings(normalized_settings),
