@@ -96,6 +96,11 @@ class PlanSlot:
     target_family: str = ""
     #: Concrete structural edit pinned by the adaptive mutation allocation (P9.2).
     mutation_operation: str = ""
+    #: Exact planned skeleton hashes (P4.2) for motif-materialized slots: the structure the
+    #: materializer must reproduce. Empty for mutation/crossover slots, whose child structure
+    #: is an edit of a parent rather than a planned motif.
+    planned_grammar_hash: str = ""
+    planned_semantic_hash: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +115,8 @@ class PlanSlot:
             "parent_ids": list(self.parent_ids),
             "target_family": self.target_family,
             "mutation_operation": self.mutation_operation,
+            "planned_grammar_hash": self.planned_grammar_hash,
+            "planned_semantic_hash": self.planned_semantic_hash,
         }
 
 
@@ -473,14 +480,38 @@ def _structure_counts(db: Any, catalog: Any = None) -> tuple[dict[str, int], dic
     return grammar_counts, semantic_counts
 
 
-def _structure_hashes(motif_id: str, fields: Sequence[Any]) -> tuple[str, str] | None:
-    """Representative ``(grammar, semantic)`` skeleton hashes of one motif over these fields.
+def planned_recipe(
+    campaign_id: str,
+    seed: int,
+    field_ids: Sequence[str],
+    motif_id: str,
+    recipe_index: int,
+    parent_ids: Sequence[int] = (),
+) -> grammar.Recipe:
+    """The exact recipe materialization samples for this slot (P3.1/P4.2).
 
-    Built through the same typed grammar the materializer uses, with a default recipe, so
-    the planner budgets the structure it will actually ask for.
+    Same ``recipe_seed`` inputs as ``generator.materialize`` uses, so the planner and the
+    materializer cannot disagree about lookback/window/decay or the topology-changing
+    dimensions (rank vs zscore, winsorization, sign).
+    """
+    rng = random.Random(recipe_seed(campaign_id, seed, list(field_ids), motif_id, recipe_index, parent_ids))
+    return sample_recipe(rng, motif_id)
+
+
+def _structure_hashes(
+    motif_id: str,
+    fields: Sequence[Any],
+    *,
+    recipe: grammar.Recipe | None = None,
+) -> tuple[str, str] | None:
+    """``(grammar, semantic)`` skeleton hashes of one motif over these fields.
+
+    Built through the same typed grammar the materializer uses. ``recipe`` must be the
+    exact recipe materialization will sample for this slot (see :func:`planned_recipe`);
+    the default recipe is a coarse proxy that can hash a different topology (P4.2).
     """
     try:
-        node = grammar.build_motif(motif_id, list(fields), grammar.Recipe(), limits=_PLANNING_LIMITS)
+        node = grammar.build_motif(motif_id, list(fields), recipe or grammar.Recipe(), limits=_PLANNING_LIMITS)
     except grammar.GrammarError:
         return None
     return grammar.grammar_skeleton_hash(node), grammar.semantic_skeleton_hash(node)
@@ -491,10 +522,8 @@ _PLANNING_LIMITS = grammar.ComplexityLimits(max_depth=5, max_nodes=16, max_field
 
 
 def _structure_novelty(
-    motif_id: str,
-    fields: Sequence[Any],
+    hashes: tuple[str, str] | None,
     *,
-    context: "diversity.NoveltyContext",
     grammar_counts: Mapping[str, int],
     semantic_counts: Mapping[str, int],
     occupancy: Mapping[str, int],
@@ -502,8 +531,8 @@ def _structure_novelty(
     rng: random.Random,
 ) -> tuple[int, int, int, int, int, float]:
     """Explore priority of one motif: unseen grammar first, then sparse archive cells, then
-    unseen semantics. A structure that cannot even be planned ranks last (P4.2)."""
-    hashes = _structure_hashes(motif_id, fields)
+    unseen semantics. ``hashes`` are the *exact* planned skeleton hashes (P4.2) of the
+    structure materialization will build; ``None`` ranks last because it cannot be planned."""
     if hashes is None:
         return (2, 0, 0, 1, 0, rng.random())
     grammar_key, semantic_key = hashes
@@ -653,6 +682,13 @@ def plan_campaign(
     used_motifs: dict[str, int] = {}
     used_operations: dict[str, int] = {}
     used_parents: dict[int, int] = {}
+    # Reachability of a genuine cross-dataset structure must not depend on the novelty
+    # tiebreak's random draw (P4.2): once a campaign has begun exploring, the first explore
+    # slot that can build such a structure *and* that structure is structurally unseen seats
+    # it deterministically. The opening slot is left to ordinary novelty so the plan is not
+    # reordered around the reservation.
+    cross_dataset_seated = False
+    explore_seats = 0
     for index, (slot_family, generation_mode) in enumerate(zip(family_slots, modes)):
         slot_rng = random.Random(recipe_seed(campaign_id, seed, (), generation_mode, index, ()))
         sources = _ordered_sources(db, catalog, slot_family, scope)
@@ -716,20 +752,53 @@ def plan_campaign(
             roles = len(grammar.motif_by_id(name).input_roles)
             return [primary, partner] if roles == 2 and partner is not None else [primary]
 
+        recipe_index = index % 8
+
+        def hashes_for(name: str, stage_fields: Sequence[Any]) -> tuple[str, str] | None:
+            """Exact planned skeleton hashes of ``name`` over ``stage_fields`` (P4.2).
+
+            Derives the recipe materialization will sample from the same recipe-seed inputs,
+            so the planner budgets the structure it will actually build.
+            """
+            field_ids = [node.field_id for node in stage_fields]
+            recipe = planned_recipe(campaign_id, seed, field_ids, name, recipe_index, parent_ids)
+            return _structure_hashes(name, stage_fields, recipe=recipe)
+
+        def cross_dataset_option() -> str | None:
+            """A constructible, structurally unseen cross-dataset motif for this slot, if any."""
+            field_set = motif_fields("cross_dataset_composite")
+            if len({node.dataset for node in field_set}) < 2:
+                return None
+            hashes = hashes_for("cross_dataset_composite", field_set)
+            if hashes is None:
+                return None
+            grammar_key = hashes[0]
+            if grammar_counts.get(grammar_key, 0) or used_structures["grammar"].get(grammar_key, 0):
+                return None  # a repeat: never spend the reachability seat on a known structure
+            return "cross_dataset_composite"
+
         if not eligible:
             motif_id = "cross_sectional_level"
         elif effective_mode == "explore":
             # Budget grammar/semantic novelty *before* materialization (P4.2): explore slots go
             # to structures that are unseen or sparse in the archive, never to a repeat while
             # an untested structure is still reachable.
-            motif_id = min(
-                (motif.id for motif in eligible),
-                key=lambda name: _structure_novelty(
-                    name, motif_fields(name), context=context,
-                    grammar_counts=grammar_counts, semantic_counts=semantic_counts,
-                    occupancy=occupancy, used=used_structures, rng=slot_rng,
-                ),
+            reachable_cross = (
+                cross_dataset_option() if not cross_dataset_seated and explore_seats >= 1 else None
             )
+            if reachable_cross is not None:
+                motif_id = reachable_cross
+                cross_dataset_seated = True
+            else:
+                motif_id = min(
+                    (motif.id for motif in eligible),
+                    key=lambda name: _structure_novelty(
+                        hashes_for(name, motif_fields(name)),
+                        grammar_counts=grammar_counts, semantic_counts=semantic_counts,
+                        occupancy=occupancy, used=used_structures, rng=slot_rng,
+                    ),
+                )
+            explore_seats += 1
         else:
             # exploit / mutate / crossover: spend the bounded adaptive allocation, preferring a
             # motif that still has budget and has performed well enough to earn more.
@@ -743,11 +812,15 @@ def plan_campaign(
         used_motifs[motif_id] = used_motifs.get(motif_id, 0) + 1
         remaining_motif_budget[motif_id] = max(0, remaining_motif_budget.get(motif_id, 0) - 1)
         field_nodes = [primary, partner] if len(grammar.motif_by_id(motif_id).input_roles) == 2 and partner else [primary]
-        hashes = _structure_hashes(motif_id, motif_fields(motif_id))
+        hashes = hashes_for(motif_id, motif_fields(motif_id))
+        planned_grammar_hash = planned_semantic_hash = ""
         if hashes is not None:
             grammar_key, semantic_key = hashes
             used_structures["grammar"][grammar_key] = used_structures["grammar"].get(grammar_key, 0) + 1
             used_structures["semantic"][semantic_key] = used_structures["semantic"].get(semantic_key, 0) + 1
+            if effective_mode in {"explore", "exploit"}:
+                # Only motif-materialized slots have a planner-known structure (P4.2).
+                planned_grammar_hash, planned_semantic_hash = grammar_key, semantic_key
 
         reason = "under-tested semantic niche"
         if effective_mode == "explore":
@@ -771,13 +844,15 @@ def plan_campaign(
             generation_mode=effective_mode,
             family=slot_family,
             motif_id=motif_id,
-            recipe_index=index % 8,
+            recipe_index=recipe_index,
             reason=reason,
             fields=tuple(node.field_id for node in field_nodes),
             datasets=tuple(sorted({node.dataset for node in field_nodes})),
             parent_ids=parent_ids,
             target_family=target_family,
             mutation_operation=mutation_operation,
+            planned_grammar_hash=planned_grammar_hash,
+            planned_semantic_hash=planned_semantic_hash,
         ))
 
     # Never plan fewer slots than requested: repeat the last slot family deterministically if

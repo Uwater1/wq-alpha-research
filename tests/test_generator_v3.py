@@ -792,12 +792,11 @@ def test_explore_slots_budget_unseen_structures_before_repeats(db):
     )
     explore = [slot for slot in plan.slots if slot.generation_mode == "explore"]
     assert explore
-    nodes = {field.name: grammar.field_node_from(field) for field in catalog.fields}
     seats: dict[str, int] = {}
     for slot in explore:
-        hashes = policy._structure_hashes(slot.motif_id, [nodes[name] for name in slot.fields])
-        assert hashes is not None, f"planned motif {slot.motif_id} must be materializable"
-        grammar_key = hashes[0]
+        # The planner must expose the exact structure it budgeted (P4.2), not a proxy.
+        grammar_key = slot.planned_grammar_hash
+        assert grammar_key, f"planned motif {slot.motif_id} must record its structure"
         assert grammar_key not in history, (
             "a history-saturated structure may not be re-planned while unseen structures remain"
         )
@@ -805,6 +804,32 @@ def test_explore_slots_budget_unseen_structures_before_repeats(db):
     # Unseen structures first: with 18+ reachable structures and 12 explore slots, no
     # structure may be seated twice.
     assert max(seats.values()) == 1, f"repeated planned structures: {seats}"
+
+
+def test_planned_structure_hashes_match_materialized_structures(db):
+    """P4.2/P15: the planner's exact-recipe hashes equal the materialized proposal's."""
+    for window in (20, 30, 40, 50, 60, 70, 80, 90):
+        db.queue_candidate(f"ts_rank(close,{window})", {"decay": 6}, signal_family="pv1")
+    catalog = generator.Catalog()
+    history, _ = policy._structure_counts(db, catalog)
+    plan = generator.CandidateGenerator(db, seed=6).plan(
+        campaign_id="v3-exact", budget=12, seed=6, mode="explore",
+    )
+    service = generator.CandidateGenerator(db, seed=6)
+    materialized = [service.materialize(slot, campaign_id="v3-exact", seed=6) for slot in plan.slots]
+    assert all(proposal is not None for proposal in materialized), "every planned slot must materialize"
+    seen: set[str] = set()
+    for slot, proposal in zip(plan.slots, materialized):
+        if slot.generation_mode != "explore":
+            continue
+        assert slot.planned_grammar_hash == proposal.grammar_skeleton_hash, slot.motif_id
+        assert slot.planned_semantic_hash == proposal.semantic_skeleton_hash, slot.motif_id
+        assert proposal.grammar_skeleton_hash not in history, (
+            f"{slot.motif_id} re-used a saturated structure the planner said it avoided"
+        )
+        assert proposal.grammar_skeleton_hash not in seen, "repeated materialized structure"
+        seen.add(proposal.grammar_skeleton_hash)
+    assert seen
 
 
 def test_exploit_transfers_proven_structure_to_a_new_source(db):
