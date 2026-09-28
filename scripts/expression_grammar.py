@@ -249,6 +249,22 @@ def validate_call(operator: str, args: Sequence[ExprNode]) -> None:
         raise GrammarError("; ".join(message for _code, message in findings))
 
 
+def validate_tree(node: ExprNode, limits: ComplexityLimits | None = DEFAULT_LIMITS) -> None:
+    """Validate every nested call and the complexity budget before an AST may be used.
+
+    Raises :class:`GrammarError` on the first known deterministic type/arity error, or on any
+    complexity-budget violation when ``limits`` is given. Typed mutation edits reuse this so
+    generated children are checked exactly like generated motifs.
+    """
+    for item in _walk(node):
+        if isinstance(item, CallNode):
+            validate_call(item.operator, item.args)
+    if limits is not None:
+        violations = check_complexity(node, limits)
+        if violations:
+            raise GrammarError("complexity budget exceeded: " + "; ".join(violations))
+
+
 def make_call(
     operator: str,
     args: Sequence[ExprNode],
@@ -967,12 +983,7 @@ def build_motif(
     if not isinstance(node, CallNode):
         raise GrammarError(f"motif {motif_id!r} did not build a call node")
     # Re-validate every nested call and enforce the complexity budget before returning.
-    for item in _walk(node):
-        if isinstance(item, CallNode):
-            validate_call(item.operator, item.args)
-    violations = check_complexity(node, limits)
-    if violations:
-        raise GrammarError("complexity budget exceeded: " + "; ".join(violations))
+    validate_tree(node, limits)
     return node
 
 

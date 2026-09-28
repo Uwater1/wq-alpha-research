@@ -91,6 +91,29 @@ DEFAULT_NEUTRALIZATIONS = ("SUBINDUSTRY", "INDUSTRY", "SECTOR")
 GROUP_BROADENING = ("subindustry", "industry", "sector", "market")
 SMOOTHING_WINDOWS = (5, 10, 22)
 
+#: Concrete V3 structural mutation operations (P4.4). Every one is a typed AST edit that is
+#: re-validated against the operator catalog and a parent-scaled complexity budget before a
+#: child exists, and every child records which edit produced it in ``parameters["operation"]``.
+V3_MUTATION_OPERATIONS = (
+    "dataset_swap", "motif_change", "normalization_change", "group_change",
+    "subtree_replace", "add_component",
+)
+#: Normalizers ``normalization_change`` flips between (same arity, so the swap is type-safe).
+NORMALIZATION_SWAPS: dict[str, str] = {
+    "rank": "zscore", "zscore": "rank",
+    "group_rank": "group_zscore", "group_zscore": "group_rank",
+}
+#: ``group_change`` moves a group literal one step around this cycle.
+GROUP_CYCLE: dict[str, str] = {
+    "subindustry": "industry", "industry": "sector", "sector": "market", "market": "subindustry",
+}
+#: Legacy operation spellings normalized into the stable vocabulary before aggregation, so
+#: ledger rows written before the rename still count as the same concrete edit.
+MUTATION_OPERATION_ALIASES: dict[str, str] = {
+    "combine_signals": "add_component",
+    "signal_combination": "add_component",
+}
+
 #: Diagnosed failure mode -> structured mutation type emitted by the repair dispatch.
 FAILURE_MUTATION_TYPES: dict[str, str] = {
     "HIGH_TURNOVER": "turnover_repair",
@@ -509,18 +532,18 @@ class CandidateGenerator:
             parent = self.db.get_candidate(int(slot.parent_ids[0]))
             if parent:
                 # A per-slot seed keeps two mutate slots on the same parent from producing the
-                # same child (the V2 repair path is deterministic in the generator seed alone).
+                # same child (the repair path is deterministic in the generator seed alone).
                 slot_seed = generation_policy.recipe_seed(campaign_id, seed, (), "mutate", slot.recipe_index, slot.parent_ids)
                 mutator = CandidateGenerator(self.db, self.catalog, seed=slot_seed % (2 ** 31))
-                repairs = mutator.mutate(parent, count=1, campaign_id=campaign_id)
-                if repairs:
-                    operation = str(repairs[0].parameters.get("operation") or repairs[0].mutation_type)
+                child = mutator._mutate_child(parent, campaign_id=campaign_id)
+                if child is not None:
+                    operation = str(child.parameters.get("operation") or child.mutation_type)
                     return replace(
-                        repairs[0], generation_mode="mutate", strategy="mutate",
+                        child, generation_mode="mutate", strategy="mutate",
                         motif_id=f"mutation:{operation}", recipe_index=slot.recipe_index,
-                        source_profile=diversity.derive_source_profile(repairs[0].expression, self.catalog),
-                        grammar_skeleton_hash=grammar.grammar_skeleton_hash(repairs[0].expression, self.metadata()),
-                        semantic_skeleton_hash=grammar.semantic_skeleton_hash(repairs[0].expression, self.metadata()),
+                        source_profile=diversity.derive_source_profile(child.expression, self.catalog),
+                        grammar_skeleton_hash=grammar.grammar_skeleton_hash(child.expression, self.metadata()),
+                        semantic_skeleton_hash=grammar.semantic_skeleton_hash(child.expression, self.metadata()),
                     )
         # When a lineage-producing mode cannot be realized, the same slot is still materialized so
         # the planned budget equals the materialized count. The realized mode is then reported
@@ -728,17 +751,262 @@ class CandidateGenerator:
         proposals: list[Proposal] = []
         seen: set[str] = set()
         for parent in parents:
-            for child in self.mutate(parent, count=1, campaign_id=campaign_id):
-                child = replace(child, generation_mode="mutate", strategy="mutate",
-                                source_profile=diversity.derive_source_profile(child.expression, self.catalog))
-                key = canonical.canonical_key(child.expression, child.settings)
-                if key in seen:
-                    continue
-                seen.add(key)
-                proposals.append(child)
-                if len(proposals) >= count:
-                    return proposals
+            child = self._mutate_child(parent, campaign_id=campaign_id)
+            if child is None:
+                continue
+            child = replace(child, generation_mode="mutate", strategy="mutate",
+                            source_profile=diversity.derive_source_profile(child.expression, self.catalog))
+            key = canonical.canonical_key(child.expression, child.settings)
+            if key in seen:
+                continue
+            seen.add(key)
+            proposals.append(child)
+            if len(proposals) >= count:
+                return proposals
         return proposals[:count]
+
+    def _mutate_child(self, parent: Mapping[str, Any], *, campaign_id: str) -> Proposal | None:
+        """One V3 mutation child: failure-directed repair when a failure is diagnosed,
+        otherwise a concrete structural edit (P4.4), and finally the structural field swap."""
+        repairs = self.mutate(parent, count=1, campaign_id=campaign_id) if self.diagnose(parent) else []
+        child = repairs[0] if repairs else self.structural_mutation(parent, campaign_id=campaign_id)
+        if child is None:
+            fallback = self.mutate(parent, count=1, campaign_id=campaign_id)
+            child = fallback[0] if fallback else None
+        return child
+
+    def structural_mutation(
+        self,
+        parent: Mapping[str, Any],
+        *,
+        operation: str | None = None,
+        campaign_id: str = "mutation",
+        seed: int | None = None,
+    ) -> Proposal | None:
+        """One typed structural edit of ``parent`` under a stable operation name (P4.4).
+
+        ``operation`` pins the edit; otherwise a concrete edit is sampled deterministically
+        from :data:`V3_MUTATION_OPERATIONS`, skipping edits that do not apply to this parent.
+        Every child is re-validated (arity/types through the operator catalog, then the
+        parent-scaled complexity budget) before it becomes a :class:`Proposal`; an edit that
+        cannot be realized cleanly returns ``None`` instead of a half-validated child.
+        """
+        expression = str(parent.get("normalized_expression") or parent.get("expression") or "")
+        parent_id = int(parent["id"]) if parent.get("id") is not None else None
+        parent_ids = (parent_id,) if parent_id is not None else ()
+        family = str(parent.get("signal_family") or "mutation")
+        settings = _settings(parent)
+        generation = self.db.next_generation(parent_ids) if parent_ids else 0
+        metadata = self.metadata()
+        try:
+            node = grammar.parse_expression(expression, metadata)
+        except grammar.GrammarError:
+            return None
+        limits = _mutation_limits(node)
+        seed_value = self.seed if seed is None else int(seed)
+        rng = random.Random(generation_policy.recipe_seed(
+            campaign_id, seed_value, [field.field_id for field in grammar.source_fields(node)],
+            f"mutation:{operation or 'sample'}", 0, parent_ids,
+        ))
+        if operation is not None:
+            if operation not in V3_MUTATION_OPERATIONS:
+                raise ValueError(f"unknown mutation operation {operation!r}; known: {list(V3_MUTATION_OPERATIONS)}")
+            order = [operation]
+        else:
+            order = list(V3_MUTATION_OPERATIONS)
+            rng.shuffle(order)
+        for name in order:
+            edit = self._structural_edit(name, node, rng)
+            if edit is None:
+                continue
+            child_node, parameters, reason = edit
+            try:
+                grammar.validate_tree(child_node, limits)
+            except grammar.GrammarError:
+                continue
+            child_expression = grammar.render(child_node)
+            if child_expression == expression:
+                continue
+            operation_parameters: dict[str, Any] = {
+                "operation": name, "previous_operation": str(parent.get("mutation_type") or ""),
+                **parameters,
+            }
+            return self._proposal(
+                child_expression, settings, family, name, operation_parameters,
+                parent_ids, generation, reason,
+            )
+        return None
+
+    def _structural_edit(
+        self,
+        operation: str,
+        node: grammar.ExprNode,
+        rng: random.Random,
+    ) -> tuple[grammar.ExprNode, dict[str, Any], str] | None:
+        handler = {
+            "dataset_swap": self._edit_dataset_swap,
+            "motif_change": self._edit_motif_change,
+            "normalization_change": self._edit_normalization_change,
+            "group_change": self._edit_group_change,
+            "subtree_replace": self._edit_subtree_replace,
+            "add_component": self._edit_add_component,
+        }[operation]
+        return handler(node, rng)
+
+    def _edit_dataset_swap(
+        self, node: grammar.ExprNode, rng: random.Random,
+    ) -> tuple[grammar.ExprNode, dict[str, Any], str] | None:
+        """Replace one source with a same-type field from a different dataset."""
+        used = {field.field_id for field in grammar.source_fields(node)}
+        swappable = [field for field in grammar.source_fields(node) if self.catalog.get(field.field_id)]
+        if not swappable:
+            return None
+        target = swappable[rng.randrange(len(swappable))]
+        candidates = [
+            field for field in self.catalog.fields
+            if field.name not in used
+            and field.dataset != target.dataset
+            and field.field_type == target.value_type
+            and field.field_type in {compatibility.MATRIX, compatibility.VECTOR}
+        ]
+        if not candidates:
+            return None
+        chosen = candidates[rng.randrange(min(4, len(candidates)))]
+        replacement = grammar.field_node_from(chosen)
+        child = _substitute_fields(node, {target.field_id: replacement})
+        return child, {
+            "replaced_field": target.field_id, "previous_dataset": target.dataset,
+            "replacement_field": replacement.field_id, "replacement_dataset": replacement.dataset,
+        }, "swap one source for a same-type field from another dataset"
+
+    def _edit_motif_change(
+        self, node: grammar.ExprNode, rng: random.Random,
+    ) -> tuple[grammar.ExprNode, dict[str, Any], str] | None:
+        """Rebuild the whole child from the same sources through a different motif."""
+        fields = [field for field in grammar.source_fields(node) if self.catalog.get(field.field_id)]
+        if not fields:
+            return None
+        candidates = [motif for motif in grammar.eligible_motifs(fields)
+                      if len(motif.input_roles) <= len(fields)]
+        rng.shuffle(candidates)
+        current = grammar.render(node)
+        for motif in candidates:
+            recipe = generation_policy.sample_recipe(rng, motif.id)
+            try:
+                child = grammar.build_motif(motif.id, fields, recipe, limits=_mutation_limits(node))
+            except grammar.GrammarError:
+                continue
+            if grammar.render(child) == current:
+                continue
+            return child, {"motif_id": motif.id, "fields": [field.field_id for field in fields]}, \
+                "rebuild the same sources through a different economic motif"
+        return None
+
+    def _edit_normalization_change(
+        self, node: grammar.ExprNode, rng: random.Random,
+    ) -> tuple[grammar.ExprNode, dict[str, Any], str] | None:
+        """Flip a cross-sectional normalizer, or introduce one when the tree has none."""
+        targets = [call for call in _call_nodes(node) if call.operator in NORMALIZATION_SWAPS]
+        if targets:
+            target = targets[rng.randrange(len(targets))]
+            replacement = grammar.CallNode(
+                NORMALIZATION_SWAPS[target.operator], target.args, target.output_type, target.keywords,
+            )
+            child, swapped = _swap_subtree(node, target, replacement)
+            if not swapped:
+                return None
+            return child, {"previous_normalizer": target.operator, "normalizer": replacement.operator}, \
+                "flip the cross-sectional normalizer"
+        operator = "zscore" if rng.random() < 0.5 else "rank"
+        try:
+            child = grammar.make_call(operator, [node])
+        except grammar.GrammarError:
+            return None
+        return child, {"previous_normalizer": "none", "normalizer": operator}, \
+            "introduce a cross-sectional normalizer"
+
+    def _edit_group_change(
+        self, node: grammar.ExprNode, rng: random.Random,
+    ) -> tuple[grammar.ExprNode, dict[str, Any], str] | None:
+        """Move one group literal one level around :data:`GROUP_CYCLE`."""
+        groups = [field for field in _field_nodes(node) if field.value_type == grammar.GROUP]
+        if not groups:
+            return None
+        target = groups[rng.randrange(len(groups))]
+        new_name = GROUP_CYCLE.get(target.field_id, "subindustry")
+        if new_name == target.field_id:
+            return None
+        replacement = grammar.group_node(new_name, self.metadata())
+        child, swapped = _swap_subtree(node, target, replacement)
+        if not swapped:
+            return None
+        return child, {"previous_group": target.field_id, "group": new_name}, \
+            "move the grouping one level"
+
+    def _edit_subtree_replace(
+        self, node: grammar.ExprNode, rng: random.Random,
+    ) -> tuple[grammar.ExprNode, dict[str, Any], str] | None:
+        """Replace one typed subtree with a different motif over that subtree's own sources."""
+        subtrees = [
+            call for call in _call_nodes(node)
+            if grammar.source_fields(call)
+            and all(self.catalog.get(field.field_id) for field in grammar.source_fields(call))
+        ]
+        if not subtrees:
+            return None
+        # Prefer interior subtrees: replacing the root is ``motif_change``'s job.
+        interior = [call for call in subtrees if call is not node]
+        rng.shuffle(interior or subtrees)
+        subtrees = interior or subtrees
+        for target in subtrees[:3]:
+            fields = list(grammar.source_fields(target))
+            candidates = [motif for motif in grammar.eligible_motifs(fields)
+                          if len(motif.input_roles) <= len(fields)]
+            rng.shuffle(candidates)
+            for motif in candidates:
+                recipe = generation_policy.sample_recipe(rng, motif.id)
+                try:
+                    replacement = grammar.build_motif(motif.id, fields, recipe, limits=_mutation_limits(node))
+                except grammar.GrammarError:
+                    continue
+                if grammar.render(replacement) == grammar.render(target):
+                    continue
+                child, swapped = _swap_subtree(node, target, replacement)
+                if not swapped:
+                    continue
+                return child, {
+                    "replaced_operator": target.operator, "replacement_motif": motif.id,
+                    "subtree_fields": [field.field_id for field in fields],
+                }, "replace one typed subtree with a different motif over its sources"
+        return None
+
+    def _edit_add_component(
+        self, node: grammar.ExprNode, rng: random.Random,
+    ) -> tuple[grammar.ExprNode, dict[str, Any], str] | None:
+        """Combine the parent with one orthogonal component from a fresh source."""
+        used = {field.field_id for field in grammar.source_fields(node)}
+        candidates = [
+            field for field in self.catalog.fields
+            if field.name not in used and field.field_type in {compatibility.MATRIX, compatibility.VECTOR}
+        ]
+        if not candidates:
+            return None
+        for chosen in rng.sample(candidates, min(4, len(candidates))):
+            fresh = grammar.field_node_from(chosen)
+            motifs = [motif for motif in grammar.eligible_motifs([fresh]) if len(motif.input_roles) == 1]
+            rng.shuffle(motifs)
+            for motif in motifs:
+                recipe = generation_policy.sample_recipe(rng, motif.id)
+                try:
+                    component = grammar.build_motif(motif.id, [fresh], recipe, limits=_mutation_limits(node))
+                    child = grammar.make_call("add", [node, component])
+                except grammar.GrammarError:
+                    continue
+                return child, {
+                    "added_field": fresh.field_id, "added_dataset": fresh.dataset,
+                    "component_motif": motif.id,
+                }, "combine an orthogonal component into the signal"
+        return None
 
     # -- mutation ----------------------------------------------------------
 
@@ -827,12 +1095,16 @@ class CandidateGenerator:
         generation: int,
         reason: str,
     ) -> Proposal:
+        parameters = dict(parameters)
+        # The concrete structural edit is always recorded, so mutation stats can aggregate
+        # operations separately from the broad repair class (P9.2).
+        parameters.setdefault("operation", mutation_type)
         return Proposal(
             expression=expression,
             settings=settings,
             family=self._child_family(expression, family),
             mutation_type=mutation_type,
-            parameters=dict(parameters),
+            parameters=parameters,
             parent_ids=parent_ids,
             reason=reason,
             generation=generation,
@@ -843,7 +1115,7 @@ class CandidateGenerator:
         repair_settings = {**settings, "decay": min(512, base_decay + 4)}
         proposals = [
             self._proposal(
-                f"hump({expression}, hump={hump})", repair_settings, family, "turnover_repair",
+                f"hump({expression}, hump={hump})", repair_settings, family, "hump_smoothing",
                 {"hump": hump, "decay": repair_settings["decay"], "previous_decay": base_decay},
                 parent_ids, generation, "repair diagnosed high turnover",
             )
@@ -1044,7 +1316,7 @@ class CandidateGenerator:
             leg = template.render(self._field_reference(field), 126)
             proposals.append(self._proposal(
                 f"add({expression}, {leg})",
-                settings, family, "combine_signals",
+                settings, family, "add_component",
                 {"added_field": field.name, "added_dataset": field.dataset, "window": 126,
                  "template": template.id},
                 parent_ids, generation, "combine an orthogonal data source to lower correlation",
@@ -1130,7 +1402,7 @@ def _as_repair(proposal: Proposal, repair_type: str) -> Proposal:
 
     ``mutation_type`` is the research decision (``turnover_repair``, ``sharpe_repair``, ...)
     and ``parameters['operation']`` is the concrete structural edit that was applied
-    (``hump_smoothing``, ``window_change``, ``field_swap``, ``combine_signals``, ...), so a
+    (``hump_smoothing``, ``window_change``, ``field_swap``, ``add_component``, ...), so a
     repair stays explainable without losing which failure drove it.
     """
     parameters = dict(proposal.parameters)
@@ -1157,6 +1429,79 @@ def _crossover_leg(node: grammar.ExprNode, form: str) -> grammar.ExprNode:
     """Wrap one parent expression in the normalizer its crossover form calls for."""
     operator = "zscore" if form == "add_zscore" else "rank"
     return grammar.make_call(operator, [node])
+
+
+def _mutation_limits(parent: grammar.ExprNode) -> grammar.ComplexityLimits:
+    """Budget a structural mutation child against its parent, never above the hard ceiling.
+
+    A typed edit adds at most a handful of nodes to the parent; charging the child against a
+    fresh-candidate budget would refuse edits of already-evolved elites, exactly like the
+    crossover budget used to before it was scaled to its parents.
+    """
+    return grammar.ComplexityLimits(
+        max_depth=min(CROSSOVER_LIMITS.max_depth, grammar.node_depth(parent) + 2),
+        max_nodes=min(CROSSOVER_LIMITS.max_nodes, grammar.node_count(parent) + 6),
+        max_fields=min(CROSSOVER_LIMITS.max_fields, len(grammar.source_fields(parent)) + 1),
+        max_binary_ops=min(CROSSOVER_LIMITS.max_binary_ops, grammar.binary_op_count(parent) + 2),
+    )
+
+
+def _substitute_fields(
+    node: grammar.ExprNode,
+    replacements: Mapping[str, grammar.FieldNode],
+) -> grammar.ExprNode:
+    """Frozen-dataclass-safe rebuild of ``node`` with named source fields replaced."""
+    if isinstance(node, grammar.FieldNode):
+        return replacements.get(node.field_id, node)
+    if isinstance(node, grammar.LiteralNode):
+        return node
+    args = tuple(_substitute_fields(argument, replacements) for argument in node.args)
+    keywords = tuple((name, _substitute_fields(value, replacements)) for name, value in node.keywords)
+    return grammar.CallNode(node.operator, args, node.output_type, keywords)
+
+
+def _swap_subtree(
+    root: grammar.ExprNode,
+    target: grammar.ExprNode,
+    replacement: grammar.ExprNode,
+) -> tuple[grammar.ExprNode, bool]:
+    """Replace the first occurrence of ``target`` (by identity) with ``replacement``."""
+    if root is target:
+        return replacement, True
+    if isinstance(root, grammar.CallNode):
+        args = list(root.args)
+        keywords = list(root.keywords)
+        for index, argument in enumerate(args):
+            new, swapped = _swap_subtree(argument, target, replacement)
+            if swapped:
+                args[index] = new
+                return grammar.CallNode(root.operator, tuple(args), root.output_type, tuple(keywords)), True
+        for index, (name, value) in enumerate(keywords):
+            new, swapped = _swap_subtree(value, target, replacement)
+            if swapped:
+                keywords[index] = (name, new)
+                return grammar.CallNode(root.operator, tuple(args), root.output_type, tuple(keywords)), True
+    return root, False
+
+
+def _call_nodes(node: grammar.ExprNode) -> list[grammar.CallNode]:
+    """Every call subtree of ``node``, outermost first."""
+    if not isinstance(node, grammar.CallNode):
+        return []
+    children = [child for argument in node.args for child in _call_nodes(argument)]
+    children += [child for _name, value in node.keywords for child in _call_nodes(value)]
+    return [node] + children
+
+
+def _field_nodes(node: grammar.ExprNode) -> list[grammar.FieldNode]:
+    """Every field leaf of ``node``, source order."""
+    if isinstance(node, grammar.FieldNode):
+        return [node]
+    if isinstance(node, grammar.LiteralNode):
+        return []
+    leaves = [leaf for argument in node.args for leaf in _field_nodes(argument)]
+    leaves += [leaf for _name, value in node.keywords for leaf in _field_nodes(value)]
+    return leaves
 
 
 def _first_window(expression: str) -> int | None:

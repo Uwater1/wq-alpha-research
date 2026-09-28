@@ -393,3 +393,119 @@ def test_crossover_child_family_matches_its_own_source_profile(db):
     assert row["signal_family"] == proposal.family
     trial = db.trials("v3-x-fam")[-1]
     assert trial["signal_family"] == proposal.family
+
+
+# ---------------------------------------------------------------------------
+# P4.4: the concrete structural mutation vocabulary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("operation, parent_expression", [
+    ("dataset_swap", "rank(ts_delta(close,20))"),
+    ("motif_change", "ts_rank(close,60)"),
+    ("normalization_change", "rank(ts_delta(close,20))"),
+    ("group_change", "group_rank(ts_rank(close,60),subindustry)"),
+    ("subtree_replace", "group_rank(ts_rank(ts_delta(close,20),60),subindustry)"),
+    ("add_component", "ts_rank(close,60)"),
+])
+def test_every_v3_mutation_operation_is_generatable(db, operation, parent_expression):
+    """Each promised operation is a real, validated edit that records its own name."""
+    parent_id = db.queue_candidate(
+        parent_expression, {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    parent = db.get_candidate(parent_id)
+    service = generator.CandidateGenerator(db, seed=3)
+    proposal = service.structural_mutation(parent, operation=operation, campaign_id="v3-ops")
+    assert proposal is not None, f"{operation} must be generatable"
+    assert proposal.parameters["operation"] == operation
+    assert proposal.mutation_type == operation
+    assert proposal.parent_ids == (parent_id,)
+    assert proposal.expression != parent_expression
+    # AST/type/complexity validation happens before the child exists.
+    metadata = service.metadata()
+    child_node = grammar.parse_expression(proposal.expression, metadata)
+    parent_node = grammar.parse_expression(parent_expression, metadata)
+    grammar.validate_tree(child_node, generator._mutation_limits(parent_node))
+    assert proposal.family == diversity.derive_source_profile(
+        proposal.expression, catalog=generator.Catalog())["primary_family"]
+
+
+def test_structural_dataset_swap_moves_to_another_dataset(db):
+    parent_id = db.queue_candidate("rank(ts_delta(close,20))", {"decay": 6}, signal_family="pv1").candidate_id
+    proposal = generator.CandidateGenerator(db, seed=4).structural_mutation(
+        db.get_candidate(parent_id), operation="dataset_swap", campaign_id="v3-swap",
+    )
+    assert proposal is not None
+    assert proposal.parameters["previous_dataset"] == "pv1"
+    assert proposal.parameters["replacement_dataset"] != "pv1"
+    assert proposal.parameters["replacement_field"] in proposal.expression
+    assert proposal.parameters["replaced_field"] not in proposal.expression
+
+
+def test_structural_normalization_change_flips_the_normalizer(db):
+    parent_id = db.queue_candidate("rank(ts_delta(close,20))", {"decay": 6}, signal_family="pv1").candidate_id
+    proposal = generator.CandidateGenerator(db, seed=5).structural_mutation(
+        db.get_candidate(parent_id), operation="normalization_change", campaign_id="v3-norm",
+    )
+    assert proposal is not None
+    assert proposal.parameters["previous_normalizer"] == "rank"
+    assert proposal.parameters["normalizer"] == "zscore"
+    assert proposal.expression.startswith("zscore(")
+
+
+def test_structural_group_change_moves_one_level(db):
+    parent_id = db.queue_candidate(
+        "group_rank(ts_rank(close,60),subindustry)", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    proposal = generator.CandidateGenerator(db, seed=6).structural_mutation(
+        db.get_candidate(parent_id), operation="group_change", campaign_id="v3-group",
+    )
+    assert proposal is not None
+    assert proposal.parameters["previous_group"] == "subindustry"
+    assert proposal.parameters["group"] == "industry"
+    assert proposal.expression.endswith(",industry)")
+
+
+def test_structural_add_component_combines_a_fresh_source(db):
+    parent_id = db.queue_candidate("ts_rank(close,60)", {"decay": 6}, signal_family="pv1").candidate_id
+    proposal = generator.CandidateGenerator(db, seed=7).structural_mutation(
+        db.get_candidate(parent_id), operation="add_component", campaign_id="v3-add",
+    )
+    assert proposal is not None
+    assert proposal.parameters["operation"] == "add_component"
+    assert proposal.parameters["added_field"] not in ("close", "")
+    assert proposal.expression.startswith("add(")
+
+
+def test_v3_mutate_slots_generate_structural_operations(db):
+    """The V3 mutate path must reach the structural vocabulary, not only repair/field swaps."""
+    parent_id = db.queue_candidate(
+        "group_rank(ts_rank(ts_delta(close,20),60),subindustry)", {"decay": 6}, signal_family="pv1",
+    ).candidate_id
+    operations: set[str] = set()
+    for index in range(16):
+        slot = policy.PlanSlot(
+            slot=index, generation_mode="mutate", family="pv1", motif_id="mutation",
+            recipe_index=index, reason="repair/perturb a diverse archive elite",
+            parent_ids=(parent_id,),
+        )
+        proposal = generator.CandidateGenerator(db, seed=index).materialize(
+            slot, campaign_id="v3-struct",
+        )
+        if proposal is not None:
+            operations.add(str(proposal.parameters.get("operation") or proposal.mutation_type))
+    assert operations & set(generator.V3_MUTATION_OPERATIONS), (
+        f"expected at least one structural operation, got {sorted(operations)}"
+    )
+
+
+def test_add_component_is_the_stable_combine_operation_name(db):
+    """The historical structural-combine name is normalized to ``add_component``."""
+    parent_id = db.queue_candidate("ts_rank(close,60)", {"decay": 6}, signal_family="pv1").candidate_id
+    parent = db.get_candidate(parent_id)
+    proposals = generator.CandidateGenerator(db, seed=9).mutate(
+        dict(parent, failure_reason="LOW_SHARPE"), count=10,
+    )
+    combined = [p for p in proposals if p.parameters.get("operation") in {"add_component", "combine_signals"}]
+    assert combined, "the sharpe repair must offer a structural combine"
+    assert all(p.parameters["operation"] == "add_component" for p in combined)
