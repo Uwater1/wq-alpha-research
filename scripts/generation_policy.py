@@ -392,6 +392,85 @@ def _proven_motifs(db: Any, families: Sequence[str]) -> dict[str, set[str]]:
     return proven
 
 
+def _structure_counts(db: Any, catalog: Any = None) -> tuple[dict[str, int], dict[str, int]]:
+    """``grammar/semantic skeleton hash -> attempts`` from local history (P4.2 budgeting).
+
+    Hashes are derived from the stored expressions like :func:`diversity.novelty_context`
+    does (falling back to the stored columns), so rows written before the V3 columns existed
+    still count as the structures they are.
+    """
+    grammar_counts: dict[str, int] = {}
+    semantic_counts: dict[str, int] = {}
+    if db is None:
+        return grammar_counts, semantic_counts
+    metadata = diversity.catalog_metadata(catalog) if catalog is not None else diversity.load_field_metadata()
+    try:
+        rows = db.query(
+            "SELECT normalized_expression, grammar_skeleton_hash, semantic_skeleton_hash FROM candidates"
+        )
+    except Exception:  # pragma: no cover - advisory only
+        return grammar_counts, semantic_counts
+    for row in rows:
+        expression = str(row["normalized_expression"] or "")
+        grammar_key = str(row["grammar_skeleton_hash"] or "")
+        semantic_key = str(row["semantic_skeleton_hash"] or "")
+        if not grammar_key and expression:
+            grammar_key = grammar.grammar_skeleton_hash(expression, metadata)
+        if not semantic_key and expression:
+            semantic_key = grammar.semantic_skeleton_hash(expression, metadata)
+        if grammar_key:
+            grammar_counts[grammar_key] = grammar_counts.get(grammar_key, 0) + 1
+        if semantic_key:
+            semantic_counts[semantic_key] = semantic_counts.get(semantic_key, 0) + 1
+    return grammar_counts, semantic_counts
+
+
+def _structure_hashes(motif_id: str, fields: Sequence[Any]) -> tuple[str, str] | None:
+    """Representative ``(grammar, semantic)`` skeleton hashes of one motif over these fields.
+
+    Built through the same typed grammar the materializer uses, with a default recipe, so
+    the planner budgets the structure it will actually ask for.
+    """
+    try:
+        node = grammar.build_motif(motif_id, list(fields), grammar.Recipe(), limits=_PLANNING_LIMITS)
+    except grammar.GrammarError:
+        return None
+    return grammar.grammar_skeleton_hash(node), grammar.semantic_skeleton_hash(node)
+
+
+#: The V3 materialization budget, reused so planning and materialization agree on what fits.
+_PLANNING_LIMITS = grammar.ComplexityLimits(max_depth=5, max_nodes=16, max_fields=2, max_binary_ops=3)
+
+
+def _structure_novelty(
+    motif_id: str,
+    fields: Sequence[Any],
+    *,
+    context: "diversity.NoveltyContext",
+    grammar_counts: Mapping[str, int],
+    semantic_counts: Mapping[str, int],
+    occupancy: Mapping[str, int],
+    used: Mapping[str, Mapping[str, int]],
+    rng: random.Random,
+) -> tuple[int, int, int, int, int, float]:
+    """Explore priority of one motif: unseen grammar first, then sparse archive cells, then
+    unseen semantics. A structure that cannot even be planned ranks last (P4.2)."""
+    hashes = _structure_hashes(motif_id, fields)
+    if hashes is None:
+        return (2, 0, 0, 1, 0, rng.random())
+    grammar_key, semantic_key = hashes
+    grammar_seen = grammar_counts.get(grammar_key, 0) + used["grammar"].get(grammar_key, 0)
+    semantic_seen = semantic_counts.get(semantic_key, 0) + used["semantic"].get(semantic_key, 0)
+    return (
+        0 if grammar_seen == 0 else 1,
+        grammar_seen,
+        int(occupancy.get(grammar_key, 0)),
+        0 if semantic_seen == 0 else 1,
+        semantic_seen,
+        rng.random(),
+    )
+
+
 def _ordered_sources(db: Any, catalog: Any, family: str, scope: Mapping[str, Any] | None) -> list[Any]:
     """Fields of a family, least-tested first (coverage-aware, seeded tie-break left to caller)."""
     fields = _catalog_fields(catalog, family)
@@ -458,6 +537,18 @@ def plan_campaign(
     context = diversity.novelty_context(db, catalog) if db is not None else diversity.NoveltyContext.empty()
     parents = archive.parents(db, count=parent_pool, seed=seed) if db is not None else []
     proven = _proven_motifs(db, sorted(set(family_slots)))
+    # P4.3: evidence is not keyed to one family. A motif proven anywhere may seed a
+    # compatible new dataset here before any unproven structure is considered.
+    proven_anywhere: set[str] = set().union(*proven.values()) if proven else set()
+    grammar_counts, semantic_counts = _structure_counts(db, catalog)
+    occupancy: dict[str, int] = {}
+    if db is not None:
+        try:
+            occupancy = archive.structure_occupancy(db)
+        except Exception:  # pragma: no cover - advisory only
+            occupancy = {}
+    used_structures: dict[str, dict[str, int]] = {"grammar": {}, "semantic": {}}
+    global_sources = _ordered_sources(db, catalog, "all", scope)
     # Bounded adaptive allocation (P9): under-tested motifs keep a floor, proven motifs gain
     # budget, and no motif can monopolize the campaign.
     if db is not None:
@@ -508,6 +599,12 @@ def plan_campaign(
         primary = grammar.field_node_from(chosen)
         others = [item for item in sources if str(getattr(item, "name", "")) != primary.field_id]
         distinct = [item for item in others if str(getattr(item, "dataset", "")) != primary.dataset]
+        if not distinct:
+            # Cross-dataset motifs must be reachable in ordinary planning (P4.2): widen the
+            # partner pool to the global source pool when the family itself is single-dataset.
+            distinct = [item for item in global_sources
+                        if str(getattr(item, "dataset", "")) != primary.dataset
+                        and str(getattr(item, "name", "")) != primary.field_id]
         partner_pool = distinct or others
         partner = grammar.field_node_from(partner_pool[slot_rng.randrange(min(4, len(partner_pool)))]) if partner_pool else None
         single_source = list(grammar.eligible_motifs([primary]))
@@ -516,17 +613,31 @@ def plan_campaign(
             if len(motif.input_roles) == 2
         ]
         eligible = single_source + two_source
+
+        def motif_fields(name: str) -> list[Any]:
+            roles = len(grammar.motif_by_id(name).input_roles)
+            return [primary, partner] if roles == 2 and partner is not None else [primary]
+
         if not eligible:
             motif_id = "cross_sectional_level"
         elif effective_mode == "explore":
-            unseen = [m.id for m in eligible if m.id not in context.motifs and used_motifs.get(m.id, 0) == 0]
-            pool = unseen or [m.id for m in eligible]
-            motif_id = pool[slot_rng.randrange(len(pool))]
+            # Budget grammar/semantic novelty *before* materialization (P4.2): explore slots go
+            # to structures that are unseen or sparse in the archive, never to a repeat while
+            # an untested structure is still reachable.
+            motif_id = min(
+                (motif.id for motif in eligible),
+                key=lambda name: _structure_novelty(
+                    name, motif_fields(name), context=context,
+                    grammar_counts=grammar_counts, semantic_counts=semantic_counts,
+                    occupancy=occupancy, used=used_structures, rng=slot_rng,
+                ),
+            )
         else:
             # exploit / mutate / crossover: spend the bounded adaptive allocation, preferring a
             # motif that still has budget and has performed well enough to earn more.
-            preferred = [m.id for m in eligible if m.id in proven.get(slot_family, set())]
-            pool = preferred or [m.id for m in eligible]
+            local = [m.id for m in eligible if m.id in proven.get(slot_family, set())]
+            transferred = [m.id for m in eligible if m.id in proven_anywhere]
+            pool = local or transferred or [m.id for m in eligible]
             motif_id = max(
                 pool,
                 key=lambda name: (remaining_motif_budget.get(name, 0), -used_motifs.get(name, 0), name),
@@ -534,12 +645,22 @@ def plan_campaign(
         used_motifs[motif_id] = used_motifs.get(motif_id, 0) + 1
         remaining_motif_budget[motif_id] = max(0, remaining_motif_budget.get(motif_id, 0) - 1)
         field_nodes = [primary, partner] if len(grammar.motif_by_id(motif_id).input_roles) == 2 and partner else [primary]
+        hashes = _structure_hashes(motif_id, motif_fields(motif_id))
+        if hashes is not None:
+            grammar_key, semantic_key = hashes
+            used_structures["grammar"][grammar_key] = used_structures["grammar"].get(grammar_key, 0) + 1
+            used_structures["semantic"][semantic_key] = used_structures["semantic"].get(semantic_key, 0) + 1
 
         reason = "under-tested semantic niche"
         if effective_mode == "explore":
             reason = "unseen motif for this campaign" if motif_id not in context.motifs else "sparse archive niche"
         elif effective_mode == "exploit":
-            reason = "proven motif on a new source"
+            if motif_id in proven.get(slot_family, set()):
+                reason = "proven motif on a new source"
+            elif motif_id in proven_anywhere:
+                reason = "proven structure transferred to a new dataset"
+            else:
+                reason = "exploit allocation without family-local evidence"
         elif effective_mode == "mutate":
             reason = "repair/perturb a diverse archive elite"
         elif effective_mode == "crossover":

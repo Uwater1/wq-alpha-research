@@ -499,6 +499,73 @@ def test_v3_mutate_slots_generate_structural_operations(db):
     )
 
 
+# ---------------------------------------------------------------------------
+# P4.2/P4.3: cross-dataset reachability, novelty budgeting, structure transfer
+# ---------------------------------------------------------------------------
+
+
+def test_ordinary_planning_produces_a_cross_dataset_motif(db):
+    """P4.2: a deterministic fixture must reach a genuine cross-dataset proposal."""
+    plan, proposals = generator.CandidateGenerator(db, seed=13).generate(
+        campaign_id="v3-xdata", count=24, seed=13, strategy="mixed",
+    )
+    assert plan.planned_budget == 24 == len(proposals)
+    cross = [p for p in proposals if p.source_profile["cross_dataset"]]
+    assert cross, "ordinary planning must be able to reach cross-dataset structures"
+    assert all(len(p.source_profile["datasets"]) >= 2 for p in cross)
+    composite = [p for p in proposals if p.motif_id == "cross_dataset_composite"]
+    assert composite, "cross_dataset_composite must be reachable without forcing --motif"
+    assert all(p.source_profile["cross_dataset"] for p in composite)
+
+
+def test_explore_slots_budget_unseen_structures_before_repeats(db):
+    """P4.2: grammar/semantic history is budgeted at plan time, not after materialization."""
+    for window in (20, 30, 40, 50, 60, 70, 80, 90):
+        db.queue_candidate(f"ts_rank(close,{window})", {"decay": 6}, signal_family="pv1")
+    catalog = generator.Catalog()
+    history, _ = policy._structure_counts(db, catalog)
+    assert history, "the fixture must leave a saturated grammar structure in history"
+    plan = generator.CandidateGenerator(db, seed=6).plan(
+        campaign_id="v3-budget", budget=12, seed=6, mode="explore",
+    )
+    explore = [slot for slot in plan.slots if slot.generation_mode == "explore"]
+    assert explore
+    nodes = {field.name: grammar.field_node_from(field) for field in catalog.fields}
+    seats: dict[str, int] = {}
+    for slot in explore:
+        hashes = policy._structure_hashes(slot.motif_id, [nodes[name] for name in slot.fields])
+        assert hashes is not None, f"planned motif {slot.motif_id} must be materializable"
+        grammar_key = hashes[0]
+        assert grammar_key not in history, (
+            "a history-saturated structure may not be re-planned while unseen structures remain"
+        )
+        seats[grammar_key] = seats.get(grammar_key, 0) + 1
+    # Unseen structures first: with 18+ reachable structures and 12 explore slots, no
+    # structure may be seated twice.
+    assert max(seats.values()) == 1, f"repeated planned structures: {seats}"
+
+
+def test_exploit_transfers_proven_structure_to_a_new_source(db):
+    """P4.3: a motif proven in one family may seed a compatible new dataset."""
+    outcome = db.queue_candidate(
+        "rank(ts_delta(close,20))", {"decay": 6}, signal_family="pv1",
+        mutation_parameters={"motif_id": "momentum", "generation_mode": "exploit"},
+    )
+    claimed = db.claim_simulation("xfer", candidate_id=outcome.candidate_id)
+    db.record_simulation_result(
+        candidate_id=claimed["id"], status="DONE",
+        metrics={"sharpe": 1.5, "fitness": 1.1, "turnover": 0.08},
+        checks=[{"name": "IS", "result": "PASS"}], brain_alpha_id="A-xfer",
+    )
+    plan = generator.CandidateGenerator(db, seed=3).plan(
+        campaign_id="v3-xfer", budget=12, seed=3, mode="exploit", family="fundamental6",
+    )
+    assert plan.slots and all(slot.family == "fundamental6" for slot in plan.slots)
+    motifs = {slot.motif_id for slot in plan.slots}
+    assert "momentum" in motifs, "proven structure must transfer to the new dataset"
+    assert any("transferred" in slot.reason for slot in plan.slots)
+
+
 def test_add_component_is_the_stable_combine_operation_name(db):
     """The historical structural-combine name is normalized to ``add_component``."""
     parent_id = db.queue_candidate("ts_rank(close,60)", {"decay": 6}, signal_family="pv1").candidate_id

@@ -473,22 +473,34 @@ class CandidateGenerator:
         family: str,
         count: int,
     ) -> list[grammar.FieldNode]:
-        """Additional source fields for a two-source motif, preferring a different dataset."""
+        """Additional source fields for a two-source motif, preferring a different dataset.
+
+        A cross-dataset motif must stay reachable even when the planned family is
+        single-dataset: when the family pool holds no other-dataset partner, the global
+        catalog is searched before any same-dataset fallback (P4.2).
+        """
         used_ids = {node.field_id for node in used}
-        candidates = [
-            field for field in self.catalog.select(family)
-            if field.name not in used_ids
-            and field.field_type in {compatibility.MATRIX, compatibility.VECTOR}
-        ]
-        if not candidates:
-            candidates = [
-                field for field in self.catalog.fields
-                if field.name not in used_ids
-                and field.field_type in {compatibility.MATRIX, compatibility.VECTOR}
-            ]
         datasets = {node.dataset for node in used}
-        candidates.sort(key=lambda field: (field.dataset in datasets, field.name))
-        return [grammar.field_node_from(field) for field in candidates[: max(0, count)]]
+
+        def usable(field: Field) -> bool:
+            return (
+                field.name not in used_ids
+                and field.field_type in {compatibility.MATRIX, compatibility.VECTOR}
+            )
+
+        family_pool = sorted(
+            (field for field in self.catalog.select(family) if usable(field)),
+            key=lambda field: (field.dataset in datasets, field.dataset, field.name),
+        )
+        cross_family = [field for field in family_pool if field.dataset not in datasets]
+        if cross_family:
+            return [grammar.field_node_from(field) for field in cross_family[: max(0, count)]]
+        global_cross = sorted(
+            (field for field in self.catalog.fields if usable(field) and field.dataset not in datasets),
+            key=lambda field: (field.dataset, field.name),
+        )
+        pool = global_cross or family_pool
+        return [grammar.field_node_from(field) for field in pool[: max(0, count)]]
 
     def _fallback_motif(
         self,
@@ -598,10 +610,11 @@ class CandidateGenerator:
             parameters["planned_generation_mode"] = slot.generation_mode
             parameters["lineage_fallback"] = True
         parent_ids = () if lineage_fallback else tuple(slot.parent_ids)
+        profile = diversity.derive_source_profile(expression, self.catalog)
         return Proposal(
             expression=expression,
             settings=settings,
-            family=slot.family,
+            family=diversity.family_for_profile(profile, slot.family),
             mutation_type="motif_generation",
             parameters=parameters,
             parent_ids=parent_ids,
@@ -611,7 +624,7 @@ class CandidateGenerator:
             recipe_index=slot.recipe_index,
             generation_mode=realized_mode,
             strategy=realized_mode if force_motif is None else strategy,
-            source_profile=diversity.derive_source_profile(expression, self.catalog),
+            source_profile=profile,
             grammar_skeleton_hash=grammar.grammar_skeleton_hash(expression, self.metadata()),
             semantic_skeleton_hash=grammar.semantic_skeleton_hash(expression, self.metadata()),
             recipe=recipe.as_dict(),
