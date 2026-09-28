@@ -869,6 +869,72 @@ def test_grammar_novelty_prefers_an_unseen_topology(db):
     assert ordered[0] == distinct[0].candidate_id
 
 
+# ---------------------------------------------------------------------------
+# archive_v2: the pre-V3 comparison arm (P14)
+# ---------------------------------------------------------------------------
+
+
+def _v2cmp_settle(db, expression, *, family, motif, sharpe, fitness):
+    outcome = db.queue_candidate(
+        expression, {"decay": 6}, signal_family=family, source="v2cmp",
+        motif_id=motif, generation_mode="explore",
+    )
+    db.claim_simulation("seed", candidate_id=outcome.candidate_id)
+    db.record_simulation_result(
+        candidate_id=outcome.candidate_id, status="DONE",
+        metrics={"sharpe": sharpe, "fitness": fitness, "turnover": 0.06},
+        checks=[{"name": "IS", "result": "PASS"}], brain_alpha_id=f"C{outcome.candidate_id}",
+    )
+    return outcome.candidate_id
+
+
+def test_archive_v2_reproduces_pre_v3_global_top_elite_selection(db):
+    """P14: V2 selection is global top-elite; family/niche diversity never enters."""
+    elite = _v2cmp_settle(db, "rank(ts_delta(close,20))", family="pv1", motif="momentum",
+                          sharpe=2.0, fitness=1.2)
+    mid = _v2cmp_settle(db, "group_rank(ts_rank(assets,60),industry)", family="fundamental6",
+                        motif="group_relative", sharpe=1.5, fitness=0.8)
+    weak = _v2cmp_settle(db, "ts_mean(open,60)", family="pv1", motif="time_series_level",
+                         sharpe=0.5, fitness=0.3)
+
+    environment = policy_replay.ReplayEnvironment.from_db(db, budget=3)
+    cards = {item.card.candidate_id: item.card for item in environment.items}
+    outcomes = {item.candidate_id: item.outcome for item in environment.items}
+    assert set(cards) == {elite, mid, weak}
+    context = policy_replay.DecisionContext(
+        clock=10 ** 9, as_of="", step=0, remaining_budget=3, history=(),
+        settled_before={cid: (cards[cid], outcomes[cid]) for cid in cards},
+    )
+    v2 = policy_replay.build_policy("archive_v2", environment=environment)
+    # Global top-elite order by the V2 elite score — the pv1 pair is split by quality,
+    # never reunited by family diversity.
+    assert v2.order(list(cards.values()), context) == [elite, mid, weak]
+
+    # The V3 archive deliberately reorders the same three: the least-tested family leads.
+    v3 = policy_replay.build_policy("archive_v3", environment=environment)
+    assert v3.order(list(cards.values()), context)[0] == mid
+
+    # And the pre-V3 arm is point-in-time clean like every other policy.
+    run = policy_replay.replay(environment, v2, record_details=False)
+    assert run["leakage_check"]["status"] == "passed", run["leakage_check"]
+
+
+def test_archive_v2_is_in_the_benchmark_matrix(db, tmp_path, capsys):
+    """P14: the explicit archive-V2 comparison runs in equal-budget comparisons."""
+    _v2cmp_settle(db, "rank(ts_delta(close,20))", family="pv1", motif="momentum",
+                  sharpe=2.0, fitness=1.2)
+    _v2cmp_settle(db, "ts_mean(open,60)", family="pv1", motif="time_series_level",
+                  sharpe=0.5, fitness=0.3)
+    path = str(tmp_path / "research.db")
+
+    assert "archive_v2" in policy_replay.POLICIES
+    assert "archive_v2" in policy_replay.BASELINE_POLICIES
+    assert policy_replay.main(["--db", path, "--compare", "--budget", "2", "--no-persist"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert "archive_v2" in result["policies"]
+    assert "archive_v3" in result["policies"]
+
+
 def test_v3_replay_reports_effective_diversity(db):
     _v3_settle(db, "group_rank(ts_rank(close,60),subindustry)", family="pv1", motif="group_relative")
     _v3_settle(db, "rank(ts_delta(assets,126))", family="fundamental2", motif="momentum", mode="exploit")

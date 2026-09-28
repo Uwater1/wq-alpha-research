@@ -578,6 +578,43 @@ class SemanticNoveltyPolicy(Policy):
         return [card.candidate_id for card in sorted(available, key=score)]
 
 
+class ArchiveV2Policy(Policy):
+    """The pre-V3 archive behaviour: deterministic global top-elite selection (P14).
+
+    Before the quality-diversity archive existed, ``archive.parents()`` shuffled niches and
+    then immediately re-sorted by elite score, so parent selection was plain global
+    top-elite ordering — no niche or family diversity ever entered. This policy reproduces
+    that selection rule so equal-budget comparisons can price the V3 diversity machinery
+    against what it replaced. The elite score is the archive's own
+    ``sharpe + 0.75*fitness - 0.25*turnover - 0.25*|self_corr|`` when an outcome had already
+    settled before the decision clock; the stored quality prior stands in for it otherwise.
+    """
+
+    name = "archive_v2"
+    description = "Pre-V3 archive behaviour: deterministic global top-elite selection, no diversity."
+    is_baseline = True
+
+    @staticmethod
+    def elite_score(outcome: CandidateOutcome | None) -> float | None:
+        """The V2 archive elite score, visible only for already-settled outcomes."""
+        if outcome is None:
+            return None
+        sharpe = float(outcome.sharpe or 0.0)
+        fitness = float(outcome.fitness or 0.0)
+        turnover = float(outcome.turnover or 0.0)
+        corr = abs(float(outcome.self_corr or 0.0))
+        return round(sharpe + 0.75 * fitness - 0.25 * turnover - 0.25 * corr, 6)
+
+    def order(self, available, context):
+        def score(card: CandidateCard) -> tuple[float, float, int]:
+            elite = self.elite_score(context.recorded_outcome(card.candidate_id))
+            if elite is None:
+                elite = float(card.expected_quality if card.expected_quality is not None else 0.0)
+            return (-elite, -float(card.priority or 0.0), card.creation_order)
+
+        return [card.candidate_id for card in sorted(available, key=score)]
+
+
 class ArchiveV3Policy(Policy):
     """Sparse archive niches first: an untested family and unseen grammar, then quality (P14)."""
 
@@ -708,7 +745,7 @@ class FindingGatePolicy(Policy):
 POLICY_CLASSES: tuple[type[Policy], ...] = (
     FifoPolicy, RankingPolicy, StagedSearchPolicy, SurrogatePolicy, CoveragePolicy,
     CalibratedPolicy, CalibratedSkipPolicy, FindingGatePolicy,
-    GrammarNoveltyPolicy, SemanticNoveltyPolicy, ArchiveV3Policy, MixedV3Policy,
+    ArchiveV2Policy, GrammarNoveltyPolicy, SemanticNoveltyPolicy, ArchiveV3Policy, MixedV3Policy,
 )
 POLICIES: dict[str, type[Policy]] = {policy.name: policy for policy in POLICY_CLASSES}
 BASELINE_POLICIES: tuple[str, ...] = tuple(policy.name for policy in POLICY_CLASSES if policy.is_baseline)
@@ -1640,7 +1677,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.compare or not names:
         names = [name for name in BASELINE_POLICIES] + [
             name for name in ("coverage", "calibrated_rank", "calibrated_skip",
-                              "grammar_novelty", "semantic_novelty", "archive_v3", "mixed_v3")
+                              "archive_v2", "grammar_novelty", "semantic_novelty",
+                              "archive_v3", "mixed_v3")
             if name not in BASELINE_POLICIES
         ]
     names = [name for name in dict.fromkeys(names)]
