@@ -2,71 +2,50 @@
 
 **Goal:** diversity-first symbolic alpha generation while preserving validation, canonical deduplication, lineage, the permanent trial ledger, staged search, scheduler safety, and point-in-time replay.
 
-**Status:** All P0–P15 audit items are closed with regression coverage (473 offline tests green). Promotion gates remain open: equal-budget V2 vs V3 replay and small explicitly named live V3 campaigns must justify promotion before the default changes.
+**Status after second audit:** most P0–P15 implementation work is complete. The remaining issues are concentrated in P4/P5/P6/P7/P9/P15. Keep those items open until the implementation and regressions below are complete.
 
-**Live default:** unchanged. V2 remains the default unless `--strategy`, `--motif`, or `--dry-plan` explicitly selects V3.
+**Live default:** V2 remains the default unless V3 is explicitly selected.
 
 ---
 
 # P0 — Diversity identities and source metadata
 
-## P0.1 Child source profile
-
-- [x] `derive_source_profile()` returns field IDs, datasets, categories, types, primary family, and cross-dataset flag.
-- [x] Single-dataset children use that dataset as `primary_family`.
-- [x] Multi-dataset children use a stable composite family such as `multi:analyst4+fundamental2`.
-- [x] Normal mutation children recompute family/source metadata from the child.
-- [x] **Fix crossover family persistence.** `_crossover_proposal()` derives the child profile once and sets `Proposal.family = profile["primary_family"]`.  
-  **Regressions:** `test_crossover_child_family_matches_its_own_source_profile`, `test_v2_mutation_child_family_is_derived_from_the_child`.
-
-## P0.2 Structural identities
-
-- [x] Keep `canonical_key`.
-- [x] Keep existing `skeleton_hash` behavior.
-- [x] Add `grammar_skeleton` / `grammar_skeleton_hash`.
-- [x] Add `semantic_skeleton` / `semantic_skeleton_hash`.
-- [x] Same topology + different fields collapse under grammar hash.
-- [x] Dataset/category source changes remain visible under semantic hash.
-- [x] Numeric-only variants collapse under grammar/semantic hashes.
-
-## P0.3 Archive niche identity
-
-- [x] Archive niches use topology-preserving grammar/semantic hashes.
-- [x] Niche metadata includes family, dataset/category sets, motif, depth, field count, cross-dataset flag, turnover bucket, mutation type, and generation mode.
-- [x] Operator sets are descriptive metadata only.
+- [x] Child source profile exposes fields, datasets, categories, types, primary family, and cross-dataset flag.
+- [x] Single-source and multi-source family derivation are stable.
+- [x] Mutation children derive family from the child.
+- [x] Crossover children derive family from the child.
+- [x] Canonical, parameter-skeleton, grammar-skeleton, and semantic-skeleton identities remain distinct.
+- [x] Archive niches use topology-preserving identities.
 
 ---
 
 # P1 — Typed expression grammar
 
-- [x] `FieldNode`, `LiteralNode`, `CallNode`, `ExprNode`.
-- [x] Reuse `scripts/compatibility.py`; no second type system.
-- [x] Validate known arity/type constraints before generated calls are accepted.
+- [x] Typed AST.
+- [x] Reuse `compatibility.py`.
+- [x] Arity/type validation.
 - [x] Deterministic FASTEXPR rendering.
-- [x] Complexity budgets for depth, nodes, fields, and binary operators.
-- [x] Grammar tests require no BRAIN calls.
-- [x] Tolerant parsing covers real stored shapes such as `trade_when(a>b,...)` with fallback hashing for unmodelled legacy syntax.
+- [x] Complexity limits.
+- [x] Tolerant parsing for stored legacy expressions.
 
 ---
 
 # P2 — Motif registry
 
-- [x] `Motif` registry replaces a large flat template catalogue as the V3 search primitive.
-- [x] Single-source motifs: level, momentum/reversion/change/acceleration, smoothing, volatility adjustment, group transforms, ranked level.
-- [x] Two-source motifs: spread, ratio, rank difference, normalized difference, confirmation/contrarian, cross-dataset composite.
-- [x] Event/expectation motifs exist and are gated by type/dataset metadata.
-- [x] **Make event/expectation eligibility role-aware.** Semantic roles (actual, estimate, revision, event/surprise, …) are inferred deterministically and `motif_eligible()` requires compatible roles, not just dataset membership.  
-  **Regressions:** `test_event_expectation_motifs_are_role_aware_not_dataset_aware`, `test_field_roles_are_inferred_deterministically` (positive and negative).
+- [x] Single-source motifs.
+- [x] Two-source motifs.
+- [x] Cross-dataset composite.
+- [x] Role-aware event/expectation motifs.
+- [x] Deterministic role inference + positive/negative eligibility tests.
 
 ---
 
-# P3 — Independent deterministic recipes
+# P3 — Deterministic recipes
 
-- [x] Per-proposal RNG seed includes campaign, global seed, field IDs, motif, recipe index, and parents.
-- [x] Unrelated proposals do not perturb an existing proposal's recipe.
-- [x] Independently sample lookback, smoothing, decay, neutralization, group, truncation, normalization, winsorization, rank/zscore, and sign.
-- [x] Persist recipe index + full recipe metadata.
-- [x] One field can produce multiple reproducible recipes.
+- [x] Per-proposal deterministic RNG.
+- [x] Independent recipe dimensions.
+- [x] Recipe index + full recipe provenance.
+- [x] Unrelated proposal insertion does not perturb an existing recipe.
 
 ---
 
@@ -79,123 +58,107 @@
 - [x] `mutate`
 - [x] `crossover`
 - [x] `mixed`
-- [x] Every realized V3 proposal records its generation mode; unavailable lineage modes fall back honestly.
+- [x] Realized mode is reported honestly when lineage modes fall back.
 
-## P4.2 Explore
+## P4.2 Explore / structural novelty
 
-- [x] Prefer unseen motifs and under-tested fields/families.
-- [x] Post-materialization novelty screening sees grammar/semantic history.
-- [x] **Plan grammar/semantic novelty before materialization.** Explore slots budget unseen grammar skeletons/semantic structures and sparse archive cells from grammar/semantic counts + archive occupancy before re-seating history-saturated structures.  
-  **Regression:** `test_explore_slots_budget_unseen_structures_before_repeats`.
-- [x] **Make cross-dataset motifs reachable in ordinary planning.** Motifs requiring distinct datasets draw partners from the compatible global source pool, so `cross_dataset_composite` is reachable in ordinary planning.  
-  **Regression:** `test_ordinary_planning_produces_a_cross_dataset_motif` (deterministic fixture).
+- [x] Under-tested fields/families and unseen motifs influence explore allocation.
+- [x] Cross-dataset motifs are reachable in ordinary planning.
+- [x] Grammar/semantic history and archive occupancy are consulted before materialization.
+- [ ] **Make the planned structure exactly match the materialized structure.**  
+  Current planner novelty scoring builds a representative AST with `grammar.Recipe()`; materialization later samples the real deterministic recipe. Topology-changing recipe choices such as rank vs zscore, winsorization, or sign can therefore change the grammar hash after the planner allocated the slot.  
+  **Do:** during `plan_campaign()`, derive the exact recipe using the same `recipe_seed(campaign_id, seed, fields, motif_id, recipe_index, parent_ids)` inputs used by materialization; build/hash that exact AST.  
+  **Regression:** plan against saturated history → materialize the selected explore slots → assert the **actual proposal** grammar/semantic hashes satisfy the planner's unseen/sparse guarantee.
 
 ## P4.3 Exploit
 
-- [x] Prefer proven motifs within observed family evidence.
-- [x] **Support proven-structure transfer to new datasets/sources.** Proven motif/semantic evidence seeds compatible new datasets instead of being keyed only to the current family.  
-  **Regression:** `test_exploit_transfers_proven_structure_to_a_new_source` (“proven structure → new source”).
+- [x] Proven motifs can transfer from one family to a compatible new dataset.
+- [ ] **Either implement semantic-structure transfer or narrow the contract.**  
+  Current code transfers `motif_id` evidence via `proven_anywhere`; it does not generally learn “this semantic skeleton worked, transfer that structure to a nearby source”.  
+  **Option A:** persist/query successful semantic-skeleton evidence and use it in exploit slot selection.  
+  **Option B:** change docs/tests from “proven motif/semantic structure transfer” to the narrower implemented guarantee: “proven motif → compatible new source”.  
+  **Regression if A:** prove a successful semantic structure influences exploit selection even when motif identity alone is insufficient.
 
-## P4.4 Mutate
+## P4.4 Mutation vocabulary
 
-Existing concrete edits include field swap, template change, window change, decay change, neutralization change, group transform, component removal, and signal combination.
-
-- [x] Keep failure-directed repair.
-- [x] Implement real V3 `dataset_swap`.
-- [x] Implement real V3 `motif_change`.
-- [x] Implement real V3 `normalization_change`.
-- [x] Implement real V3 `group_change`.
-- [x] Implement typed `subtree_replace`.
-- [x] Normalize `add_component` / structural-combine naming as a stable concrete operation.  
-  **Done for all mutation items:** typed AST edits with AST/type/complexity validation and a stable persisted `operation`. **Regressions:** `test_every_v3_mutation_operation_is_generatable` (one positive case per promised operation), `test_structural_dataset_swap_moves_to_another_dataset`, `test_structural_normalization_change_flips_the_normalizer`, `test_structural_group_change_moves_one_level`, `test_structural_add_component_combines_a_fresh_source`, `test_add_component_is_the_stable_combine_operation_name`.
+- [x] Failure-directed repair.
+- [x] `dataset_swap`.
+- [x] `motif_change`.
+- [x] `normalization_change`.
+- [x] `group_change`.
+- [x] `subtree_replace`.
+- [x] `add_component`.
+- [x] Stable concrete `operation` provenance.
+- [x] Type/arity/complexity validation.
+- [ ] **Honor adaptive mutation-operation allocation at realization time.**  
+  A slot can be budgeted for operation X, but if X cannot apply to that parent, the mutation path can fall back to another structural edit or repair. The campaign then consumes X's planned budget without actually testing X.  
+  **Do:** choose one explicit contract:
+  1. strict realization — an inapplicable pinned operation causes deterministic reallocation to another parent/slot before materialization; or
+  2. honest fallback — persist `planned_operation` and `realized_operation`, charge empirical statistics to the realized operation, and expose fallback counts.
+  **Regression:** pin an operation that cannot apply to the selected parent and prove the resulting ledger/allocation is honest.
 
 ---
 
 # P5 — Archive → generator loop
 
-- [x] `plan_campaign()` produces explicit slots with mode, family, motif, parents, recipe index, and reason.
-- [x] Consume `archive.allocate_families()`.
-- [x] Enforce bounded family share.
-- [x] Reserve under-tested-family exploration.
-- [x] Consume `archive.parents()`.
-- [x] Parent selection rotates across archive families/niches.
-- [x] Planned budget equals requested budget.
+- [x] Family budgets consume archive evidence.
+- [x] Parent selection consumes archive elites.
+- [x] Family caps/exploration reserve are enforced.
 - [x] Same DB snapshot + seed reproduces the same plan.
-- [x] Archive state affects actual generation.
+- [ ] **Remove stale archive cells during rebuild.**  
+  `archive.rebuild()` currently upserts current cells but does not remove obsolete cells. Because niche version participates in the cell identity and `parents()` reads all rows, a long-lived DB can retain pre-current-version niches after a rebuild.  
+  **Do:** treat `archive_cells` as derived state and atomically replace it, or delete cells whose stored `niche_version != NICHE_VERSION` before/within rebuild.  
+  **Regression:** seed an old-version archive cell, run rebuild, assert the stale cell cannot appear in occupancy or parent selection.
+- [ ] **Define and enforce archive refresh lifecycle.**  
+  V3 planning reads the current `archive_cells` table but `generate`/plan does not automatically rebuild it. Newly settled candidates therefore may not affect the next campaign until a manual rebuild happens.  
+  **Do:** pick one explicit lifecycle:
+  - rebuild before V3 planning;
+  - rebuild after batches of settled outcomes; or
+  - require an explicit archive-refresh step and enforce/check freshness before planning.  
+  **Regression:** settle a new candidate and prove the next V3 plan can use it without undocumented manual intervention.
 
 ---
 
 # P6 — Crossover
 
-## P6.1 Structural distance
-
-- [x] `grammar_distance(A, B) -> [0,1]`.
-- [x] Operator-tree difference.
-- [x] Dataset-set Jaccard distance.
-- [x] Category-set Jaccard distance.
-- [x] Field-count difference.
-- [x] Depth difference.
-- [x] Optional motif mismatch component.
-
-## P6.2 Parent selection
-
-- [x] Reject same-grammar/near-identical pairs when better alternatives exist.
-- [x] **Use distance as a real selection objective.** Eligible pairs are scored with `grammar_distance()` (motif IDs included when known) and the structurally most distant pair wins deterministically; the seeded rng only breaks exact ties.  
-  **Regression:** `test_crossover_distance_is_a_selection_objective_not_only_a_filter`.
-
-## P6.3 Crossover forms and complexity
-
-- [x] `add(rank(A), rank(B))`.
-- [x] `subtract(rank(A), rank(B))`.
-- [x] `add(zscore(A), zscore(B))`.
-- [x] `multiply(rank(A), rank(B))`.
-- [x] Complexity budget scales to evolved parents under a hard ceiling.
-- [x] Persist both parent IDs.
-- [x] Child family must be derived from final child sources.  
-  **Regression:** `test_crossover_child_family_matches_its_own_source_profile` (genuinely cross-family parent pair).
+- [x] Two-parent lineage.
+- [x] Bounded complexity.
+- [x] Child-derived family.
+- [x] Distance is an actual selection objective rather than only a filter.
+- [ ] **Pass real source metadata into `grammar_distance()`.**  
+  `_pair_distance()` currently parses expression strings without the field catalog, so source fields become dataset/category `unknown`; dataset/category Jaccard components therefore contribute little or nothing during real parent selection.  
+  **Do:** pass the generator/catalog metadata into distance calculation, or compute source-distance components from persisted source profiles/archive dimensions.  
+  **Regression:** use parent expressions with the same topology/depth but known different datasets/categories and assert dataset/category distance changes pair ordering.
 
 ---
 
 # P7 — Novelty-aware generation
 
-Implemented novelty facts:
-
-- [x] exact-candidate novelty
-- [x] current `skeleton_hash` novelty
-- [x] grammar-skeleton novelty
-- [x] semantic-skeleton novelty
-- [x] dataset novelty
-- [x] motif novelty
-
-Outcomes:
-
-- [x] `KEEP`
-- [x] `DOWNWEIGHT`
-- [x] `SKIP_REDUNDANT`
-- [x] Skips consume no simulation capacity and remain in `research_trials`.
-
-Remaining dimensions:
-
-- [x] **Category novelty.** Category history is tracked separately from dataset history and exposed as a `NoveltyReport` component.  
-  **Regression:** `test_category_novelty_is_tracked_separately_from_datasets`.
-- [x] **Archive niche sparsity.** Scored from actual archive-cell occupancy/member counts, not grammar frequency.  
-  **Regression:** `test_archive_sparsity_reads_cell_occupancy_not_grammar_frequency`.
-- [x] **Numeric parent→child grammar distance.** `screen_novelty()` scores `grammar_distance(parent, child)` from parent grammar/source metadata; equality-only penalty is retained only as a fallback.  
-  **Regression:** `test_parent_child_distance_is_numeric_not_equality_only`, `test_parent_child_distance_sees_parents_from_an_earlier_campaign`.
-- [x] **Full skip provenance.** Skipped mutations/crossovers retain their parents and operation (P10 skip-lineage work).  
-  **Regressions:** `test_skipped_mutation_preserves_generation_parent_and_operation`, `test_skipped_crossover_preserves_both_parents`.
+- [x] Exact novelty.
+- [x] Parameter-skeleton novelty.
+- [x] Grammar novelty.
+- [x] Semantic novelty.
+- [x] Dataset novelty.
+- [x] Category novelty.
+- [x] Motif novelty.
+- [x] Archive sparsity.
+- [x] Numeric parent→child distance.
+- [x] `KEEP`, `DOWNWEIGHT`, `SKIP_REDUNDANT`.
+- [x] Skips consume no simulation capacity and preserve lineage.
+- [ ] **Evaluate crossover novelty against both parents.**  
+  `screen_proposals()` currently loads only `parent_ids[0]`. For a two-parent child, novelty can therefore look favorable relative to parent A while being a near-clone of parent B.  
+  **Do:** compute both parent distances. Recommended clone-protection signal: `min(distance_to_parent_A, distance_to_parent_B)`; optionally also report the mean/max for diagnostics. Persist enough detail to audit the decision.  
+  **Regression:** create a crossover child close to parent B but far from parent A and prove the novelty score/decision reflects the close parent.
 
 ---
 
 # P8 — Ranking integration
 
-- [x] Expected quality, exact novelty, grammar novelty, semantic novelty, information gain, family diversity, failure risk, duplicate penalty.
-- [x] Correlated novelty contribution is bounded/capped.
-- [x] Ranking remains advisory.
-- [x] **Make `archive_sparsity` a real archive signal.** Derived from archive niche occupancy/member counts, distinct from grammar novelty.  
-  **Regressions:** `test_archive_sparsity_is_real_occupancy_not_grammar_frequency` (equal grammar frequency, differing sparsity), `test_ranking_penalises_parameter_clones_and_rewards_new_structure`.
-- [x] **Clarify `portfolio_diversification` stage.** Documented and tested as submission-stage-only: it never affects simulation priority, only submission ranking.  
-  **Regression:** `test_portfolio_diversification_is_submission_stage_only`.
+- [x] Expected quality, novelty, information gain, family diversity, duplicate penalty, failure risk.
+- [x] Grammar/semantic novelty terms are bounded.
+- [x] Archive sparsity comes from archive occupancy rather than grammar-frequency duplication.
+- [x] Portfolio diversification is submission-stage-only.
+- [ ] **Dependency:** final archive-sparsity correctness requires P5 archive lifecycle/freshness to be closed.
 
 ---
 
@@ -203,147 +166,136 @@ Remaining dimensions:
 
 ## P9.1 Motifs
 
-- [x] Persist motif outcome counters.
-- [x] Bounded Thompson-style motif allocation.
-- [x] Reserve exploration for under-tested motifs.
-- [x] Successful motifs can earn more budget.
-- [x] No motif can monopolize the campaign.
+- [x] Persist outcome counters.
+- [x] Bounded Thompson-style allocation.
+- [x] Exploration floor.
+- [x] Max-share protection.
 
-## P9.2 Mutation/source transitions
+## P9.2 Mutation/source statistics
 
-- [x] **Record correct source→target families.** Source family = parent/source lineage; target family = final child-derived profile.  
-  **Regression:** `test_generation_stats_preserve_cross_family_mutation_lineage` (cross-family mutation).
-- [x] **Record concrete mutation operation, not only broad repair class.** `mutation_parameters["operation"]` (normalized operation vocabulary) is aggregated separately from `mutation_type`.  
-  **Regression:** `test_generation_stats_learn_concrete_operations_apart_from_repair_class`.
-- [x] **Implement adaptive mutation allocation.** Bounded Thompson-style budget across concrete mutation operations from corrected historical outcomes, analogous to motif allocation, with reserved exploration.  
-  **Regressions:** `test_mutation_allocation_rewards_success_and_reserves_exploration` (successful operation gains budget, untested operation retains exploration), `test_mutation_allocation_responds_to_new_evidence`.
+- [x] Source family comes from parent lineage.
+- [x] Target family comes from child profile.
+- [x] Concrete mutation operation is separate from broad repair class.
+- [x] Bounded mutation-operation allocation exists.
+- [ ] **Do not let skipped duplicate trials inherit the existing candidate's success outcome.**  
+  A `SKIP_REDUNDANT` trial may point to an already successful canonical candidate. `refresh_generation_stats()` joins candidate status, so repeated skipped rediscoveries can be counted as simulated/pass evidence even though no new simulation occurred.  
+  **Do:** include trial decision/validation fields in aggregation. A skipped rediscovery may count as a generator attempt if useful, but it must contribute zero to `simulated`, `is_pass`, `corr_pass`, and `active`.  
+  **Regression:** start with one existing IS_PASS candidate, rediscover/skip it several times, refresh stats, and prove pass/simulation counters do not increase.
+- [ ] **Keep planned vs realized mutation-operation accounting honest.**  
+  Close together with P4.4: statistics and future allocation must learn from the operation that actually ran, while optionally retaining the planned operation for policy diagnostics.
 
 ---
 
 # P10 — Database / provenance
 
-- [x] Candidate fields expose strategy, generation mode, motif, recipe ID/index, grammar hash, semantic hash, source profile, policy/grammar versions.
-- [x] `research_trials` records campaign/candidate IDs, V3 mode/version/motif/recipe, hashes, source profile, decision, and reason.
-- [x] Queued crossover lineage persists both parents.
-- [x] Historical rows are migrated in place; no destructive rewrite.
-- [x] **Preserve complete lineage for novelty-skipped proposals.** `record_generation_decision()` + caller persist `parent_ids`, generation, mutation type, and mutation parameters for skipped proposals.  
-  **Regressions:** `test_skipped_mutation_preserves_generation_parent_and_operation`, `test_skipped_crossover_preserves_both_parents`.
+- [x] V3 strategy/mode/motif/recipe/hash/source profile are queryable.
+- [x] Queued mutation/crossover lineage persists.
+- [x] Skipped mutation/crossover lineage persists.
+- [x] Historical rows are preserved.
 
 ---
 
 # P11 — Versioning
 
-- [x] V3 identity: `catalog-generator-v3`.
-- [x] V2 path remains honestly labelled `catalog-generator-v2`.
-- [x] `GRAMMAR_VERSION`.
-- [x] `MOTIF_REGISTRY_VERSION`.
-- [x] `GENERATION_POLICY_VERSION`.
+- [x] V2 and V3 generator identities are distinct.
+- [x] Grammar, motif-registry, and generation-policy versions are explicit.
+- [x] V2 remains honestly labelled and backward compatible.
 
 ---
 
 # P12 — CLI
 
-- [x] V2-compatible `python -m wq generate`.
-- [x] `python -m wq mutate`.
+- [x] V2 generate path remains available.
 - [x] V3 `--strategy`.
 - [x] V3 `--motif`.
-- [x] Explicit `crossover` command.
-- [x] `--dry-plan` performs no BRAIN calls and no queue writes.
-- [x] Dry plan reports mode/family/motif/dataset/grammar/semantic distribution.
+- [x] `crossover` command.
+- [x] `--dry-plan` performs no BRAIN calls or queue writes.
+- [x] Dry plan reports V3 distributions.
 
 ---
 
 # P13 — Diversity report
 
-- [x] trial count
-- [x] unique exact candidates
-- [x] unique fields/datasets/categories
-- [x] current/grammar/semantic skeleton counts
-- [x] motif count
-- [x] entropy-based effective motif/dataset/grammar/semantic/family counts
-- [x] cross-dataset share
-- [x] duplicate / near-duplicate rates
-- [x] median parent→child grammar distance
-- [x] median pairwise PnL correlation when cached data permits
-- [x] IS_PASS / CORR_PASS / ACTIVE breakdowns by motif
+- [x] Exact/field/dataset/category diversity.
+- [x] Parameter/grammar/semantic structure diversity.
+- [x] Motif and effective-count metrics.
+- [x] Cross-dataset share.
+- [x] Duplicate/near-duplicate rates.
+- [x] Parent-child grammar distance.
+- [x] Pairwise PnL correlation when available.
+- [x] Funnel outcomes by motif.
 
 ---
 
 # P14 — Point-in-time policy replay
 
-- [x] `grammar_novelty`.
-- [x] `semantic_novelty`.
-- [x] `archive_v3`.
-- [x] `mixed_v3`.
-- [x] Decision cards exclude outcomes and raw hidden state.
-- [x] Outcomes/ranking/surrogate evidence are resolved as-of the decision clock.
-- [x] Leakage self-checks cover future candidates and future outcome stages.
-- [x] Metrics include simulation efficiency, top-k recall, waste, effective V3 diversity, turnover/correlation failures, and robustness adjustment.
-- [x] **Add the explicit archive-V2 comparison requested by the benchmark matrix.** `archive_v2` reproduces the intended pre-V3 global top-elite archive behavior and is included in the benchmark matrix for equal-budget comparisons.  
-  **Regressions:** `test_archive_v2_reproduces_pre_v3_global_top_elite_selection`, `test_archive_v2_is_in_the_benchmark_matrix`.
+- [x] Grammar novelty.
+- [x] Semantic novelty.
+- [x] Archive V2.
+- [x] Archive V3.
+- [x] Mixed V3.
+- [x] Point-in-time leakage protections.
+- [x] Equal-budget comparison framework.
+- [x] Efficiency/diversity/robustness metrics.
 
 ---
 
 # P15 — Tests / regression
 
-Existing coverage:
+Existing V3 regression coverage now includes:
 
-- [x] AST typing / arity.
-- [x] motif eligibility and rendering.
-- [x] recipe determinism/independence.
-- [x] source-profile derivation.
-- [x] grammar/semantic hash behavior.
-- [x] structural distance.
-- [x] archive niche identity.
-- [x] family budget conservation.
-- [x] crossover lineage/complexity.
-- [x] deterministic plans.
-- [x] novelty skip/no-capacity behavior.
-- [x] V3 provenance columns.
-- [x] generation-stat refresh.
-- [x] legacy DB migration.
-- [x] real comparison-expression parsing.
-- [x] V2 canonical/dedup/queue/replay invariants remain covered.
+- [x] crossover child family
+- [x] role-aware event motifs
+- [x] cross-dataset reachability
+- [x] explore novelty budgeting proxy
+- [x] proven motif transfer
+- [x] every promised structural mutation operation
+- [x] distance-driven crossover selection
+- [x] category novelty / archive sparsity / parent distance
+- [x] real archive sparsity ranking
+- [x] source→target mutation lineage
+- [x] concrete operation statistics
+- [x] adaptive mutation allocation
+- [x] skipped mutation/crossover provenance
+- [x] archive-V2 replay baseline
 
-Required regressions before P15 can be closed:
+Required before P15 is truly closed:
 
-- [x] Crossover `family == source_profile.primary_family`.
-- [x] Ordinary V3 planning produces at least one genuine cross-dataset motif under a deterministic fixture.
-- [x] Positive test for each promised V3 mutation operation.
-- [x] Negative/positive role-semantic tests for event/expectation motifs.
-- [x] Novelty report tests category novelty, archive sparsity, and numeric parent-child distance.
-- [x] Ranking test distinguishes archive sparsity from grammar novelty.
-- [x] Generation stats preserve `source_family != target_family` when appropriate.
-- [x] Generation stats learn concrete mutation operation separately from repair class.
-- [x] Skipped mutation preserves generation/parent/operation.
-- [x] Skipped crossover preserves both parents.
-- [x] Adaptive mutation allocation responds to evidence while reserving exploration.
-- [x] Archive-V2 replay policy/equivalence is benchmarked.
+- [ ] **Actual planned-vs-materialized structure novelty regression.**  
+  Plan and materialize the same slots; test the final proposal hashes, not the planner's proxy hashes.
+- [ ] **Semantic-transfer contract regression.**  
+  Required only if P4.3 keeps the stronger semantic-structure-transfer claim.
+- [ ] **Stale archive-version cleanup regression.**
+- [ ] **Archive refresh lifecycle regression.**
+- [ ] **Crossover dataset/category distance regression using real metadata.**
+- [ ] **Two-parent crossover novelty-distance regression.**
+- [ ] **Skipped duplicate does not create simulated/pass evidence regression.**
+- [ ] **Pinned mutation operation fallback/reallocation accounting regression.**
+- [ ] **Execution evidence.**  
+  The named tests exist in the repo, but current GitHub head has no attached Actions/check result proving the documented full-suite count. Keep completion wording tied to reproducible test execution rather than a documentation-only number.
 
 ---
 
-# P16 — Promotion order
+# P16 — Remaining implementation order
 
-Do not reinterpret P0–P15 as a reason to switch the live default. Close the reopened audit items first, then benchmark.
-
-Recommended remaining implementation order:
+Recommended order:
 
 ```text
-1. P0/P6 crossover family correctness
-2. P4 cross-dataset planning + mutation vocabulary
-3. P7 novelty completeness
-4. P8 real archive sparsity
-5. P9 source→target stats + adaptive mutation allocation
-6. P10 skipped-lineage provenance
-7. P2 semantic-role tightening
-8. P14 archive-V2 benchmark
-9. P15 regression closure
-10. replay + small live V3 campaigns
+1. P9 skipped-trial outcome contamination
+2. P6 real metadata in crossover distance
+3. P5 stale archive cleanup
+4. P5 archive refresh lifecycle
+5. P4.2 exact planned-vs-materialized structure hashes
+6. P4.4 planned vs realized mutation operation accounting
+7. P7 both-parent crossover novelty
+8. P4.3 semantic-transfer contract
+9. P15 full regression closure
+10. equal-budget replay + small live campaigns
 ```
 
-- [ ] **Keep V2 as live default until comparative evidence exists.**
-- [ ] Run equal-budget V2 vs V3 replay after the above fixes.
-- [ ] Run small explicitly named live V3 campaigns only after replay is clean.
+- [ ] Keep V2 as live default until the above implementation gaps are closed.
+- [ ] Run equal-budget V2 vs V3 replay after P15 closes.
+- [ ] Run small explicitly named live V3 campaigns after replay is clean.
 
 ---
 
@@ -364,7 +316,7 @@ Recommended family cap:
 max_family_share = 0.35–0.50
 ```
 
-Promote only if evidence shows improvement in:
+Promote only if evidence improves:
 
 - [ ] simulation efficiency
 - [ ] grammar diversity
@@ -381,18 +333,17 @@ without material degradation in:
 
 # Final acceptance
 
-Generator V3 is ready for promotion when:
+Generator V3 is implementation-complete when:
 
-- [x] All open P0–P15 audit items above have regression coverage.
+- [ ] All remaining P4/P5/P6/P7/P9/P15 audit items are closed with regressions.
 - [x] Exact, parameter, grammar, and semantic diversity are separately measurable.
-- [x] Archive niches preserve expression topology.
-- [x] One field can generate multiple deterministic recipes.
-- [x] Multiple economic motifs and multi-field expressions exist.
+- [x] Archive niches preserve topology.
+- [x] Multi-recipe, multi-field, cross-dataset generation exists.
 - [x] Archive family/parent decisions affect generation.
 - [x] Two-parent crossover works under bounded complexity.
 - [x] V3 is auditable and reproducible.
-- [x] V3 can be evaluated with point-in-time-safe replay.
-- [ ] Equal-budget replay and small live campaigns justify promotion over V2.
+- [x] Point-in-time replay exists.
+- [ ] Equal-budget replay and small live campaigns justify promotion.
 - [x] Until then, V2 remains the default.
 
 > **Core rule: search over hypotheses, not merely field names.**
