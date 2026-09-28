@@ -15,9 +15,9 @@
 > `GENERATOR_VERSION_V3 = "catalog-generator-v3"`. **P16 promotion and P17 rollout gates remain
 > open** — they need live V3 campaign evidence, not more code.
 >
-> Naming note: the P10 field `recipe_id` is realized as `recipe_index` (the per-slot recipe
-> ordinal) plus a `recipe` JSON blob holding every sampled dimension, which is what the replay
-> and report paths actually read.
+> Naming note: candidate rows carry both `recipe_id` (a stable `motif:index` label) and the
+> `recipe_index` ordinal, plus a `recipe` JSON blob holding every sampled dimension — the blob is
+> what the replay and report paths read.
 
 ---
 

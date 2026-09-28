@@ -148,6 +148,14 @@ ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: Indexes that reference ADDED_COLUMNS, so they are created only after an existing database has
+#: been upgraded in place (``_init_schema`` runs this list after ``_ensure_columns``).
+V3_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_candidates_grammar ON candidates(grammar_skeleton_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_candidates_motif ON candidates(motif_id)",
+    "CREATE INDEX IF NOT EXISTS idx_research_trials_motif ON research_trials(motif_id)",
+)
+
 # IS gates from SKILL.md Section 5, used only when BRAIN's own IS checks are absent.
 IS_THRESHOLDS = {"sharpe": 1.25, "fitness": 1.1, "turnover_min": 0.01, "turnover_max": 0.20}
 
@@ -370,8 +378,9 @@ SCHEMA: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_candidates_queue ON candidates(status, priority DESC, id)",
     "CREATE INDEX IF NOT EXISTS idx_candidates_skeleton ON candidates(skeleton_hash)",
     "CREATE INDEX IF NOT EXISTS idx_candidates_brain_alpha ON candidates(brain_alpha_id)",
-    "CREATE INDEX IF NOT EXISTS idx_candidates_grammar ON candidates(grammar_skeleton_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_candidates_motif ON candidates(motif_id)",
+    # NOTE: the V3 indexes on candidates(grammar_skeleton_hash/motif_id) and
+    # research_trials(motif_id) are created in _init_schema *after* _ensure_columns, because an
+    # existing research.db predates those columns and CREATE INDEX would fail on it.
     """
     CREATE TABLE IF NOT EXISTS simulations (
         id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -608,7 +617,6 @@ SCHEMA: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_research_trials_campaign ON research_trials(campaign_id, creation_order, id)",
     "CREATE INDEX IF NOT EXISTS idx_research_trials_candidate ON research_trials(candidate_id)",
-    "CREATE INDEX IF NOT EXISTS idx_research_trials_motif ON research_trials(motif_id)",
     # Adaptive motif/mutation allocation evidence (P9). Populated by refresh_generation_stats.
     """
     CREATE TABLE IF NOT EXISTS motif_stats (
@@ -1026,6 +1034,10 @@ class ResearchDB:
             for statement in SCHEMA:
                 conn.execute(statement)
             self._ensure_columns(conn)
+            # Generator V3 provenance indexes (P10). They reference ADDED_COLUMNS, so they can
+            # only be created once an older candidates/research_trials table has been upgraded.
+            for statement in V3_INDEXES:
+                conn.execute(statement)
             # Scope is part of the coverage identity; upgrade a pre-scope table before any
             # index references the new column.
             self._migrate_field_coverage(conn)

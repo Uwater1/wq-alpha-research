@@ -432,3 +432,51 @@ def test_batch_simulate_skips_invalid_settings_before_calling_brain(monkeypatch,
 
     assert bs.main() == 0
     assert "Nothing to do" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# schema migration: an existing research.db gains new columns in place
+# ---------------------------------------------------------------------------
+
+
+def test_open_upgrades_a_pre_v3_database_in_place(tmp_path):
+    """A database predating the V3 columns must still open: ALTER before CREATE INDEX.
+
+    The fixture is built by taking a current database and dropping the V3 columns back out,
+    which is exactly what an older research.db looks like to this code path.
+    """
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    with rdb.ResearchDB.open(path) as store:
+        store.queue_candidate("rank(close)", {"decay": 6}, signal_family="pv1")
+
+    dropped = (
+        "generator_strategy", "generation_mode", "motif_id", "recipe_id", "recipe_index",
+        "grammar_skeleton_hash", "semantic_skeleton_hash", "source_profile_json",
+        "generator_policy_version", "grammar_version",
+    )
+    conn = sqlite3.connect(str(path))
+    for index in ("idx_candidates_grammar", "idx_candidates_motif", "idx_research_trials_motif"):
+        conn.execute(f"DROP INDEX IF EXISTS {index}")
+    for column in dropped:
+        conn.execute(f"ALTER TABLE candidates DROP COLUMN {column}")
+    conn.execute("ALTER TABLE research_trials DROP COLUMN motif_id")
+    conn.commit()
+    conn.close()
+
+    with rdb.ResearchDB.open(path) as store:
+        columns = {row["name"] for row in store.query("PRAGMA table_info(candidates)")}
+        trial_columns = {row["name"] for row in store.query("PRAGMA table_info(research_trials)")}
+        indexes = {row["name"] for row in store.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name IN ('candidates','research_trials')"
+        )}
+        assert {"generator_strategy", "generation_mode", "motif_id", "recipe_id", "recipe_index",
+                "grammar_skeleton_hash", "semantic_skeleton_hash",
+                "source_profile_json"} <= columns
+        assert {"motif_id", "decision", "skip_reason"} <= trial_columns
+        assert {"idx_candidates_grammar", "idx_candidates_motif", "idx_research_trials_motif"} <= indexes
+        # The pre-existing row survives the upgrade untouched.
+        row = store.get_candidate(1)
+        assert row["expression"] == "rank(close)"
+        assert row["grammar_skeleton_hash"] is None
