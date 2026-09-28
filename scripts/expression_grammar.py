@@ -64,16 +64,67 @@ class GrammarError(ValueError):
 # ---------------------------------------------------------------------------
 
 
+#: Semantic roles a source field can carry (P2). Event/expectation motifs are gated by
+#: these roles, never by dataset membership alone: being in ``analyst4`` does not make one
+#: field an "actual" and another an "expectation".
+ROLE_ACTUAL = "actual"
+ROLE_ESTIMATE = "estimate"
+ROLE_REVISION = "revision"
+ROLE_EVENT = "event"
+ROLE_SURPRISE = "surprise"
+ROLE_GENERIC = "generic"
+#: Every role that carries event/expectation semantics.
+EVENT_ROLES = (ROLE_ACTUAL, ROLE_ESTIMATE, ROLE_REVISION, ROLE_EVENT, ROLE_SURPRISE)
+
+#: Explicit ``field_id -> roles`` overrides for ids the inference cannot see through.
+FIELD_ROLE_OVERRIDES: dict[str, tuple[str, ...]] = {}
+
+#: Ordered inference rules over the lower-cased field id. Deterministic and explainable:
+#: a role is only claimed when the id says so (``est_ptp`` is an estimate; ``assets`` is not).
+_ROLE_PATTERNS: tuple[tuple[tuple[str, ...], "re.Pattern[str]"], ...] = (
+    ((ROLE_SURPRISE,), re.compile(r"surprise|(^|_)sue(_|$)|unexpected")),
+    ((ROLE_REVISION,), re.compile(r"revision|revised|restated")),
+    ((ROLE_ACTUAL,), re.compile(r"(^|_)actual(_|$)|(^|_)reported(_|$)|(^|_)act(_|$)")),
+    ((ROLE_ESTIMATE,), re.compile(r"(^|_)est(_|$)|estimate|forecast|consensus|expected")),
+    ((ROLE_EVENT,), re.compile(r"(^|_)event(_|$)|announcement|earnings_date")),
+)
+
+
+def infer_field_roles(field_id: str) -> tuple[str, ...]:
+    """Deterministic semantic-role tags for one field id (P2); ``("generic",)`` when unknown.
+
+    Roles are inferred from the published field id with an explicit override table, so an
+    event/expectation motif needs fields that actually *say* they are an actual or an
+    estimate — the dataset allow-list alone is never proof of semantics.
+    """
+    name = str(field_id or "")
+    override = FIELD_ROLE_OVERRIDES.get(name) or FIELD_ROLE_OVERRIDES.get(name.lower())
+    if override:
+        return tuple(override)
+    lowered = name.lower()
+    roles: list[str] = []
+    for matched, pattern in _ROLE_PATTERNS:
+        if pattern.search(lowered):
+            roles.extend(matched)
+    return tuple(roles) or (ROLE_GENERIC,)
+
+
 @dataclass(frozen=True)
 class FieldNode:
     field_id: str
     value_type: str = MATRIX
     dataset: str = "unknown"
     category: str = "unknown"
+    #: Semantic roles (P2); empty means "infer from the field id on demand".
+    roles: tuple[str, ...] = ()
 
     @property
     def is_source(self) -> bool:
         return self.value_type in SOURCE_TYPES
+
+    @property
+    def semantic_roles(self) -> tuple[str, ...]:
+        return self.roles or infer_field_roles(self.field_id)
 
 
 @dataclass(frozen=True)
@@ -513,6 +564,7 @@ def field_node_from(info: Any, *, fallback_id: str | None = None) -> FieldNode:
         value_type,
         _identifier(_attr(info, "dataset", default="unknown")),
         _identifier(_attr(info, "category", default="unknown")),
+        infer_field_roles(field_id),
     )
 
 
@@ -738,6 +790,9 @@ class Motif:
     needs_group: bool = False
     #: When set, only fields whose dataset is in this set are eligible (event motifs).
     allowed_datasets: tuple[str, ...] = ()
+    #: Per-input acceptable semantic roles (P2), e.g. an "actual" paired with an
+    #: "estimate". Empty means any role; dataset allow-lists alone never imply roles.
+    role_requirements: tuple[tuple[str, ...], ...] = ()
 
 
 def _apply_sign(node: ExprNode, recipe: Recipe) -> ExprNode:
@@ -908,13 +963,17 @@ MOTIFS: tuple[Motif, ...] = (
     Motif("cross_dataset_composite", "Two group-neutralized sources from different datasets", ("left", "right"), _SOURCE_TYPES,
           _build_cross_dataset_composite, ("two_source", "composite"), needs_group=True),
     Motif("actual_vs_expectation", "Reported value relative to an expectation", ("actual", "expected"), _SOURCE_TYPES,
-          _build_actual_vs_expectation, ("event",), allowed_datasets=EVENT_DATASETS),
+          _build_actual_vs_expectation, ("event",), allowed_datasets=EVENT_DATASETS,
+          role_requirements=((ROLE_ACTUAL,), (ROLE_ESTIMATE,))),
     Motif("estimate_revision", "Revision of an estimate/expectation", ("value",), _SOURCE_TYPES,
-          _build_estimate_revision, ("event",), allowed_datasets=EVENT_DATASETS),
+          _build_estimate_revision, ("event",), allowed_datasets=EVENT_DATASETS,
+          role_requirements=((ROLE_ESTIMATE, ROLE_REVISION),)),
     Motif("event_decay", "Event effect decayed linearly", ("value",), _SOURCE_TYPES,
-          _build_event_decay, ("event",), allowed_datasets=EVENT_DATASETS),
+          _build_event_decay, ("event",), allowed_datasets=EVENT_DATASETS,
+          role_requirements=(EVENT_ROLES,)),
     Motif("surprise_normalization", "Expectation surprise scaled by its own volatility", ("actual", "expected"), _SOURCE_TYPES,
-          _build_surprise_normalization, ("event",), allowed_datasets=EVENT_DATASETS),
+          _build_surprise_normalization, ("event",), allowed_datasets=EVENT_DATASETS,
+          role_requirements=((ROLE_ACTUAL,), (ROLE_ESTIMATE,))),
 )
 
 MOTIF_BY_ID: dict[str, Motif] = {motif.id: motif for motif in MOTIFS}
@@ -932,7 +991,7 @@ def motif_by_id(motif_id: str) -> Motif:
 
 
 def motif_eligible(motif: Motif, fields: Sequence[FieldNode], *, distinct_datasets: bool = False) -> bool:
-    """Metadata/type-driven eligibility; unsupported semantic combinations are refused."""
+    """Metadata/type/role-driven eligibility; unsupported semantic combinations are refused."""
     if len(fields) < len(motif.input_roles):
         return False
     used = fields[: len(motif.input_roles)]
@@ -940,6 +999,9 @@ def motif_eligible(motif: Motif, fields: Sequence[FieldNode], *, distinct_datase
         return False
     if motif.allowed_datasets and not all(field.dataset in motif.allowed_datasets for field in used):
         return False
+    for field, accepted in zip(used, motif.role_requirements):
+        if set(field.semantic_roles).isdisjoint(accepted):
+            return False
     if distinct_datasets and len({field.dataset for field in used}) < 2:
         return False
     return True

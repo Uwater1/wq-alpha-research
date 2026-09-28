@@ -67,6 +67,50 @@ def test_event_motifs_require_supporting_metadata():
     assert grammar.render(node).startswith("ts_decay_linear(")
 
 
+def test_field_roles_are_inferred_deterministically():
+    assert grammar.infer_field_roles("est_ptp") == (grammar.ROLE_ESTIMATE,)
+    assert grammar.infer_field_roles("actual_earnings_per_share_2") == (grammar.ROLE_ACTUAL,)
+    assert grammar.infer_field_roles("eps_revision_1m") == (grammar.ROLE_REVISION,)
+    assert grammar.infer_field_roles("assets") == (grammar.ROLE_GENERIC,)
+    assert grammar.infer_field_roles("close") == (grammar.ROLE_GENERIC,)
+    # An explicit override beats inference.
+    grammar.FIELD_ROLE_OVERRIDES["custom_x"] = (grammar.ROLE_SURPRISE,)
+    try:
+        assert grammar.infer_field_roles("custom_x") == (grammar.ROLE_SURPRISE,)
+    finally:
+        grammar.FIELD_ROLE_OVERRIDES.pop("custom_x", None)
+
+
+def test_event_expectation_motifs_are_role_aware_not_dataset_aware():
+    """P2: 'actual' vs 'expectation' is a role relation, not two dataset memberships."""
+    actual = grammar.FieldNode("actual_earnings_per_share_2", MATRIX, "news12", "news")
+    estimate = grammar.FieldNode("est_eps", MATRIX, "analyst4", "analyst")
+    other_estimate = grammar.FieldNode("est_ptp", MATRIX, "analyst4", "analyst")
+    generic = grammar.FieldNode("close", MATRIX, "pv1", "pv")
+    motif = grammar.motif_by_id("actual_vs_expectation")
+
+    # Positive: an actual paired with an estimate is the promised semantic pair.
+    assert grammar.motif_eligible(motif, [actual, estimate])
+    node = grammar.build_motif("actual_vs_expectation", [actual, estimate], grammar.Recipe())
+    assert grammar.render(node).startswith("divide(subtract(")
+
+    # Negative: two event-dataset estimates are not an actual-vs-expectation pair.
+    assert not grammar.motif_eligible(motif, [estimate, other_estimate])
+    with pytest.raises(grammar.GrammarError):
+        grammar.build_motif("actual_vs_expectation", [estimate, other_estimate], grammar.Recipe())
+
+    # Negative: an actual paired with a role-less event-dataset field is refused — the
+    # dataset allow-list alone is not proof that the pair is actual-vs-expectation.
+    roleless = grammar.FieldNode("volume_rank_60", MATRIX, "analyst4", "analyst")
+    assert not grammar.motif_eligible(grammar.motif_by_id("surprise_normalization"), [actual, roleless])
+
+    # Positive/negative for the single-source event motifs.
+    assert grammar.motif_eligible(grammar.motif_by_id("estimate_revision"), [estimate])
+    assert not grammar.motif_eligible(grammar.motif_by_id("estimate_revision"), [actual])
+    assert grammar.motif_eligible(grammar.motif_by_id("event_decay"), [estimate])
+    assert not grammar.motif_eligible(grammar.motif_by_id("event_decay"), [generic])
+
+
 def test_same_topology_different_fields_shares_grammar_hash():
     fields = diversity.load_field_metadata()
     left = grammar.build_motif("change", [grammar.field_node_from(fields["close"])], grammar.Recipe())
