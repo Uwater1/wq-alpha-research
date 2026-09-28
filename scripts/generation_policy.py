@@ -643,8 +643,10 @@ def plan_campaign(
     context = diversity.novelty_context(db, catalog) if db is not None else diversity.NoveltyContext.empty()
     parents = archive.parents(db, count=parent_pool, seed=seed) if db is not None else []
     proven = _proven_motifs(db, sorted(set(family_slots)))
-    # P4.3: evidence is not keyed to one family. A motif proven anywhere may seed a
-    # compatible new dataset here before any unproven structure is considered.
+    # P4.3 (narrowed contract): evidence is not keyed to one family. A *motif* proven
+    # anywhere may seed a compatible new source here before any unproven structure is
+    # considered. This is motif-level transfer, not a general proven-semantic-skeleton
+    # transfer mechanism.
     proven_anywhere: set[str] = set().union(*proven.values()) if proven else set()
     grammar_counts, semantic_counts = _structure_counts(db, catalog)
     occupancy: dict[str, int] = {}
@@ -829,7 +831,7 @@ def plan_campaign(
             if motif_id in proven.get(slot_family, set()):
                 reason = "proven motif on a new source"
             elif motif_id in proven_anywhere:
-                reason = "proven structure transferred to a new dataset"
+                reason = "proven motif transferred to a compatible new dataset"
             else:
                 reason = "exploit allocation without family-local evidence"
         elif effective_mode == "mutate":

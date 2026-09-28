@@ -923,8 +923,12 @@ def test_planned_structure_hashes_match_materialized_structures(db):
     assert seen
 
 
-def test_exploit_transfers_proven_structure_to_a_new_source(db):
-    """P4.3: a motif proven in one family may seed a compatible new dataset."""
+def test_exploit_transfers_a_proven_motif_to_a_compatible_source(db):
+    """P4.3 (narrowed contract): proven *motif* transfer, not semantic-skeleton transfer.
+
+    Exploit selection reuses a motif id with evidence anywhere as a prior for a compatible
+    new source; it does not generalize an arbitrary proven semantic structure.
+    """
     outcome = db.queue_candidate(
         "rank(ts_delta(close,20))", {"decay": 6}, signal_family="pv1",
         mutation_parameters={"motif_id": "momentum", "generation_mode": "exploit"},
@@ -940,8 +944,8 @@ def test_exploit_transfers_proven_structure_to_a_new_source(db):
     )
     assert plan.slots and all(slot.family == "fundamental6" for slot in plan.slots)
     motifs = {slot.motif_id for slot in plan.slots}
-    assert "momentum" in motifs, "proven structure must transfer to the new dataset"
-    assert any("transferred" in slot.reason for slot in plan.slots)
+    assert "momentum" in motifs, "the proven motif must transfer to the new dataset"
+    assert any("proven motif transferred" in slot.reason for slot in plan.slots)
 
 
 def test_add_component_is_the_stable_combine_operation_name(db):

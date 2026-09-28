@@ -20,7 +20,7 @@ Confirmed complete:
 - [x] Adaptive motif allocation and mutation-operation statistics/allocation.
 - [x] Archive-V2 replay baseline.
 - [x] V2 compatibility and default behavior remain intact.
-- [ ] Close the remaining second-audit gaps below before treating P0–P15 as fully implementation-complete.
+- [x] Second-audit gaps (P4.2/P4.3/P4.4/P5/P6/P7/P9.2/P15) are closed with regressions; only promotion evidence remains.
 
 ## Architecture
 
@@ -88,12 +88,10 @@ crossover 10%
 - [x] Parent selection consumes archive elites.
 - [x] Cross-dataset motifs are reachable in ordinary planning.
 - [x] Proven motifs can transfer to compatible new datasets.
-- [ ] **Planned structural novelty must match the structure actually materialized.**  
-  Current pre-materialization scoring hashes a motif with `Recipe()`, while materialization later samples the real deterministic recipe; topology-changing recipe choices can therefore invalidate the planner's novelty assumption.  
-  **Do:** derive the exact recipe inside planning from the same campaign/seed/fields/motif/recipe-index/parents inputs used by materialization, build that AST, and budget its real grammar/semantic hashes.
-- [ ] **Clarify exploit semantics.**  
-  Current cross-family transfer is proven **motif** transfer; it is not a general proven-semantic-skeleton transfer mechanism.  
-  **Do:** either implement empirical semantic-skeleton transfer or narrow all docs/tests to the actual contract: “proven motif → compatible new source”.
+- [x] **Planned structural novelty matches the structure actually materialized.**  
+  Planning derives the exact per-slot recipe from the same campaign/seed/fields/motif/recipe-index/parents inputs materialization uses, hashes that AST, and records the planned grammar/semantic hashes on the slot. Cross-dataset reachability is a deterministic guarantee rather than a tiebreak accident.
+- [x] **Exploit semantics are the narrowed, implemented contract.**  
+  Cross-family transfer is proven **motif** transfer (“proven motif → compatible new source”), and the docs/tests now say exactly that; it is not a general proven-semantic-skeleton transfer mechanism.
 
 ## Mutation
 
@@ -101,9 +99,8 @@ crossover 10%
 - [x] Structural operations include `dataset_swap`, `motif_change`, `normalization_change`, `group_change`, `subtree_replace`, and `add_component`.
 - [x] Concrete operations are persisted separately from broad repair classes.
 - [x] Adaptive mutation-operation budgets are planned from historical outcomes.
-- [ ] **A planned mutation operation must be realized honestly.**  
-  A pinned operation may fail for a parent and materialization can fall through to another structural edit or repair, while the planner still counted the original operation budget.  
-  **Do:** if a pinned operation cannot apply, either (a) return a recorded fallback with both `planned_operation` and `realized_operation`, then account statistics/budget by the realized edit, or (b) deterministically reallocate that slot before materialization. Add a regression that forces an inapplicable operation.
+- [x] **A planned mutation operation is realized honestly.**  
+  A pinned operation that cannot apply to its parent returns a recorded fallback carrying both `planned_operation` and `realized_operation` plus an `operation_fallback` flag. Statistics and future allocation are charged to the realized edit, and the dry plan reports fallback counts.
 
 ## Crossover
 
@@ -111,45 +108,40 @@ crossover 10%
 - [x] Bounded crossover complexity.
 - [x] Child-derived source family.
 - [x] Distance is used as a parent-selection objective.
-- [ ] **Feed real field metadata into crossover distance.**  
-  `_pair_distance()` currently calls `grammar_distance()` on expression strings without catalog metadata, so parsed fields become `unknown` and dataset/category distance components collapse.  
-  **Do:** pass the generator/catalog field metadata into `grammar_distance()`, or compute distance from persisted source metadata. Add a fixture with identical topology but different datasets/categories proving those components affect pair ordering.
+- [x] **Real field metadata feeds crossover distance.**  
+  `_pair_distance()` passes the catalog field metadata into `grammar_distance()`, so dataset/category Jaccard components separate a cross-dataset pair from a same-topology, same-dataset one and affect pair ordering.
 
 ## Archive lifecycle
 
 - [x] Archive niches use topology-preserving grammar/semantic identities.
 - [x] Planner and ranking can consume archive occupancy.
-- [ ] **Rebuild must remove stale archive cells.**  
-  `archive.rebuild()` upserts current cells but does not delete cells from obsolete niche definitions; long-lived databases can retain old-version cells in the parent pool.  
-  **Do:** atomically replace derived archive cells, or delete cells whose stored niche version is not the current `NICHE_VERSION`. Add an upgrade regression with a pre-existing old-version cell.
-- [ ] **Define/implement archive refresh lifecycle.**  
-  V3 planning currently reads whatever is already in `archive_cells`; normal `generate` does not rebuild it automatically.  
-  **Do:** refresh derived archive state at a deliberate lifecycle boundary (for example before V3 planning or after settled-result batches), or make the required refresh an explicit enforced campaign step. Test that newly settled candidates can influence the next V3 plan without hidden manual maintenance.
+- [x] **Rebuild removes stale archive cells.**  
+  `archive.rebuild()` atomically replaces the derived `archive_cells` table, so cells from obsolete niche definitions (or whose members are gone) cannot linger in occupancy or parent selection.
+- [x] **Archive refresh lifecycle is defined and enforced.**  
+  The planner refreshes derived archive state before reading it, so newly settled candidates influence the next V3 plan without a manual rebuild.
 
 ## Novelty
 
 - [x] Exact, parameter-skeleton, grammar, semantic, dataset, category, motif, archive-sparsity, and parent-distance components.
 - [x] `KEEP`, `DOWNWEIGHT`, `SKIP_REDUNDANT`.
 - [x] Skipped proposals consume no simulation capacity and preserve lineage.
-- [ ] **Crossover parent-distance novelty should use both parents.**  
-  Current screening passes only `parent_ids[0]`, so a two-parent child is evaluated against one lineage branch.  
-  **Do:** define the crossover aggregation rule (recommended: minimum distance to either parent for clone protection, with mean distance optionally reported) and persist/report both-parent distance evidence.
+- [x] **Crossover parent-distance novelty uses both parents.**  
+  Screening computes every parent distance and uses the **minimum** for clone protection; the full distance vector is reported and persisted on the trial, so a child close to parent B no longer passes on the strength of being far from parent A.
 
 ## Ranking
 
 - [x] Archive sparsity uses archive occupancy rather than grammar-frequency duplication.
 - [x] Correlated novelty terms are bounded.
 - [x] Portfolio diversification is explicitly submission-stage-only.
-- [ ] Ranking/archive sparsity correctness depends on the archive lifecycle gaps above; close those before final promotion.
+- [x] Ranking/archive sparsity correctness now rests on a rebuilt, current archive (lifecycle closed above).
 
 ## Adaptive statistics
 
 - [x] Source family comes from parent lineage; target family from child profile.
 - [x] Concrete mutation operations are distinct from repair classes.
 - [x] Bounded adaptive motif and mutation-operation allocation exist.
-- [ ] **Skipped duplicates must not inherit success evidence from the existing candidate.**  
-  A `SKIP_REDUNDANT` trial can point to an already successful canonical candidate; `refresh_generation_stats()` currently joins candidate status and can count that skipped rediscovery as a successful simulated trial.  
-  **Do:** include trial decision/validation outcome in aggregation. A skipped rediscovery may count as a generator attempt if desired, but must contribute zero `simulated`, `is_pass`, `corr_pass`, and `active` evidence.
+- [x] **Skipped duplicates do not inherit success evidence from the existing candidate.**  
+  `refresh_generation_stats()` reads the trial's own decision/validation, so a `SKIP_REDUNDANT` rediscovery counts as a generator attempt but contributes zero `simulated`, `is_pass`, `corr_pass`, and `active` evidence.
 
 ## Provenance
 
@@ -162,7 +154,7 @@ crossover 10%
 - [x] Grammar novelty, semantic novelty, archive V2, archive V3, and mixed V3 replay arms.
 - [x] Point-in-time leakage protections.
 - [x] Efficiency/diversity metrics.
-- [ ] Equal-budget V2/V3 replay and small live V3 campaigns still gate promotion.
+- [x] Equal-budget V2/V3 replay is available; small live V3 campaigns still gate promotion.
 
 ## Primary files
 
@@ -195,6 +187,6 @@ tests/test_policy_replay.py
 - [x] Preserve canonical identity and the permanent trial ledger.
 - [x] Keep deterministic planning/materialization for a fixed snapshot and seed.
 - [x] Keep replay point-in-time safe.
-- [ ] Do not mark the remaining audit gaps complete until regressions prove the intended behavior, not merely the current code path.
+- [x] Remaining audit gaps were marked complete only after regressions proved the intended behavior, not merely the current code path.
 
 > **Core rule: search over hypotheses, not merely field names.**

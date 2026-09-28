@@ -2,7 +2,7 @@
 
 **Goal:** diversity-first symbolic alpha generation while preserving validation, canonical deduplication, lineage, the permanent trial ledger, staged search, scheduler safety, and point-in-time replay.
 
-**Status after second audit:** most P0–P15 implementation work is complete. The remaining issues are concentrated in P4/P5/P6/P7/P9/P15. Keep those items open until the implementation and regressions below are complete.
+**Status after third audit:** P0–P15 implementation work is complete, with the remaining P4/P5/P6/P7/P9/P15 gaps closed and regression-covered. The only open final-acceptance items are promotion evidence (equal-budget V2/V3 replay + small live V3 campaigns), which are not implementation gaps.
 
 **Live default:** V2 remains the default unless V3 is explicitly selected.
 
@@ -65,19 +65,16 @@
 - [x] Under-tested fields/families and unseen motifs influence explore allocation.
 - [x] Cross-dataset motifs are reachable in ordinary planning.
 - [x] Grammar/semantic history and archive occupancy are consulted before materialization.
-- [ ] **Make the planned structure exactly match the materialized structure.**  
-  Current planner novelty scoring builds a representative AST with `grammar.Recipe()`; materialization later samples the real deterministic recipe. Topology-changing recipe choices such as rank vs zscore, winsorization, or sign can therefore change the grammar hash after the planner allocated the slot.  
-  **Do:** during `plan_campaign()`, derive the exact recipe using the same `recipe_seed(campaign_id, seed, fields, motif_id, recipe_index, parent_ids)` inputs used by materialization; build/hash that exact AST.  
-  **Regression:** plan against saturated history → materialize the selected explore slots → assert the **actual proposal** grammar/semantic hashes satisfy the planner's unseen/sparse guarantee.
+- [x] **The planned structure exactly matches the materialized structure.**  
+  `plan_campaign()` derives the exact per-slot recipe from the same `recipe_seed(campaign_id, seed, fields, motif_id, recipe_index, parent_ids)` inputs materialization uses, hashes that AST, and records `planned_grammar_hash`/`planned_semantic_hash` on the slot. Cross-dataset reachability is a deterministic seat rather than a novelty-tiebreak accident.  
+  **Regression:** `test_planned_structure_hashes_match_materialized_structures` plans against saturated history, materializes the explore slots, and asserts the actual proposal hashes equal the planned ones and stay unseen.
 
 ## P4.3 Exploit
 
 - [x] Proven motifs can transfer from one family to a compatible new dataset.
-- [ ] **Either implement semantic-structure transfer or narrow the contract.**  
-  Current code transfers `motif_id` evidence via `proven_anywhere`; it does not generally learn “this semantic skeleton worked, transfer that structure to a nearby source”.  
-  **Option A:** persist/query successful semantic-skeleton evidence and use it in exploit slot selection.  
-  **Option B:** change docs/tests from “proven motif/semantic structure transfer” to the narrower implemented guarantee: “proven motif → compatible new source”.  
-  **Regression if A:** prove a successful semantic structure influences exploit selection even when motif identity alone is insufficient.
+- [x] **Exploit contract narrowed to the implemented guarantee (Option B).**  
+  Cross-family exploit transfer is proven **motif** transfer (`motif_id` evidence via `proven_anywhere`), not general proven-semantic-skeleton transfer. Docs, slot reasons, and tests now state the narrow contract: “proven motif → compatible new source”.  
+  **Regression:** `test_exploit_transfers_a_proven_motif_to_a_compatible_source`.
 
 ## P4.4 Mutation vocabulary
 
@@ -90,12 +87,9 @@
 - [x] `add_component`.
 - [x] Stable concrete `operation` provenance.
 - [x] Type/arity/complexity validation.
-- [ ] **Honor adaptive mutation-operation allocation at realization time.**  
-  A slot can be budgeted for operation X, but if X cannot apply to that parent, the mutation path can fall back to another structural edit or repair. The campaign then consumes X's planned budget without actually testing X.  
-  **Do:** choose one explicit contract:
-  1. strict realization — an inapplicable pinned operation causes deterministic reallocation to another parent/slot before materialization; or
-  2. honest fallback — persist `planned_operation` and `realized_operation`, charge empirical statistics to the realized operation, and expose fallback counts.
-  **Regression:** pin an operation that cannot apply to the selected parent and prove the resulting ledger/allocation is honest.
+- [x] **Adaptive mutation-operation allocation is honored honestly (Option 2).**  
+  An inapplicable pinned operation yields an honest fallback: `planned_operation`, `realized_operation`, and `operation_fallback` are persisted, statistics/allocation are charged to the realized edit, and the dry plan exposes fallback counts.  
+  **Regression:** `test_pinned_inapplicable_mutation_operation_records_an_honest_fallback` and `test_applicable_pinned_mutation_operation_is_recorded_without_a_fallback`.
 
 ---
 
@@ -105,17 +99,12 @@
 - [x] Parent selection consumes archive elites.
 - [x] Family caps/exploration reserve are enforced.
 - [x] Same DB snapshot + seed reproduces the same plan.
-- [ ] **Remove stale archive cells during rebuild.**  
-  `archive.rebuild()` currently upserts current cells but does not remove obsolete cells. Because niche version participates in the cell identity and `parents()` reads all rows, a long-lived DB can retain pre-current-version niches after a rebuild.  
-  **Do:** treat `archive_cells` as derived state and atomically replace it, or delete cells whose stored `niche_version != NICHE_VERSION` before/within rebuild.  
-  **Regression:** seed an old-version archive cell, run rebuild, assert the stale cell cannot appear in occupancy or parent selection.
-- [ ] **Define and enforce archive refresh lifecycle.**  
-  V3 planning reads the current `archive_cells` table but `generate`/plan does not automatically rebuild it. Newly settled candidates therefore may not affect the next campaign until a manual rebuild happens.  
-  **Do:** pick one explicit lifecycle:
-  - rebuild before V3 planning;
-  - rebuild after batches of settled outcomes; or
-  - require an explicit archive-refresh step and enforce/check freshness before planning.  
-  **Regression:** settle a new candidate and prove the next V3 plan can use it without undocumented manual intervention.
+- [x] **Stale archive cells are removed during rebuild.**  
+  `archive_cells` is treated as derived state and atomically replaced inside one transaction, so obsolete niche versions and dropped members can never reappear in occupancy or parent selection.  
+  **Regression:** `test_rebuild_drops_stale_niche_version_cells`.
+- [x] **Archive refresh lifecycle defined and enforced.**  
+  The planner refreshes derived archive state before reading it, so a newly settled candidate can influence the very next V3 plan with no manual rebuild step.  
+  **Regression:** `test_newly_settled_candidate_reaches_the_next_plan_without_manual_rebuild`.
 
 ---
 
@@ -125,10 +114,9 @@
 - [x] Bounded complexity.
 - [x] Child-derived family.
 - [x] Distance is an actual selection objective rather than only a filter.
-- [ ] **Pass real source metadata into `grammar_distance()`.**  
-  `_pair_distance()` currently parses expression strings without the field catalog, so source fields become dataset/category `unknown`; dataset/category Jaccard components therefore contribute little or nothing during real parent selection.  
-  **Do:** pass the generator/catalog metadata into distance calculation, or compute source-distance components from persisted source profiles/archive dimensions.  
-  **Regression:** use parent expressions with the same topology/depth but known different datasets/categories and assert dataset/category distance changes pair ordering.
+- [x] **Real source metadata is passed into `grammar_distance()`.**  
+  `_pair_distance()` / `_pick_crossover_pair()` receive the catalog field metadata, so dataset/category Jaccard components are real in parent selection.  
+  **Regression:** `test_crossover_distance_uses_real_dataset_and_category_metadata`.
 
 ---
 
@@ -145,10 +133,9 @@
 - [x] Numeric parent→child distance.
 - [x] `KEEP`, `DOWNWEIGHT`, `SKIP_REDUNDANT`.
 - [x] Skips consume no simulation capacity and preserve lineage.
-- [ ] **Evaluate crossover novelty against both parents.**  
-  `screen_proposals()` currently loads only `parent_ids[0]`. For a two-parent child, novelty can therefore look favorable relative to parent A while being a near-clone of parent B.  
-  **Do:** compute both parent distances. Recommended clone-protection signal: `min(distance_to_parent_A, distance_to_parent_B)`; optionally also report the mean/max for diagnostics. Persist enough detail to audit the decision.  
-  **Regression:** create a crossover child close to parent B but far from parent A and prove the novelty score/decision reflects the close parent.
+- [x] **Crossover novelty is evaluated against both parents.**  
+  `screen_proposals()` computes every parent distance and uses `min(distance_to_parent)` for clone protection; the full distance vector is reported on the report/proposal and persisted on the queued/skipped trial.  
+  **Regression:** `test_two_parent_crossover_novelty_reflects_the_closest_parent`.
 
 ---
 
@@ -158,7 +145,7 @@
 - [x] Grammar/semantic novelty terms are bounded.
 - [x] Archive sparsity comes from archive occupancy rather than grammar-frequency duplication.
 - [x] Portfolio diversification is submission-stage-only.
-- [ ] **Dependency:** final archive-sparsity correctness requires P5 archive lifecycle/freshness to be closed.
+- [x] **Dependency:** P5 archive lifecycle/freshness is closed, so archive-sparsity ranking reads a rebuilt, current archive.
 
 ---
 
@@ -177,12 +164,11 @@
 - [x] Target family comes from child profile.
 - [x] Concrete mutation operation is separate from broad repair class.
 - [x] Bounded mutation-operation allocation exists.
-- [ ] **Do not let skipped duplicate trials inherit the existing candidate's success outcome.**  
-  A `SKIP_REDUNDANT` trial may point to an already successful canonical candidate. `refresh_generation_stats()` joins candidate status, so repeated skipped rediscoveries can be counted as simulated/pass evidence even though no new simulation occurred.  
-  **Do:** include trial decision/validation fields in aggregation. A skipped rediscovery may count as a generator attempt if useful, but it must contribute zero to `simulated`, `is_pass`, `corr_pass`, and `active`.  
-  **Regression:** start with one existing IS_PASS candidate, rediscover/skip it several times, refresh stats, and prove pass/simulation counters do not increase.
-- [ ] **Keep planned vs realized mutation-operation accounting honest.**  
-  Close together with P4.4: statistics and future allocation must learn from the operation that actually ran, while optionally retaining the planned operation for policy diagnostics.
+- [x] **Skipped duplicate trials do not inherit the existing candidate's success outcome.**  
+  `refresh_generation_stats()` reads the trial's own decision/validation fields; a skipped rediscovery counts as an attempt but contributes zero to `simulated`, `is_pass`, `corr_pass`, and `active`.  
+  **Regression:** `test_skipped_rediscovery_does_not_create_simulated_or_pass_evidence`.
+- [x] **Planned vs realized mutation-operation accounting is honest.**  
+  Closed with P4.4: statistics and future allocation learn from the realized operation, while `planned_operation` is retained for diagnostics.
 
 ---
 
@@ -261,18 +247,18 @@ Existing V3 regression coverage now includes:
 
 Required before P15 is truly closed:
 
-- [ ] **Actual planned-vs-materialized structure novelty regression.**  
-  Plan and materialize the same slots; test the final proposal hashes, not the planner's proxy hashes.
-- [ ] **Semantic-transfer contract regression.**  
-  Required only if P4.3 keeps the stronger semantic-structure-transfer claim.
-- [ ] **Stale archive-version cleanup regression.**
-- [ ] **Archive refresh lifecycle regression.**
-- [ ] **Crossover dataset/category distance regression using real metadata.**
-- [ ] **Two-parent crossover novelty-distance regression.**
-- [ ] **Skipped duplicate does not create simulated/pass evidence regression.**
-- [ ] **Pinned mutation operation fallback/reallocation accounting regression.**
-- [ ] **Execution evidence.**  
-  The named tests exist in the repo, but current GitHub head has no attached Actions/check result proving the documented full-suite count. Keep completion wording tied to reproducible test execution rather than a documentation-only number.
+- [x] **Actual planned-vs-materialized structure novelty regression.**  
+  `test_planned_structure_hashes_match_materialized_structures` tests the final proposal hashes, not the planner's proxy hashes.
+- [x] **Semantic-transfer contract regression.**  
+  P4.3 keeps the narrowed motif-transfer contract, so no stronger regression is required; `test_exploit_transfers_a_proven_motif_to_a_compatible_source` covers it.
+- [x] **Stale archive-version cleanup regression.** (`test_rebuild_drops_stale_niche_version_cells`)
+- [x] **Archive refresh lifecycle regression.** (`test_newly_settled_candidate_reaches_the_next_plan_without_manual_rebuild`)
+- [x] **Crossover dataset/category distance regression using real metadata.** (`test_crossover_distance_uses_real_dataset_and_category_metadata`)
+- [x] **Two-parent crossover novelty-distance regression.** (`test_two_parent_crossover_novelty_reflects_the_closest_parent`)
+- [x] **Skipped duplicate does not create simulated/pass evidence regression.** (`test_skipped_rediscovery_does_not_create_simulated_or_pass_evidence`)
+- [x] **Pinned mutation operation fallback/reallocation accounting regression.** (`test_pinned_inapplicable_mutation_operation_records_an_honest_fallback`)
+- [x] **Execution evidence.**  
+  A GitHub Actions workflow runs the credential-free offline suite (`pytest -q`) on every push and pull request, so completion wording is tied to a reproducible check result rather than a documentation-only number.
 
 ---
 
@@ -293,7 +279,9 @@ Recommended order:
 10. equal-budget replay + small live campaigns
 ```
 
-- [ ] Keep V2 as live default until the above implementation gaps are closed.
+Items 1–9 are complete. Item 10 (equal-budget replay + small live V3 campaigns) remains a promotion gate, not an implementation gap.
+
+- [x] Keep V2 as live default until the implementation gaps are closed (gaps are now closed; V2 remains the default until replay/live evidence justifies promotion).
 - [ ] Run equal-budget V2 vs V3 replay after P15 closes.
 - [ ] Run small explicitly named live V3 campaigns after replay is clean.
 
@@ -335,7 +323,7 @@ without material degradation in:
 
 Generator V3 is implementation-complete when:
 
-- [ ] All remaining P4/P5/P6/P7/P9/P15 audit items are closed with regressions.
+- [x] All remaining P4/P5/P6/P7/P9/P15 audit items are closed with regressions.
 - [x] Exact, parameter, grammar, and semantic diversity are separately measurable.
 - [x] Archive niches preserve topology.
 - [x] Multi-recipe, multi-field, cross-dataset generation exists.
