@@ -119,6 +119,10 @@ def rebuild(db: research_db.ResearchDB) -> dict[str, int]:
         dimensions[key] = dims
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with db._tx() as conn:
+        # ``archive_cells`` is derived state: replace it atomically. A cell from an obsolete
+        # niche definition (or one whose members are gone) must not linger, or occupancy and
+        # parent selection would keep reading pre-current-version niches forever (P5/P15).
+        conn.execute("DELETE FROM archive_cells")
         for key, cell_members in members.items():
             winner = max(cell_members, key=lambda row: (elite_score(row), -int(row["id"])))
             conn.execute(

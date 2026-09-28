@@ -73,6 +73,26 @@ def test_v2_mutation_child_family_is_derived_from_the_child(db):
 # ---------------------------------------------------------------------------
 
 
+def test_rebuild_drops_stale_niche_version_cells(db):
+    """P5/P15: an old-version archive cell must not survive a rebuild into occupancy/parents."""
+    _settle(db, "rank(close)", "pv1", 1.2)
+    archive.rebuild(db)
+    # Simulate a long-lived DB carrying a cell written under an older niche definition.
+    db.query(
+        "INSERT INTO archive_cells(cell_key, dimensions_json, elite_candidate_id, elite_score, member_count, updated_at)"
+        " VALUES(?,?,?,?,?,?)",
+        ("stale-cell", json.dumps({"niche_version": "archive-niche-v3",
+                                   "grammar_skeleton_hash": "STALE"}), None, 99.0, 1, "2020-01-01T00:00:00"),
+    )
+    assert db.query("SELECT COUNT(*) AS n FROM archive_cells")[0]["n"] == 2
+
+    report = archive.rebuild(db)
+    assert report["cells"] == 1
+    assert {row["cell_key"] for row in db.query("SELECT cell_key FROM archive_cells")} != {"stale-cell"}
+    assert "STALE" not in archive.structure_occupancy(db)
+    assert archive.parents(db, count=5, seed=0)
+
+
 @pytest.mark.parametrize("strategy, count", [("mixed", 25), ("explore", 12), ("exploit", 8)])
 def test_materialized_budget_matches_the_plan(db, strategy, count):
     plan, proposals = generator.CandidateGenerator(db, seed=7).generate(
@@ -84,6 +104,22 @@ def test_materialized_budget_matches_the_plan(db, strategy, count):
     assert {proposal.generation_mode for proposal in proposals} <= (
         allowed if strategy == "mixed" else {policy.resolve_strategy(strategy)}
     )
+
+
+def test_newly_settled_candidate_reaches_the_next_plan_without_manual_rebuild(db):
+    """P5/P15: the planner refreshes derived archive state before reading it."""
+    cold = generator.CandidateGenerator(db, seed=4).plan(
+        campaign_id="v3-lifecycle", budget=12, seed=4, mode="mutate",
+    )
+    assert all(slot.generation_mode == "explore" for slot in cold.slots)  # nothing to mutate
+
+    _settle(db, "group_rank(ts_rank(close,60),subindustry)", "pv1", 1.7)
+    # No explicit archive.rebuild() call: the next plan must pick the elite up on its own.
+    warm = generator.CandidateGenerator(db, seed=4).plan(
+        campaign_id="v3-lifecycle", budget=12, seed=4, mode="mutate",
+    )
+    mutated = [slot for slot in warm.slots if slot.generation_mode == "mutate"]
+    assert mutated and all(slot.parent_ids for slot in mutated)
 
 
 def test_cold_archive_substitutes_lineage_modes_instead_of_faking_them(db):

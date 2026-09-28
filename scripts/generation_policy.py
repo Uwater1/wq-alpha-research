@@ -519,6 +519,26 @@ def _structure_novelty(
     )
 
 
+def refresh_archive(db: Any) -> bool:
+    """Rebuild the derived archive so planning sees every candidate settled so far (P5).
+
+    ``archive_cells`` is derived state, so refreshing it at the planning boundary makes
+    newly settled candidates influence the next campaign without an undocumented manual
+    rebuild. Returns whether the refresh ran; a store without the archive tables is left
+    untouched rather than failing the plan.
+    """
+    if db is None:
+        return False
+    rebuild = getattr(archive, "rebuild", None)
+    if rebuild is None:  # pragma: no cover - archive is always importable here
+        return False
+    try:
+        rebuild(db)
+    except Exception:  # pragma: no cover - derived/advisory state only
+        return False
+    return True
+
+
 def _ordered_sources(db: Any, catalog: Any, family: str, scope: Mapping[str, Any] | None) -> list[Any]:
     """Fields of a family, least-tested first (coverage-aware, seeded tie-break left to caller)."""
     fields = _catalog_fields(catalog, family)
@@ -549,14 +569,20 @@ def plan_campaign(
     weights: Mapping[str, float] | None = None,
     parent_pool: int = 24,
     generator_version: str = "",
+    refresh_archive_state: bool = True,
 ) -> Plan:
     """Turn a campaign budget into an explicit, archive-informed generation plan.
 
     Guarantees: ``plan.planned_budget == budget``; family caps from
     :func:`archive.allocate_families` are respected; the same DB snapshot + seed + versions
     produce an identical plan.
+
+    ``refresh_archive_state`` rebuilds the derived archive before reading it, so a newly
+    settled candidate is visible to the very next plan (P5 archive lifecycle).
     """
     budget = max(0, int(budget))
+    if refresh_archive_state:
+        refresh_archive(db)
     resolved_mode = resolve_strategy(mode)
     resolved_weights = {name: float((weights or STRATEGY_WEIGHTS).get(name, 0.0)) for name in GENERATION_MODES}
     families = _families(catalog, family)
