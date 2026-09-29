@@ -1,344 +1,505 @@
-# Generator V3 TODO
+# Generator V3 TODO — Quality Roadmap
 
-**Goal:** diversity-first symbolic alpha generation while preserving validation, canonical deduplication, lineage, the permanent trial ledger, staged search, scheduler safety, and point-in-time replay.
+**Goal:** turn the now-correct Generator V3 engine into a generator that spends scarce simulations on economically plausible, diverse hypotheses.
 
-**Status after third audit:** P0–P15 implementation work is complete, with the remaining P4/P5/P6/P7/P9/P15 gaps closed and regression-covered. The only open final-acceptance items are promotion evidence (equal-budget V2/V3 replay + small live V3 campaigns), which are not implementation gaps.
-
-**Live default:** V2 remains the default unless V3 is explicitly selected.
+**Current state:** P0–P15 are implementation-complete and CI-covered. Equal-budget replay infrastructure exists, but the live V3 campaigns recorded **0 IS passes from 138 simulations** versus a historical baseline around **23%**. V2 therefore remains the default.
 
 ---
 
-# P0 — Diversity identities and source metadata
+# Completed implementation — P0–P15
 
-- [x] Child source profile exposes fields, datasets, categories, types, primary family, and cross-dataset flag.
-- [x] Single-source and multi-source family derivation are stable.
-- [x] Mutation children derive family from the child.
-- [x] Crossover children derive family from the child.
-- [x] Canonical, parameter-skeleton, grammar-skeleton, and semantic-skeleton identities remain distinct.
-- [x] Archive niches use topology-preserving identities.
+The old checklist is intentionally compressed. Detailed regressions remain in the test suite and git history.
 
----
+- [x] **P0–P3 — representation:** source profiles, four identity levels, typed AST, compatibility checks, role-aware motifs, deterministic recipes.
+- [x] **P4–P7 — search mechanics:** explore/exploit/mutate/crossover, real structural mutations, exact plan→materialization hashes, archive loop, metadata-aware crossover, multi-parent novelty.
+- [x] **P8–P11 — evidence/provenance:** archive-aware ranking, corrected adaptive statistics, complete queued/skipped lineage, explicit V2/V3 subsystem versions.
+- [x] **P12–P15 — operation/evaluation:** V3 CLI, dry plan, diversity report, point-in-time replay, archive-V2 baseline, full regression suite and GitHub Actions execution.
+- [x] V2 remains the live default.
 
-# P1 — Typed expression grammar
-
-- [x] Typed AST.
-- [x] Reuse `compatibility.py`.
-- [x] Arity/type validation.
-- [x] Deterministic FASTEXPR rendering.
-- [x] Complexity limits.
-- [x] Tolerant parsing for stored legacy expressions.
+No new feature should reopen P0–P15 unless it breaks one of these contracts.
 
 ---
 
-# P2 — Motif registry
+# P16 — Small engineering carryovers
 
-- [x] Single-source motifs.
-- [x] Two-source motifs.
-- [x] Cross-dataset composite.
-- [x] Role-aware event/expectation motifs.
-- [x] Deterministic role inference + positive/negative eligibility tests.
+These are robustness cleanups, not a new redesign.
 
----
+- [ ] **Forced `--motif` plan/materialization consistency.**  
+  A forced motif is currently applied after a normal plan is built, so planned motif/hash metadata can describe a structure that will not be emitted.  
+  **Do:** pass the forced motif into planning and compute the correct planned hashes from the start, or explicitly replace/clear planned structure metadata before materialization.  
+  **Regression:** forced motif plan → materialize → planned motif/hash == emitted motif/hash.
 
-# P3 — Deterministic recipes
-
-- [x] Per-proposal deterministic RNG.
-- [x] Independent recipe dimensions.
-- [x] Recipe index + full recipe provenance.
-- [x] Unrelated proposal insertion does not perturb an existing recipe.
+- [ ] **Archive refresh failure visibility.**  
+  `refresh_archive()` currently catches broad exceptions and planning can continue against stale state.  
+  **Do:** distinguish expected “archive unavailable” cases from real DB/schema/locking failures; fail fast or persist a visible `archive_refresh_failed` diagnostic.  
+  **Regression:** injected rebuild error cannot silently produce a normal-looking archive-informed plan.
 
 ---
 
-# P4 — Generation strategy layer
+# P17 — Promotion gate status
 
-## P4.1 Modes
+- [x] P0–P15 implementation complete.
+- [x] Equal-budget replay machinery executed.
+- [x] Small live V3 campaigns executed.
+- [ ] Promote V3 to default.
 
-- [x] `explore`
-- [x] `exploit`
-- [x] `mutate`
-- [x] `crossover`
-- [x] `mixed`
-- [x] Realized mode is reported honestly when lineage modes fall back.
-
-## P4.2 Explore / structural novelty
-
-- [x] Under-tested fields/families and unseen motifs influence explore allocation.
-- [x] Cross-dataset motifs are reachable in ordinary planning.
-- [x] Grammar/semantic history and archive occupancy are consulted before materialization.
-- [x] **The planned structure exactly matches the materialized structure.**  
-  `plan_campaign()` derives the exact per-slot recipe from the same `recipe_seed(campaign_id, seed, fields, motif_id, recipe_index, parent_ids)` inputs materialization uses, hashes that AST, and records `planned_grammar_hash`/`planned_semantic_hash` on the slot. Cross-dataset reachability is a deterministic seat rather than a novelty-tiebreak accident.  
-  **Regression:** `test_planned_structure_hashes_match_materialized_structures` plans against saturated history, materializes the explore slots, and asserts the actual proposal hashes equal the planned ones and stay unseen.
-
-## P4.3 Exploit
-
-- [x] Proven motifs can transfer from one family to a compatible new dataset.
-- [x] **Exploit contract narrowed to the implemented guarantee (Option B).**  
-  Cross-family exploit transfer is proven **motif** transfer (`motif_id` evidence via `proven_anywhere`), not general proven-semantic-skeleton transfer. Docs, slot reasons, and tests now state the narrow contract: “proven motif → compatible new source”.  
-  **Regression:** `test_exploit_transfers_a_proven_motif_to_a_compatible_source`.
-
-## P4.4 Mutation vocabulary
-
-- [x] Failure-directed repair.
-- [x] `dataset_swap`.
-- [x] `motif_change`.
-- [x] `normalization_change`.
-- [x] `group_change`.
-- [x] `subtree_replace`.
-- [x] `add_component`.
-- [x] Stable concrete `operation` provenance.
-- [x] Type/arity/complexity validation.
-- [x] **Adaptive mutation-operation allocation is honored honestly (Option 2).**  
-  An inapplicable pinned operation yields an honest fallback: `planned_operation`, `realized_operation`, and `operation_fallback` are persisted, statistics/allocation are charged to the realized edit, and the dry plan exposes fallback counts.  
-  **Regression:** `test_pinned_inapplicable_mutation_operation_records_an_honest_fallback` and `test_applicable_pinned_mutation_operation_is_recorded_without_a_fallback`.
-
----
-
-# P5 — Archive → generator loop
-
-- [x] Family budgets consume archive evidence.
-- [x] Parent selection consumes archive elites.
-- [x] Family caps/exploration reserve are enforced.
-- [x] Same DB snapshot + seed reproduces the same plan.
-- [x] **Stale archive cells are removed during rebuild.**  
-  `archive_cells` is treated as derived state and atomically replaced inside one transaction, so obsolete niche versions and dropped members can never reappear in occupancy or parent selection.  
-  **Regression:** `test_rebuild_drops_stale_niche_version_cells`.
-- [x] **Archive refresh lifecycle defined and enforced.**  
-  The planner refreshes derived archive state before reading it, so a newly settled candidate can influence the very next V3 plan with no manual rebuild step.  
-  **Regression:** `test_newly_settled_candidate_reaches_the_next_plan_without_manual_rebuild`.
-
----
-
-# P6 — Crossover
-
-- [x] Two-parent lineage.
-- [x] Bounded complexity.
-- [x] Child-derived family.
-- [x] Distance is an actual selection objective rather than only a filter.
-- [x] **Real source metadata is passed into `grammar_distance()`.**  
-  `_pair_distance()` / `_pick_crossover_pair()` receive the catalog field metadata, so dataset/category Jaccard components are real in parent selection.  
-  **Regression:** `test_crossover_distance_uses_real_dataset_and_category_metadata`.
-
----
-
-# P7 — Novelty-aware generation
-
-- [x] Exact novelty.
-- [x] Parameter-skeleton novelty.
-- [x] Grammar novelty.
-- [x] Semantic novelty.
-- [x] Dataset novelty.
-- [x] Category novelty.
-- [x] Motif novelty.
-- [x] Archive sparsity.
-- [x] Numeric parent→child distance.
-- [x] `KEEP`, `DOWNWEIGHT`, `SKIP_REDUNDANT`.
-- [x] Skips consume no simulation capacity and preserve lineage.
-- [x] **Crossover novelty is evaluated against both parents.**  
-  `screen_proposals()` computes every parent distance and uses `min(distance_to_parent)` for clone protection; the full distance vector is reported on the report/proposal and persisted on the queued/skipped trial.  
-  **Regression:** `test_two_parent_crossover_novelty_reflects_the_closest_parent`.
-
----
-
-# P8 — Ranking integration
-
-- [x] Expected quality, novelty, information gain, family diversity, duplicate penalty, failure risk.
-- [x] Grammar/semantic novelty terms are bounded.
-- [x] Archive sparsity comes from archive occupancy rather than grammar-frequency duplication.
-- [x] Portfolio diversification is submission-stage-only.
-- [x] **Dependency:** P5 archive lifecycle/freshness is closed, so archive-sparsity ranking reads a rebuilt, current archive.
-
----
-
-# P9 — Adaptive motif / mutation allocation
-
-## P9.1 Motifs
-
-- [x] Persist outcome counters.
-- [x] Bounded Thompson-style allocation.
-- [x] Exploration floor.
-- [x] Max-share protection.
-
-## P9.2 Mutation/source statistics
-
-- [x] Source family comes from parent lineage.
-- [x] Target family comes from child profile.
-- [x] Concrete mutation operation is separate from broad repair class.
-- [x] Bounded mutation-operation allocation exists.
-- [x] **Skipped duplicate trials do not inherit the existing candidate's success outcome.**  
-  `refresh_generation_stats()` reads the trial's own decision/validation fields; a skipped rediscovery counts as an attempt but contributes zero to `simulated`, `is_pass`, `corr_pass`, and `active`.  
-  **Regression:** `test_skipped_rediscovery_does_not_create_simulated_or_pass_evidence`.
-- [x] **Planned vs realized mutation-operation accounting is honest.**  
-  Closed with P4.4: statistics and future allocation learn from the realized operation, while `planned_operation` is retained for diagnostics.
-
----
-
-# P10 — Database / provenance
-
-- [x] V3 strategy/mode/motif/recipe/hash/source profile are queryable.
-- [x] Queued mutation/crossover lineage persists.
-- [x] Skipped mutation/crossover lineage persists.
-- [x] Historical rows are preserved.
-
----
-
-# P11 — Versioning
-
-- [x] V2 and V3 generator identities are distinct.
-- [x] Grammar, motif-registry, and generation-policy versions are explicit.
-- [x] V2 remains honestly labelled and backward compatible.
-
----
-
-# P12 — CLI
-
-- [x] V2 generate path remains available.
-- [x] V3 `--strategy`.
-- [x] V3 `--motif`.
-- [x] `crossover` command.
-- [x] `--dry-plan` performs no BRAIN calls or queue writes.
-- [x] Dry plan reports V3 distributions.
-
----
-
-# P13 — Diversity report
-
-- [x] Exact/field/dataset/category diversity.
-- [x] Parameter/grammar/semantic structure diversity.
-- [x] Motif and effective-count metrics.
-- [x] Cross-dataset share.
-- [x] Duplicate/near-duplicate rates.
-- [x] Parent-child grammar distance.
-- [x] Pairwise PnL correlation when available.
-- [x] Funnel outcomes by motif.
-
----
-
-# P14 — Point-in-time policy replay
-
-- [x] Grammar novelty.
-- [x] Semantic novelty.
-- [x] Archive V2.
-- [x] Archive V3.
-- [x] Mixed V3.
-- [x] Point-in-time leakage protections.
-- [x] Equal-budget comparison framework.
-- [x] Efficiency/diversity/robustness metrics.
-
----
-
-# P15 — Tests / regression
-
-Existing V3 regression coverage now includes:
-
-- [x] crossover child family
-- [x] role-aware event motifs
-- [x] cross-dataset reachability
-- [x] explore novelty budgeting proxy
-- [x] proven motif transfer
-- [x] every promised structural mutation operation
-- [x] distance-driven crossover selection
-- [x] category novelty / archive sparsity / parent distance
-- [x] real archive sparsity ranking
-- [x] source→target mutation lineage
-- [x] concrete operation statistics
-- [x] adaptive mutation allocation
-- [x] skipped mutation/crossover provenance
-- [x] archive-V2 replay baseline
-
-Required before P15 is truly closed:
-
-- [x] **Actual planned-vs-materialized structure novelty regression.**  
-  `test_planned_structure_hashes_match_materialized_structures` tests the final proposal hashes, not the planner's proxy hashes.
-- [x] **Semantic-transfer contract regression.**  
-  P4.3 keeps the narrowed motif-transfer contract, so no stronger regression is required; `test_exploit_transfers_a_proven_motif_to_a_compatible_source` covers it.
-- [x] **Stale archive-version cleanup regression.** (`test_rebuild_drops_stale_niche_version_cells`)
-- [x] **Archive refresh lifecycle regression.** (`test_newly_settled_candidate_reaches_the_next_plan_without_manual_rebuild`)
-- [x] **Crossover dataset/category distance regression using real metadata.** (`test_crossover_distance_uses_real_dataset_and_category_metadata`)
-- [x] **Two-parent crossover novelty-distance regression.** (`test_two_parent_crossover_novelty_reflects_the_closest_parent`)
-- [x] **Skipped duplicate does not create simulated/pass evidence regression.** (`test_skipped_rediscovery_does_not_create_simulated_or_pass_evidence`)
-- [x] **Pinned mutation operation fallback/reallocation accounting regression.** (`test_pinned_inapplicable_mutation_operation_records_an_honest_fallback`)
-- [x] **Execution evidence.**  
-  A GitHub Actions workflow runs the credential-free offline suite (`pytest -q`) on every push and pull request, so completion wording is tied to a reproducible check result rather than a documentation-only number.
-
----
-
-# P16 — Remaining implementation order
-
-Recommended order:
+Observed 2026-09-28 live evidence:
 
 ```text
-1. P9 skipped-trial outcome contamination
-2. P6 real metadata in crossover distance
-3. P5 stale archive cleanup
-4. P5 archive refresh lifecycle
-5. P4.2 exact planned-vs-materialized structure hashes
-6. P4.4 planned vs realized mutation operation accounting
-7. P7 both-parent crossover novelty
-8. P4.3 semantic-transfer contract
-9. P15 full regression closure
-10. equal-budget replay + small live campaigns
+simulations  138
+IS_PASS        0
+pass rate      0%
+historical    ~23%
 ```
 
-Items 1–9 are complete. Item 10 (equal-budget replay + small live V3 campaigns) remains a promotion gate, not an implementation gap.
+Treat this as a **quality/search-distribution failure until disproven**, not as a reason to add more grammar complexity.
 
-- [x] Keep V2 as live default until the implementation gaps are closed (gaps are now closed; V2 remains the default until replay/live evidence justifies promotion).
-- [x] Run equal-budget V2 vs V3 replay after P15 closes.  
-  Equal-budget replay (`policy_replay.py --run archive_v2 --run archive_v3 --run mixed_v3 --budget 100`) passes the leakage check for every arm and shows V3 at parity on IS/CORR pass rate (0.07/simulation) with slightly higher effective family diversity (53.96 vs 53.09).
-- [x] Run small explicitly named live V3 campaigns after replay is clean.  
-  Live campaigns `v3-live-20260928` and `v3-novelty-20260928b` were planned, materialized, queued and simulated on BRAIN. Result: **0 IS passes from 138 V3 simulations** (explore 72, exploit 46, mutate 13, crossover 7). 137 were accepted by BRAIN and failed the IS gate (`LOW_FITNESS`/`LOW_SHARPE` dominate; 85 rejects had turnover already inside 0.01–0.20), so this is weak-signal output, not a validation or turnover artefact.
+Primary success metric from this point:
+
+```text
+IS_PASS per 100 BRAIN simulations
+→ CORR_PASS per 100
+→ robustness-adjusted quality
+→ survivor diversity
+```
 
 ---
 
-# P17 — Promotion gates
+# P18 — Failure attribution before redesign
 
-Initial V3 mix remains:
+**Question:** where does the 0/138 collapse come from?
 
-```text
-explore   40%
-exploit   25%
-mutate    25%
-crossover 10%
-```
+Do not tune policy weights until this stage can localize the failure.
 
-Recommended family cap:
+## P18.1 Outcome cube
 
-```text
-max_family_share = 0.35–0.50
-```
+- [ ] Build a reusable diagnostic over the permanent trial ledger with:
+  - generation mode
+  - motif
+  - source dataset/category
+  - semantic role signature
+  - grammar/semantic skeleton
+  - recipe dimensions
+  - mutation operation
+  - parent lineage quality
+  - Sharpe / Fitness / turnover
+  - BRAIN failure reason
+- [ ] Report attempts, simulations, IS pass rate, median/quantiles of Sharpe/Fitness/turnover and failure-reason shares.
+- [ ] Include confidence intervals / minimum-sample warnings; do not rank a bucket from 1–2 trials.
 
-Promote only if evidence improves:
+## P18.2 Matched V2/V3 comparison
 
-- [ ] simulation efficiency
-- [ ] grammar diversity
-- [ ] semantic diversity
-- [ ] correlation diversity
+- [ ] Build matched cohorts by scope/universe/delay/time window and comparable simulation budget.
+- [ ] Separate:
+  1. field/source selection gap
+  2. expression/motif gap
+  3. recipe/settings gap
+  4. search-policy gap
+- [ ] Compare live V3 failures against historical successful and failed V2 candidates.
 
-without material degradation in:
+## P18.3 Failure taxonomy
 
-- [ ] IS_PASS rate
-- [ ] CORR_PASS rate
-- [ ] robustness-adjusted quality
+- [ ] Quantify how much of the gap is explained by:
+  - low Sharpe
+  - low Fitness
+  - turnover
+  - correlation
+  - invalid/unsupported expressions
+  - weak source families
+  - specific motifs / recipe combinations
+- [ ] Produce a machine-readable artifact, e.g. `quality_diagnostics.json`, so later policy tests use the same evidence.
 
-**Observed evidence (2026-09-28):** equal-budget replay is at parity on IS/CORR pass
-rate with better family diversity; the live V3 campaigns produced 0 IS passes from 138
-simulations (0% vs the historical ~23%). V3 is implementation-complete but its current
-motif output is not competitive, so promotion gates stay open and V2 stays the default.
+**Exit gate:** identify at least the dominant failure regions and show which candidate dimensions materially separate better from worse outcomes.
 
 ---
 
-# Final acceptance
+# P19 — Recover a known-good control surface
 
-Generator V3 is implementation-complete when:
+**Question:** can V3 reproduce/search near historically successful regions before asking it to discover new ones?
 
-- [x] All remaining P4/P5/P6/P7/P9/P15 audit items are closed with regressions.
-- [x] Exact, parameter, grammar, and semantic diversity are separately measurable.
-- [x] Archive niches preserve topology.
-- [x] Multi-recipe, multi-field, cross-dataset generation exists.
-- [x] Archive family/parent decisions affect generation.
-- [x] Two-parent crossover works under bounded complexity.
-- [x] V3 is auditable and reproducible.
-- [x] Point-in-time replay exists.
-- [ ] Equal-budget replay and small live campaigns justify promotion. Replay is at parity, and the live V3 campaigns produced 0 IS passes, so promotion is **not** justified and V2 stays the default.
-- [x] Until then, V2 remains the default.
+This is the most important control experiment.
 
-> **Core rule: search over hypotheses, not merely field names.**
+## P19.1 Historical seed bank
+
+- [ ] Build a point-in-time-safe seed bank from historical candidates that had reached IS/CORR gates **before** the target campaign clock.
+- [ ] Store only evidence available at that time.
+- [ ] Tag each seed with motif, source profile, grammar/semantic skeleton, settings and outcome stage.
+
+## P19.2 V2 reconstruction control
+
+- [ ] Make V3 generate controlled candidates structurally near known V2 successes:
+  - same source + nearby recipe
+  - same motif + new compatible source
+  - same semantic skeleton + field substitution
+  - one-edit mutation
+- [ ] Run equal-budget:
+  - original/near-original V2 controls
+  - warm-started V3
+  - ordinary V3
+- [ ] Determine whether V3's weak live output is caused primarily by its search distribution rather than current BRAIN conditions.
+
+## P19.3 Distance ladder
+
+- [ ] Define mutation/search distance bands from a proven seed:
+  - D0 exact/control
+  - D1 parameter-only
+  - D2 one structural edit
+  - D3 source transfer
+  - D4 semantic/motif change
+- [ ] Measure pass probability versus distance.
+
+**Research:** warm-started GP and AutoAlpha both motivate focusing search around promising regions rather than restarting from nearly uniform novelty.
+
+- Weizhe Ren, Yichen Qin, Yang Li — *Alpha Mining and Enhancing via Warm Start Genetic Programming for Quantitative Investment*, arXiv:2412.00896.
+- Tianping Zhang, Yuanqi Li, Yifei Jin, Jian Li — *AutoAlpha*, arXiv:2002.08245.
+
+**Exit gate:** demonstrate a non-trivial V3-controlled region whose live pass rate is materially above the current 0% and whose behavior is reproducible.
+
+---
+
+# P20 — Quality-conditioned quality-diversity
+
+**Question:** how do we keep diversity without spending most capacity on diverse junk?
+
+Current novelty/search signals should become **local competition inside meaningful niches**.
+
+## P20.1 Redefine archive objective
+
+- [ ] Keep niche dimensions interpretable and stable.
+- [ ] Within each niche, rank candidates by point-in-time quality evidence instead of sparsity alone.
+- [ ] Retain one or a few elites per niche based on:
+  - IS/CORR stage reached
+  - Sharpe/Fitness
+  - turnover acceptability
+  - robustness/stability evidence
+- [ ] Keep exploration reserve for empty/under-tested niches.
+
+## P20.2 Quality-conditioned novelty
+
+Replace the mental model:
+
+```text
+novelty → simulate
+```
+
+with:
+
+```text
+quality prior × novelty × uncertainty / cost
+```
+
+- [ ] Novelty must not compensate for strongly negative quality evidence.
+- [ ] Quality must not collapse the search into one family/skeleton.
+- [ ] Use bounded terms and explicit floors/caps.
+- [ ] Keep exact deduplication and point-in-time safety unchanged.
+
+## P20.3 Local-competition experiment
+
+Run equal-budget arms:
+
+```text
+novelty-only V3
+archive-quality only
+quality-conditioned QD
+V2 control
+```
+
+Measure IS_PASS/simulation first, then survivor diversity.
+
+**Research:**
+
+- Mouret & Clune — *Illuminating search spaces by mapping elites*, arXiv:1504.04909.
+- Pugh, Soros & Stanley — *Quality Diversity: A New Frontier for Evolutionary Computation*, DOI:10.3389/frobt.2016.00040.
+- AutoAlpha's PCA-QD is a domain-specific comparison point.
+
+**Exit gate:** improve live/replay efficiency without reducing effective survivor diversity to a trivial single niche.
+
+---
+
+# P21 — Learn conditional motif/source/recipe quality
+
+**Question:** which hypotheses work **where**, rather than which motif works globally?
+
+A global motif success count is too coarse.
+
+## P21.1 Conditional statistics
+
+- [ ] Add point-in-time outcome statistics over a bounded hierarchy such as:
+
+```text
+motif
+motif × source category
+motif × dataset
+motif × semantic-role signature
+motif × recipe bucket
+mutation operation × parent-quality bucket
+```
+
+- [ ] Use hierarchical backoff when samples are sparse:
+  `specific → category → motif → global prior`.
+- [ ] Require minimum evidence before a narrow bucket can dominate allocation.
+
+## P21.2 Posterior quality prior
+
+- [ ] Estimate `P(IS_PASS | context)` or an equivalent bounded quality score.
+- [ ] Keep exploration via Thompson/UCB-style uncertainty rather than zeroing weak buckets forever.
+- [ ] Distinguish:
+  - attempts
+  - simulations
+  - IS passes
+  - CORR passes
+  - skipped duplicates
+- [ ] Do not treat skipped/non-simulated proposals as negative performance outcomes.
+
+## P21.3 Recipe learning
+
+- [ ] Measure whether lookback, normalization, decay, neutralization, sign and winsorization effects are motif/source dependent.
+- [ ] Stop sampling obviously poor recipe regions uniformly once evidence is strong.
+- [ ] Retain an exploration floor to detect regime change.
+
+**Exit gate:** conditional allocation must beat global motif allocation in point-in-time replay and then in a small matched live campaign.
+
+---
+
+# P22 — Warm-started exploit and structure-preserving mutation
+
+**Question:** can exploitation produce useful novelty by changing one justified component at a time?
+
+## P22.1 Mutation ladder
+
+Prefer controlled mutations around proven seeds:
+
+1. [ ] recipe/parameter adjustment
+2. [ ] normalization/group adjustment
+3. [ ] compatible field substitution
+4. [ ] same-motif dataset transfer
+5. [ ] add/remove one component
+6. [ ] motif change
+7. [ ] crossover only after evidence supports it
+
+- [ ] Track pass rate by mutation distance and operation.
+- [ ] Preserve the economic core of a parent when the operation is intended as exploitation.
+- [ ] Penalize operations whose live children repeatedly destroy parent quality.
+
+## P22.2 Parent quality
+
+- [ ] Parent selection should include point-in-time outcome quality, not only archive diversity.
+- [ ] Distinguish exploration parents from exploitation parents.
+- [ ] Test whether parents closer to IS/CORR success produce better children.
+
+## P22.3 Crossover budget
+
+- [ ] Keep crossover share low until it demonstrates positive marginal value.
+- [ ] Compare crossover children against one-edit mutations from the same parent pool.
+- [ ] If crossover remains weak, allow adaptive allocation to shrink it close to the exploration floor.
+
+**Research:** warm-start GP and AutoAlpha directly motivate promising-region initialization and controlled evolution.
+
+**Exit gate:** exploit/mutation must show a measurable pass-rate gradient with parent quality and/or mutation distance.
+
+---
+
+# P23 — Optimize marginal contribution, not isolated alpha quality
+
+**Question:** does a candidate improve the **set** of surviving alphas?
+
+A high-quality isolated factor can still be redundant.
+
+## P23.1 Collection-aware evidence
+
+For candidates with sufficient local evidence, estimate:
+
+- [ ] marginal IC / predictive contribution versus the current survivor set
+- [ ] correlation to existing survivors
+- [ ] incremental combination-model value where feasible
+- [ ] incremental coverage of source/semantic niches
+
+Do not use future outcomes relative to the campaign clock.
+
+## P23.2 Two-stage objective
+
+Keep simulation search and final portfolio selection distinct:
+
+```text
+stage 1: probability of surviving BRAIN gates
+stage 2: marginal contribution among survivors
+```
+
+- [ ] Do not sacrifice basic pass probability for portfolio novelty too early.
+- [ ] Once candidates are credible, reward low redundancy and incremental set value.
+
+## P23.3 Dynamic exploit prior
+
+- [ ] Test whether exploit should prefer motifs/sources that add value to the current alpha collection rather than merely repeating individually strong structures.
+
+**Research:**
+
+- Shuo Yu et al. — *Generating Synergistic Formulaic Alpha Collections via Reinforcement Learning*, KDD 2023, DOI:10.1145/3580305.3599831.
+- Hao Shi et al. — *AlphaForge*, AAAI 2025, DOI:10.1609/aaai.v39i12.33365.
+
+**Exit gate:** collection-aware ranking must improve downstream correlation/diversification metrics without lowering IS_PASS/simulation materially.
+
+---
+
+# P24 — Cheap surrogate and staged pre-simulation screening
+
+**Question:** can local evidence rank obviously weak candidates before expensive BRAIN simulation?
+
+Start advisory; do not hard-reject from an unvalidated model.
+
+## P24.1 Feature set
+
+Build features only from information available pre-simulation:
+
+- [ ] grammar/semantic hashes and complexity
+- [ ] motif/source/category/role signature
+- [ ] recipe/settings
+- [ ] archive occupancy and parent quality
+- [ ] mutation distance / operation
+- [ ] historical conditional statistics
+- [ ] inexpensive local signal statistics when available and point-in-time safe
+
+## P24.2 Targets
+
+Train/calibrate separate targets where possible:
+
+- [ ] probability of LOW_SHARPE
+- [ ] probability of LOW_FITNESS
+- [ ] turnover risk
+- [ ] IS_PASS probability
+- [ ] expected robustness/stability
+
+## P24.3 Validation
+
+- [ ] strict time split / rolling validation
+- [ ] calibration curves
+- [ ] precision/recall in the top-ranked simulation bucket
+- [ ] compare against simple priors before using complex models
+- [ ] measure **passes captured per fixed simulation budget**
+
+Initially use the surrogate to **order/downweight**, not hard reject.
+
+**Research:**
+
+- Ding et al. — *AlphaEval: A Comprehensive and Efficient Evaluation Framework for Formula Alpha Mining*, KDD 2026 / arXiv:2508.13174.
+
+Use its multi-dimensional evaluation idea as a comparison point; reproduce only dimensions supported by this repo's data.
+
+**Exit gate:** a point-in-time surrogate must improve pass capture under a fixed replay/live budget and remain calibrated out of sample.
+
+---
+
+# P25 — Controlled ablation and promotion
+
+Do not judge the new roadmap from one mixed campaign.
+
+## P25.1 Equal-budget arms
+
+At minimum compare:
+
+```text
+A  V2 default
+B  current V3
+C  V3 exploit-only / warm-start
+D  V3 quality-conditioned QD
+E  V3 conditional motif/source allocation
+F  V3 + surrogate ordering
+G  full quality-aware V3
+```
+
+Where budget allows, separately test mutation and crossover contribution.
+
+## P25.2 Required metrics
+
+Primary:
+
+- [ ] IS_PASS / simulation
+- [ ] CORR_PASS / simulation
+- [ ] simulations per IS_PASS
+- [ ] simulations per CORR_PASS
+
+Secondary:
+
+- [ ] median/upper-tail Sharpe and Fitness
+- [ ] turnover-failure rate
+- [ ] effective grammar/semantic/family diversity **among survivors**
+- [ ] pairwise survivor correlation
+- [ ] robustness/stability metrics
+- [ ] mode/motif/source concentration
+
+## P25.3 Promotion gate
+
+Promote V3 only after multiple independent matched-budget live campaigns show:
+
+- [ ] materially better simulation efficiency than the current V3
+- [ ] competitive performance versus V2
+- [ ] no material collapse in survivor diversity
+- [ ] acceptable correlation and robustness
+- [ ] no point-in-time leakage
+- [ ] reproducibility from stored campaign configuration
+
+A single strong campaign is evidence, not promotion.
+
+---
+
+# Deferred research branch — only after P18–P24 evidence
+
+Do **not** jump here to avoid fixing the basic search distribution.
+
+Potential follow-ups:
+
+- [ ] **Tree/MCTS search:** compare against *Navigating the Alpha Jungle: An LLM-Powered MCTS Framework for Formulaic Alpha Factor Mining* (AAAI 2026, DOI:10.1609/aaai.v40i2.37069).
+- [ ] **Learned alpha-search policy:** compare concepts from *AlphaEvolve* (SIGMOD 2021, DOI:10.1145/3448016.3457324).
+- [ ] Learned embeddings for semantic niches.
+- [ ] Regime-conditioned policy allocation.
+- [ ] Dynamic factor combination after a credible survivor pool exists.
+
+These become worthwhile only if P18–P24 show that the local quality model and search objective are calibrated.
+
+---
+
+# Recommended order
+
+```text
+P16  small correctness/observability cleanup
+P18  explain the 0/138 result
+P19  recover a known-good control surface
+P20  quality-conditioned QD
+P21  conditional motif/source/recipe evidence
+P22  warm-start exploit + controlled mutation
+P23  collection-aware contribution
+P24  surrogate ordering
+P25  ablation + promotion
+```
+
+P23 and P24 may proceed in parallel after P20/P21 produce stable evidence tables.
+
+---
+
+# Research reading queue
+
+Read with a concrete implementation question; record the useful mechanism and the assumptions that do **not** transfer to WorldQuant BRAIN.
+
+1. [ ] **AutoAlpha** — hierarchical promising-region search, PCA-QD, warm start. arXiv:2002.08245.
+2. [ ] **Warm Start Genetic Programming** — promising-region initialization and structural constraints. arXiv:2412.00896.
+3. [ ] **MAP-Elites** — quality within behavior niches. arXiv:1504.04909.
+4. [ ] **Quality Diversity: A New Frontier** — local competition and QD failure modes. DOI:10.3389/frobt.2016.00040.
+5. [ ] **Generating Synergistic Formulaic Alpha Collections via RL** — optimize incremental collection value. DOI:10.1145/3580305.3599831.
+6. [ ] **AlphaForge** — generation + dynamic combination and diversity. DOI:10.1609/aaai.v39i12.33365.
+7. [ ] **AlphaEval** — multi-dimensional cheap evaluation beyond backtest/IC alone. arXiv:2508.13174.
+8. [ ] **AlphaEvolve / Alpha Jungle MCTS** — later comparison for learned/hierarchical search, not immediate prerequisites.
+
+For each paper add a short note to the relevant P-section:
+
+```text
+mechanism worth testing:
+assumption that differs from BRAIN:
+minimal experiment:
+metric that would falsify the idea:
+```
+
+---
+
+# Final rule
+
+> **The generator is no longer rewarded for being different. It is rewarded for discovering distinct hypotheses in regions where point-in-time evidence says useful alphas are plausible.**
