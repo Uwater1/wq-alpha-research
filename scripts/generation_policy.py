@@ -21,8 +21,10 @@ import hashlib
 import json
 import math
 import random
+import sqlite3
 import sys
 from dataclasses import dataclass, field as dataclass_field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -35,6 +37,29 @@ import diversity  # noqa: E402
 import expression_grammar as grammar  # noqa: E402
 
 GENERATION_POLICY_VERSION = "generation-policy-v1"
+#: ``meta`` key holding the last archive-refresh failure (P16). Readable without the DB logs,
+#: so a campaign can never look archive-informed while its derived state is stale.
+ARCHIVE_REFRESH_FAILURE_KEY = "archive_refresh_failed"
+#: SQLite messages that genuinely mean "this store has no derived archive yet". Anything else
+#: (schema drift, locking, corruption) is a real failure and must fail fast (P16).
+ARCHIVE_UNAVAILABLE_MARKERS = (
+    "no such table: archive_cells",
+    "no such table: candidates",
+    "no such table: research_trials",
+)
+
+
+class ArchiveRefreshError(RuntimeError):
+    """The derived archive could not be rebuilt for a reason that is not merely "absent".
+
+    Planning against a silently stale archive produces a normal-looking, archive-informed
+    plan from state that no longer reflects reality (P16), so this is raised instead of
+    being swallowed by the caller.
+    """
+
+    def __init__(self, message: str, *, diagnostic: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostic: dict[str, Any] = dict(diagnostic or {})
 
 #: Initial V3 defaults (P17). Configurable, and later learnable.
 STRATEGY_WEIGHTS: dict[str, float] = {
@@ -139,6 +164,10 @@ class Plan:
     motif_allocation: Mapping[str, int] = dataclass_field(default_factory=dict)
     #: Bounded adaptive mutation allocation across concrete edits (P9.2).
     mutation_allocation: Mapping[str, int] = dataclass_field(default_factory=dict)
+    #: Whether the derived archive actually rebuilt before this plan was built (P16).
+    archive_refresh: bool = False
+    #: The forced motif the whole plan was built for, when one was pinned (P16).
+    forced_motif: str = ""
 
     @property
     def planned_budget(self) -> int:
@@ -173,6 +202,8 @@ class Plan:
             "max_family_share": self.max_family_share,
             "motif_allocation": dict(self.motif_allocation),
             "mutation_allocation": dict(self.mutation_allocation),
+            "archive_refresh": bool(self.archive_refresh),
+            "forced_motif": self.forced_motif,
             "slots": [slot.as_dict() for slot in self.slots],
         }
 
@@ -548,13 +579,49 @@ def _structure_novelty(
     )
 
 
+def _record_archive_refresh_failure(db: Any, error: BaseException, *, expected: bool) -> dict[str, Any]:
+    """Persist a visible ``archive_refresh_failed`` diagnostic; never mask ``error``.
+
+    The diagnostic goes to ``meta`` (cheap to read back, no schema change) and to the event
+    log. Both writes are best-effort: a store that is too broken to accept the diagnostic is
+    exactly the case where the original exception must reach the caller intact.
+    """
+    diagnostic: dict[str, Any] = {
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "error_type": type(error).__name__,
+        "error": str(error)[:500],
+        "expected_unavailable": bool(expected),
+    }
+    try:
+        set_meta = getattr(db, "set_meta", None)
+        if set_meta is not None:
+            set_meta(ARCHIVE_REFRESH_FAILURE_KEY, json.dumps(diagnostic, sort_keys=True))
+    except Exception:  # pragma: no cover - the store itself rejected the diagnostic
+        pass
+    try:
+        log_event = getattr(db, "log_event", None)
+        if log_event is not None:
+            log_event(
+                "archive", "archive_cells", "archive_refresh_failed",
+                error_category=diagnostic["error_type"], payload=diagnostic,
+            )
+    except Exception:  # pragma: no cover - event log unavailable
+        pass
+    return diagnostic
+
+
 def refresh_archive(db: Any) -> bool:
     """Rebuild the derived archive so planning sees every candidate settled so far (P5).
 
     ``archive_cells`` is derived state, so refreshing it at the planning boundary makes
     newly settled candidates influence the next campaign without an undocumented manual
-    rebuild. Returns whether the refresh ran; a store without the archive tables is left
-    untouched rather than failing the plan.
+    rebuild.
+
+    Returns whether a rebuild ran. A store that has no archive tables yet is the only case
+    that returns ``False`` without raising: that is "no archive", not "stale archive". Any
+    other failure (schema drift, locking, corruption) persists an ``archive_refresh_failed``
+    diagnostic and raises :class:`ArchiveRefreshError`, because planning must not continue
+    against derived state that may not describe the candidate population any more (P16).
     """
     if db is None:
         return False
@@ -563,9 +630,54 @@ def refresh_archive(db: Any) -> bool:
         return False
     try:
         rebuild(db)
-    except Exception:  # pragma: no cover - derived/advisory state only
-        return False
+    except sqlite3.OperationalError as error:
+        message = str(error).lower()
+        if any(marker in message for marker in ARCHIVE_UNAVAILABLE_MARKERS):
+            _record_archive_refresh_failure(db, error, expected=True)
+            return False
+        diagnostic = _record_archive_refresh_failure(db, error, expected=False)
+        raise ArchiveRefreshError(
+            f"archive refresh failed: {error}", diagnostic=diagnostic,
+        ) from error
+    except Exception as error:  # pragma: no cover - defensive: any real rebuild failure
+        diagnostic = _record_archive_refresh_failure(db, error, expected=False)
+        raise ArchiveRefreshError(
+            f"archive refresh failed: {error}", diagnostic=diagnostic,
+        ) from error
     return True
+
+
+def _planned_partner(primary: Any, sources: Sequence[Any], global_sources: Sequence[Any]) -> Any | None:
+    """The extra source a two-input motif will actually be built with (P16).
+
+    The materializer appends a partner field when the plan supplies too few sources; if the
+    planner cannot say which field that will be, the planned skeleton hash describes a
+    different tree than the emitted one. This resolves the *same* cross-dataset preference in
+    the same order as ``generator._partner_fields`` so planning and materialization agree.
+    """
+    primary_id = str(getattr(primary, "name", ""))
+    primary_dataset = str(getattr(primary, "dataset", ""))
+
+    def usable(item: Any) -> bool:
+        return (
+            str(getattr(item, "name", "")) != primary_id
+            and str(getattr(item, "field_type", grammar.MATRIX)).upper() in grammar.SOURCE_TYPES
+        )
+
+    def key(item: Any) -> tuple[str, str]:
+        return (str(getattr(item, "dataset", "")), str(getattr(item, "name", "")))
+
+    def cross(pool: Sequence[Any]) -> list[Any]:
+        return sorted(
+            (item for item in pool if usable(item) and str(getattr(item, "dataset", "")) != primary_dataset),
+            key=key,
+        )
+
+    picked = cross(sources) or cross(global_sources)
+    if picked:
+        return picked[0]
+    same = sorted((item for item in sources if usable(item)), key=key)
+    return same[0] if same else None
 
 
 def _ordered_sources(db: Any, catalog: Any, family: str, scope: Mapping[str, Any] | None) -> list[Any]:
@@ -599,6 +711,7 @@ def plan_campaign(
     parent_pool: int = 24,
     generator_version: str = "",
     refresh_archive_state: bool = True,
+    force_motif: str | None = None,
 ) -> Plan:
     """Turn a campaign budget into an explicit, archive-informed generation plan.
 
@@ -607,12 +720,24 @@ def plan_campaign(
     produce an identical plan.
 
     ``refresh_archive_state`` rebuilds the derived archive before reading it, so a newly
-    settled candidate is visible to the very next plan (P5 archive lifecycle).
+    settled candidate is visible to the very next plan (P5 archive lifecycle). A rebuild
+    that fails for a real reason raises through :func:`refresh_archive` instead of letting
+    planning read stale derived state (P16).
+
+    ``force_motif`` pins *every* slot to one motif **during planning** (P16): the planned
+    motif and skeleton hashes are then computed from that motif, the resolved sources and the
+    exact recipe materialization will sample, so ``plan.slots[i].planned_grammar_hash``
+    describes the tree that is actually emitted. Lineage modes are not planned under a pin,
+    because a mutation or crossover child has no planner-known motif.
     """
     budget = max(0, int(budget))
-    if refresh_archive_state:
-        refresh_archive(db)
+    if force_motif is not None and force_motif not in grammar.MOTIF_BY_ID:
+        raise ValueError(f"unknown motif {force_motif!r}")
+    archive_refreshed = refresh_archive(db) if refresh_archive_state else False
     resolved_mode = resolve_strategy(mode)
+    if force_motif is not None:
+        # A pinned motif is generated, never edited, so the effective mode is exploration.
+        resolved_mode = "explore"
     resolved_weights = {name: float((weights or STRATEGY_WEIGHTS).get(name, 0.0)) for name in GENERATION_MODES}
     families = _families(catalog, family)
     scope = getattr(catalog, "scope", None)
@@ -633,12 +758,15 @@ def plan_campaign(
 
     if budget == 0:
         return Plan(campaign_id, resolved_mode, budget, seed, (), resolved_weights, tuple(allocation),
-                    generator_version, max_family_share=max_family_share)
+                    generator_version, max_family_share=max_family_share,
+                    archive_refresh=archive_refreshed, forced_motif=force_motif or "")
 
     family_slots = _expand_family_slots(allocation, budget)
     if len(family_slots) < budget:
         family_slots.extend([family_slots[-1] if family_slots else families[0]] * (budget - len(family_slots)))
     modes = mode_allocation(budget, resolved_mode, resolved_weights)
+    if force_motif is not None:
+        modes = ["explore"] * budget
 
     context = diversity.novelty_context(db, catalog) if db is not None else diversity.NoveltyContext.empty()
     parents = archive.parents(db, count=parent_pool, seed=seed) if db is not None else []
@@ -669,6 +797,10 @@ def plan_campaign(
     motif_stats = motif_outcome_stats(db, generator_version=generator_version or None)
     motif_budget = allocate_motifs(list(grammar.MOTIF_BY_ID), budget, motif_stats,
                                    seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share)
+    if force_motif is not None:
+        # The pin is the allocation: reporting a Thompson spread the campaign cannot spend
+        # would be fiction (P16).
+        motif_budget = {force_motif: budget}
     remaining_motif_budget = dict(motif_budget)
     # Bounded adaptive mutation allocation (P9.2): mutate slots are budgeted across the
     # concrete structural edits from their corrected historical outcomes, so a successful
@@ -743,6 +875,13 @@ def plan_campaign(
                         and str(getattr(item, "name", "")) != primary.field_id]
         partner_pool = distinct or others
         partner = grammar.field_node_from(partner_pool[slot_rng.randrange(min(4, len(partner_pool)))]) if partner_pool else None
+        if partner is None:
+            # A two-input motif stays planable exactly (P16): resolve the same partner the
+            # materializer would append, so the planned skeleton hash is not computed over a
+            # one-source plan that silently grows a second source later.
+            fallback_partner = _planned_partner(chosen, sources, global_sources)
+            if fallback_partner is not None:
+                partner = grammar.field_node_from(fallback_partner)
         single_source = list(grammar.eligible_motifs([primary]))
         two_source = [
             motif for motif in (grammar.eligible_motifs([primary, partner]) if partner else ())
@@ -779,7 +918,10 @@ def plan_campaign(
                 return None  # a repeat: never spend the reachability seat on a known structure
             return "cross_dataset_composite"
 
-        if not eligible:
+        if force_motif is not None:
+            # Pinned at planning time: identical to what materialization will build (P16).
+            motif_id = force_motif
+        elif not eligible:
             motif_id = "cross_sectional_level"
         elif effective_mode == "explore":
             # Budget grammar/semantic novelty *before* materialization (P4.2): explore slots go
@@ -825,7 +967,9 @@ def plan_campaign(
                 planned_grammar_hash, planned_semantic_hash = grammar_key, semantic_key
 
         reason = "under-tested semantic niche"
-        if effective_mode == "explore":
+        if force_motif is not None:
+            reason = f"forced motif {force_motif} on planned sources"
+        elif effective_mode == "explore":
             reason = "unseen motif for this campaign" if motif_id not in context.motifs else "sparse archive niche"
         elif effective_mode == "exploit":
             if motif_id in proven.get(slot_family, set()):
@@ -884,6 +1028,8 @@ def plan_campaign(
         max_family_share=float(max_family_share),
         motif_allocation=dict(motif_budget),
         mutation_allocation=dict(mutation_budget),
+        archive_refresh=archive_refreshed,
+        forced_motif=force_motif or "",
     )
 
 

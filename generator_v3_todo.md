@@ -24,15 +24,15 @@ No new feature should reopen P0–P15 unless it breaks one of these contracts.
 
 These are robustness cleanups, not a new redesign.
 
-- [ ] **Forced `--motif` plan/materialization consistency.**  
-  A forced motif is currently applied after a normal plan is built, so planned motif/hash metadata can describe a structure that will not be emitted.  
-  **Do:** pass the forced motif into planning and compute the correct planned hashes from the start, or explicitly replace/clear planned structure metadata before materialization.  
-  **Regression:** forced motif plan → materialize → planned motif/hash == emitted motif/hash.
+- [x] **Forced `--motif` plan/materialization consistency.**  
+  The forced motif is now passed into `plan_campaign(force_motif=...)`, which pins every slot's motif and computes the planned skeleton hashes from that motif, the resolved sources and the exact recipe materialization samples. A direct out-of-band `materialize(force_motif=...)` call replaces the slot's planned structure instead of carrying a claim about another tree, and every proposal records `planned_motif_id` / `planned_grammar_hash` / `planned_structure_matched`, with `motif_fallback` set on any disagreement.  
+  **Regression:** `test_forced_motif_plan_hashes_describe_the_emitted_structure` (1- and 2-source motifs), `test_out_of_band_forced_motif_does_not_reuse_the_planned_structure`.
 
-- [ ] **Archive refresh failure visibility.**  
-  `refresh_archive()` currently catches broad exceptions and planning can continue against stale state.  
-  **Do:** distinguish expected “archive unavailable” cases from real DB/schema/locking failures; fail fast or persist a visible `archive_refresh_failed` diagnostic.  
-  **Regression:** injected rebuild error cannot silently produce a normal-looking archive-informed plan.
+- [x] **Archive refresh failure visibility.**  
+  `refresh_archive()` now returns `False` only for a genuinely absent archive (`no such table`), and raises `generation_policy.ArchiveRefreshError` for real schema/locking/corruption failures while persisting an `archive_refresh_failed` diagnostic to `meta` and the event log. `plan_campaign` propagates it (with an explicit `refresh_archive_state=False` opt-out) and `Plan.archive_refresh` records whether derived state was actually rebuilt.  
+  **Regression:** `test_injected_archive_rebuild_failure_cannot_produce_a_normal_plan`, `test_missing_derived_archive_is_not_reported_as_a_stale_one`.
+
+- [x] **P16 complete** — 488 offline tests green; documented in `generator_v3.md`.
 
 ---
 

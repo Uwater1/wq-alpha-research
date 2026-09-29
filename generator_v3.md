@@ -68,10 +68,10 @@ trial ledger + archive + empirical statistics
 
 ## Small engineering carryovers
 
-These do not reopen P0–P15, but should be cleaned up early in the quality phase.
+These did not reopen P0–P15 and are now closed (P16).
 
-- [ ] **Forced `--motif` planning consistency.** A forced motif is currently applied at materialization after a normal plan is built, so the plan's motif/hash metadata can describe a different structure. Either plan the forced motif from the start or explicitly clear/replace planned structure metadata.
-- [ ] **Archive refresh failure visibility.** `refresh_archive()` currently swallows rebuild exceptions and lets planning continue. Persist/report refresh failure or fail fast for real DB/schema errors so stale derived state is never silent.
+- [x] **Forced `--motif` planning consistency.** The pin is planned, not patched: `plan_campaign(force_motif=...)` pins the slot motif and computes planned skeleton hashes from the pinned motif, its resolved sources and the exact recipe materialization samples. Out-of-band `materialize(force_motif=...)` replaces the planned structure instead of mislabelling it; proposals carry `planned_motif_id` / `planned_grammar_hash` / `planned_structure_matched`, dry plans report `structure_mismatch`.
+- [x] **Archive refresh failure visibility.** `refresh_archive()` returns `False` only for an absent archive and raises `ArchiveRefreshError` (persisting an `archive_refresh_failed` diagnostic to `meta` and the event log) for real schema/locking failures. `Plan.archive_refresh` reports whether derived state actually rebuilt, and `refresh_archive_state=False` is the explicit opt-out.
 
 ## New objective
 

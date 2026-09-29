@@ -476,13 +476,18 @@ class CandidateGenerator:
         max_family_share: float = generation_policy.DEFAULT_MAX_FAMILY_SHARE,
         exploration_reserve: float = generation_policy.DEFAULT_EXPLORATION_RESERVE,
         parent_pool: int = 24,
+        force_motif: str | None = None,
     ) -> generation_policy.Plan:
-        """Build an archive-informed, deterministic campaign plan (no BRAIN calls, no queue writes)."""
+        """Build an archive-informed, deterministic campaign plan (no BRAIN calls, no queue writes).
+
+        ``force_motif`` is applied *inside* planning (P16), so the plan's motif and skeleton
+        hashes describe the tree materialization will emit instead of the one it replaced.
+        """
         return generation_policy.plan_campaign(
             self.db, self.catalog, campaign_id, budget, seed, mode,
             family=family, max_family_share=max_family_share,
             exploration_reserve=exploration_reserve, parent_pool=parent_pool,
-            generator_version=GENERATOR_VERSION_V3,
+            generator_version=GENERATOR_VERSION_V3, force_motif=force_motif,
         )
 
     def _material_field_node(self, name: str) -> grammar.FieldNode:
@@ -558,10 +563,17 @@ class CandidateGenerator:
         a typed two-parent composition; everything else samples an independent recipe and builds
         the motif AST. A motif that cannot be realized falls back rather than dropping a slot.
         """
-        strategy = slot.generation_mode
-        motif_id = force_motif or slot.motif_id
         if force_motif is not None:
-            strategy = "explore"
+            # Out-of-band pin (the plan did not describe this tree): replace the slot's planned
+            # structure instead of reporting the plan's motif/hash for a different structure.
+            # The supported path is ``plan(force_motif=...)``, which plans the pin up front;
+            # this branch keeps a direct ``materialize(force_motif=...)`` call honest (P16).
+            slot = replace(
+                slot, motif_id=force_motif, generation_mode="explore", parent_ids=(),
+                mutation_operation="", planned_grammar_hash="", planned_semantic_hash="",
+            )
+        strategy = slot.generation_mode
+        motif_id = slot.motif_id
         if force_motif is None and slot.generation_mode == "mutate" and slot.parent_ids:
             parent = self.db.get_candidate(int(slot.parent_ids[0]))
             if parent:
@@ -636,8 +648,21 @@ class CandidateGenerator:
             "recipe": recipe.as_dict(),
             "generation_mode": realized_mode,
             "planned_family": slot.family,
-            "generator_strategy": realized_mode if force_motif is None else strategy,
+            "generator_strategy": realized_mode,
+            # Planned-vs-emitted structure accounting (P16). When the planner pinned a motif
+            # and structure, the emitted skeleton must be the planned one; a disagreement is
+            # recorded rather than hidden, and the claim is never kept when planning could not
+            # describe the tree at all.
+            "planned_motif_id": slot.motif_id,
+            "planned_grammar_hash": slot.planned_grammar_hash,
         }
+        emitted_grammar_hash = grammar.grammar_skeleton_hash(expression, self.metadata())
+        if slot.planned_grammar_hash:
+            parameters["planned_structure_matched"] = emitted_grammar_hash == slot.planned_grammar_hash
+            if not parameters["planned_structure_matched"]:
+                parameters["motif_fallback"] = True
+            if motif_id != slot.motif_id:
+                parameters["motif_fallback"] = True
         if lineage_fallback:
             # The planned lineage mode could not be realized here; keep the intent auditable
             # while the realized mode and the (empty) parent ids state what actually happened.
@@ -657,9 +682,9 @@ class CandidateGenerator:
             motif_id=motif_id,
             recipe_index=slot.recipe_index,
             generation_mode=realized_mode,
-            strategy=realized_mode if force_motif is None else strategy,
+            strategy=realized_mode,
             source_profile=profile,
-            grammar_skeleton_hash=grammar.grammar_skeleton_hash(expression, self.metadata()),
+            grammar_skeleton_hash=emitted_grammar_hash,
             semantic_skeleton_hash=grammar.semantic_skeleton_hash(expression, self.metadata()),
             recipe=recipe.as_dict(),
         )
@@ -743,12 +768,12 @@ class CandidateGenerator:
         """Plan a campaign and materialize it into proposals (no queue writes)."""
         plan = self.plan(
             campaign_id=campaign_id, budget=count, seed=seed, mode=strategy,
-            family=family, max_family_share=max_family_share,
+            family=family, max_family_share=max_family_share, force_motif=motif,
         )
         proposals: list[Proposal] = []
         for slot in plan.slots:
             proposal = self.materialize(slot, campaign_id=campaign_id, seed=seed,
-                                        limits=limits, force_motif=motif)
+                                        limits=limits)
             if proposal is not None:
                 proposals.append(proposal)
         if screen:
@@ -1728,9 +1753,19 @@ def _v3_distribution(plan: generation_policy.Plan, proposals: Sequence[Proposal]
         (str(proposal.parameters.get("planned_operation") or ""), str(proposal.parameters.get("realized_operation") or ""))
         for proposal in proposals if proposal.parameters.get("operation_fallback")
     ]
+    # Planned-vs-emitted structure disagreements (P16) must be visible in a dry plan: a
+    # forced-motif campaign whose slots silently fell back is not the campaign that was asked for.
+    structure_mismatch = [
+        (str(proposal.parameters.get("planned_motif_id") or ""), proposal.motif_id)
+        for proposal in proposals if proposal.parameters.get("motif_fallback")
+    ]
     return {
         "planned_budget": plan.planned_budget,
         "materialized": len(proposals),
+        "archive_refresh": bool(plan.archive_refresh),
+        "forced_motif": plan.forced_motif,
+        "structure_mismatch": counts(f"{planned}->{emitted}" for planned, emitted in structure_mismatch),
+        "structure_mismatch_count": len(structure_mismatch),
         "generation_mode": counts(proposal.generation_mode for proposal in proposals),
         "family": counts(proposal.family for proposal in proposals),
         "motif": counts(proposal.motif_id for proposal in proposals),

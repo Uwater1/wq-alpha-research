@@ -958,3 +958,103 @@ def test_add_component_is_the_stable_combine_operation_name(db):
     combined = [p for p in proposals if p.parameters.get("operation") in {"add_component", "combine_signals"}]
     assert combined, "the sharpe repair must offer a structural combine"
     assert all(p.parameters["operation"] == "add_component" for p in combined)
+
+
+# ---------------------------------------------------------------------------
+# P16: forced-motif planning consistency and archive-refresh visibility
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("motif", ["time_series_level", "normalized_difference", "confirming_signals"])
+def test_forced_motif_plan_hashes_describe_the_emitted_structure(db, motif):
+    """P16: a forced motif is planned, not patched after the fact.
+
+    Every slot the planner could describe must materialize the structure it planned, and the
+    plan must agree with the emitted motif. A slot the planner could *not* describe must not
+    claim a planned hash at all.
+    """
+    plan, proposals = generator.CandidateGenerator(db, seed=6).generate(
+        campaign_id=f"v3-p16-{motif}", count=18, seed=6, strategy="mixed", motif=motif,
+    )
+    assert plan.forced_motif == motif
+    assert plan.motif_allocation == {motif: 18}
+    assert len(proposals) == plan.planned_budget == 18
+    assert all(proposal.motif_id == motif for proposal in proposals)
+    assert all(proposal.generation_mode == "explore" for proposal in proposals)
+    assert all(not proposal.parent_ids for proposal in proposals)
+    assert all(not proposal.parameters.get("motif_fallback") for proposal in proposals)
+
+    planned = [slot for slot in plan.slots if slot.planned_grammar_hash]
+    assert planned, "a forced motif on eligible sources must be plannable"
+    by_slot = {slot.slot: slot for slot in plan.slots}
+    for index, proposal in enumerate(proposals):
+        slot = by_slot[index]
+        assert proposal.parameters["planned_motif_id"] == motif
+        if slot.planned_grammar_hash:
+            assert proposal.grammar_skeleton_hash == slot.planned_grammar_hash
+            assert proposal.semantic_skeleton_hash == slot.planned_semantic_hash
+            assert proposal.parameters["planned_structure_matched"] is True
+        else:
+            # Not plannable here: the claim is cleared, never carried over from another tree.
+            assert proposal.parameters["planned_grammar_hash"] == ""
+
+
+def test_out_of_band_forced_motif_does_not_reuse_the_planned_structure(db):
+    """A direct ``materialize(force_motif=...)`` must replace the plan, not mislabel it."""
+    plan, _ = generator.CandidateGenerator(db, seed=6).generate(
+        campaign_id="v3-p16-oob", count=6, seed=6, strategy="mixed",
+    )
+    slot = plan.slots[0]
+    assert slot.planned_grammar_hash
+    proposal = generator.CandidateGenerator(db, seed=6).materialize(
+        slot, campaign_id="v3-p16-oob", seed=6, force_motif="time_series_level",
+    )
+    assert proposal is not None
+    assert proposal.motif_id == "time_series_level"
+    assert proposal.parameters["planned_motif_id"] == "time_series_level"
+    assert proposal.parameters["planned_grammar_hash"] == ""
+    assert "planned_structure_matched" not in proposal.parameters
+
+
+def test_missing_derived_archive_is_not_reported_as_a_stale_one(db):
+    """P16: ``no such table`` is 'no archive yet'; it must not raise or masquerade as healthy."""
+    db.query("DROP TABLE archive_cells")
+    assert policy.refresh_archive(db) is False
+    diagnostic = json.loads(db.get_meta(policy.ARCHIVE_REFRESH_FAILURE_KEY))
+    assert diagnostic["expected_unavailable"] is True
+
+
+def test_injected_archive_rebuild_failure_cannot_produce_a_normal_plan(db, monkeypatch):
+    """P16: a real rebuild error fails fast and is persisted, never planned around."""
+
+    def broken(_db):
+        raise RuntimeError("derived archive rebuild exploded")
+
+    monkeypatch.setattr(archive, "rebuild", broken)
+    with pytest.raises(policy.ArchiveRefreshError) as error:
+        policy.plan_campaign(
+            db, generator.Catalog(), "v3-p16-broken", 10, 0, "mixed",
+            generator_version=generator.GENERATOR_VERSION_V3,
+        )
+    assert "exploded" in str(error.value)
+    diagnostic = json.loads(db.get_meta(policy.ARCHIVE_REFRESH_FAILURE_KEY))
+    assert diagnostic["expected_unavailable"] is False
+    assert diagnostic["error_type"] == "RuntimeError"
+
+    # An opt-out of the refresh is explicit, not an accident of swallowed exceptions.
+    plan = policy.plan_campaign(
+        db, generator.Catalog(), "v3-p16-broken", 10, 0, "mixed",
+        generator_version=generator.GENERATOR_VERSION_V3, refresh_archive_state=False,
+    )
+    assert plan.archive_refresh is False
+    assert plan.planned_budget == 10
+
+
+def test_plan_metadata_reports_the_archive_refresh(db):
+    _settle(db, "group_rank(ts_rank(close,60),subindustry)", "pv1", 1.6)
+    plan = generator.CandidateGenerator(db, seed=3).plan(
+        campaign_id="v3-p16-refresh", budget=8, seed=3, mode="mixed",
+    )
+    assert plan.archive_refresh is True
+    assert plan.as_dict()["archive_refresh"] is True
+    assert archive.parents(db, count=5, seed=0)
