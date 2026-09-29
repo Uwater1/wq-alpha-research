@@ -454,13 +454,26 @@ Start advisory; do not hard-reject from an unvalidated model.
 
 Build features only from information available pre-simulation:
 
-- [ ] grammar/semantic hashes and complexity
-- [ ] motif/source/category/role signature
-- [ ] recipe/settings
-- [ ] archive occupancy and parent quality
-- [ ] mutation distance / operation
-- [ ] historical conditional statistics
+- [x] grammar/semantic hashes and complexity
+- [x] motif/source/category/role signature
+- [x] recipe/settings
+- [x] archive occupancy and parent quality
+- [x] mutation distance / operation
+- [x] historical conditional statistics
 - [ ] inexpensive local signal statistics when available and point-in-time safe
+
+**Implemented (first arm — the roadmap's "simple prior before a complex model"):** the P21
+conditional prior is now a *feature-free model* in the ranking path. `ranking.build_context`
+builds it once per scheduler pass, `quality_prior.context_from_row` derives a candidate's
+context without any expression parsing beyond the profile, and `ranking._contextual_quality`
+moves `expected_quality` by at most `CONTEXTUAL_QUALITY_WEIGHT = 0.35` toward the measured cell
+rate — the minority share is deliberate, because ranking only *reorders* the queue. A lookup
+that backs off to the global level is explicitly refused: "alphas pass 19% overall" is not a
+reason to prefer one queued candidate over another. Every answering level is recorded in
+`Score.reasons` (`conditional_level`, `conditional_mean`, `conditional_simulations`,
+`conditional_specific_simulations`), so a promotion from a thin cell to a broader one is
+auditable. With no settled evidence the term is absent and scores are unchanged to 1e-12.
+The remaining feature/surrogate work (P24.2 targets, P24.3 calibration) is untouched.
 
 ## P24.2 Targets
 

@@ -46,6 +46,11 @@ WEIGHTS: dict[str, float] = {
     "exact_novelty": 0.0,
 }
 
+#: How much measured cell evidence may move ``expected_quality`` (P24.1). Deliberately a
+#: minority share: this ranking only *reorders* the queue, and a cheap conditional prior must
+#: never outvote the structural and family terms on its own.
+CONTEXTUAL_QUALITY_WEIGHT = 0.35
+
 #: Correlated novelty terms are weighted and then *capped*, never summed at full weight.
 NOVELTY_WEIGHTS: dict[str, float] = {"exact": 1.0, "grammar": 0.6, "semantic": 0.6}
 #: The maximum combined novelty a single candidate may contribute.
@@ -79,6 +84,10 @@ class RankingContext:
     queued_total: int = 0
     total_candidates: int = 0
     surrogate_model: dict[str, Any] | None = None
+    #: Point-in-time conditional quality prior over the ledger (P21/P24.1). ``None`` keeps the
+    #: previous hand-written heuristic; a prior that answers only from the global level is
+    #: treated as "no cell evidence" and changes nothing.
+    conditional_prior: Any = None
 
 
 @dataclass
@@ -164,6 +173,14 @@ def build_context(db: Any) -> RankingContext:
     context.queued_total = int(db.query("SELECT COUNT(*) AS n FROM candidates WHERE status='QUEUED'")[0]["n"])
     context.total_candidates = int(db.query("SELECT COUNT(*) AS n FROM candidates")[0]["n"])
     context.surrogate_model = surrogate.load(db)
+    try:
+        # The cheapest useful model of "where do alphas pass": the ledger's own conditional
+        # outcome counts. Advisory only, and built once per scheduler pass (P24.1).
+        import quality_prior
+
+        context.conditional_prior = quality_prior.QualityPrior.build(db)
+    except Exception:  # pragma: no cover - ranking must survive an unbuildable prior
+        context.conditional_prior = None
     return context
 
 
@@ -210,6 +227,37 @@ def structural_prior(row: Mapping[str, Any]) -> tuple[float, dict[str, Any]]:
     return _clamp(score), reasons
 
 
+def _contextual_quality(
+    row: Mapping[str, Any],
+    context: RankingContext,
+    reasons: dict[str, Any],
+) -> float | None:
+    """Measured pass rate of this candidate's own cell, or ``None`` when there is none (P21/P24.1).
+
+    The hierarchical prior already decides how specific an answer is allowed to be, so this
+    only refuses the *global* level: "alphas pass at 19% overall" is not a reason to prefer one
+    queued candidate over another, and using it here would silently re-scale the whole queue.
+    Every level that answered is recorded, so a promotion from a thin cell to a broader one is
+    auditable rather than invisible.
+    """
+    prior = context.conditional_prior
+    if prior is None or not getattr(prior, "tables", None):
+        return None
+    try:
+        import quality_prior
+
+        look = prior.lookup(quality_prior.context_from_row(row))
+    except Exception:  # pragma: no cover - advisory only
+        return None
+    if look.backed_off or look.level == "global":
+        return None
+    reasons["conditional_level"] = look.level
+    reasons["conditional_simulations"] = look.simulations
+    reasons["conditional_mean"] = round(look.mean, 4)
+    reasons["conditional_specific_simulations"] = look.specific.simulations
+    return max(0.0, min(1.0, float(look.mean)))
+
+
 def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
     """Rank one candidate; higher priority means 'simulate this sooner'."""
     expression_hash = str(row.get("expression_hash") or "")
@@ -225,6 +273,12 @@ def score_candidate(row: Mapping[str, Any], context: RankingContext) -> Score:
         reasons["family_pass_rate"] = round(observed, 3)
     else:
         expected_quality = prior
+    contextual = _contextual_quality(row, context, reasons)
+    if contextual is not None:
+        expected_quality = (
+            (1.0 - CONTEXTUAL_QUALITY_WEIGHT) * expected_quality
+            + CONTEXTUAL_QUALITY_WEIGHT * contextual
+        )
     if context.surrogate_model:
         prediction = surrogate.predict(context.surrogate_model, row).get("is_pass")
         if prediction is not None:

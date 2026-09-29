@@ -37,6 +37,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import canonical  # noqa: E402
+import diversity  # noqa: E402
+import expression_grammar as grammar  # noqa: E402
 import quality_diagnostics as diagnostics  # noqa: E402
 import research_db  # noqa: E402
 
@@ -387,6 +390,58 @@ class QualityPrior:
             "global": self.global_evidence.as_dict(),
             "levels": {name: len(table) for name, table in self.tables.items()},
         }
+
+
+def context_from_row(row: Mapping[str, Any]) -> Context:
+    """The pre-simulation context of one *candidate* row, for ranking and scheduling.
+
+    Derived only from what the row itself says, so it is cheap enough to call per queued
+    candidate. ``parent_quality_bucket`` is left empty: resolving a parent's outcome needs the
+    full ledger row map, which is what the diagnostic corpus (not the scheduler) is for — and
+    an unset attribute simply reads as ``unknown`` at every level that uses it.
+    """
+    expression = str(row.get("normalized_expression") or "")
+    parameters = row.get("mutation_parameters_json")
+    if isinstance(parameters, str):
+        try:
+            parameters = json.loads(parameters)
+        except ValueError:
+            parameters = {}
+    parameters = parameters if isinstance(parameters, Mapping) else {}
+    settings = row.get("settings_json")
+    if isinstance(settings, str):
+        try:
+            settings = json.loads(settings)
+        except ValueError:
+            settings = {}
+    settings = settings if isinstance(settings, Mapping) else {}
+    profile = diversity.derive_source_profile(expression) or {}
+    fields = [str(name) for name in (profile.get("field_ids") or canonical.fields_of(expression))]
+    roles = sorted({role for field in fields for role in grammar.infer_field_roles(field)})
+    recipe = row.get("recipe_json")
+    if isinstance(recipe, str):
+        try:
+            recipe = json.loads(recipe)
+        except ValueError:
+            recipe = None
+    if not isinstance(recipe, Mapping) or not recipe:
+        recipe = diagnostic_recipe(expression, settings)
+    return Context(
+        motif_id=str(row.get("motif_id") or parameters.get("motif_id") or "none"),
+        mutation_operation=canonical.normalize_mutation_operation(parameters.get("operation")) or "none",
+        dataset=(list(profile.get("datasets") or []) or ["unknown"])[0],
+        category=(list(profile.get("categories") or []) or ["unknown"])[0],
+        role_signature="+".join(roles) or "generic",
+        recipe_bucket=diagnostics.recipe_bucket(recipe),
+        outer_operator=diagnostics.outer_operator(expression),
+    )
+
+
+def diagnostic_recipe(expression: str, settings: Mapping[str, Any]) -> dict[str, Any]:
+    """The stored recipe, or one reconstructed from settings plus the first window (P21.3)."""
+    import seed_bank  # local: keeps the module import graph acyclic
+
+    return seed_bank.recipe_from_settings(expression, settings)
 
 
 def quality_conditioned_score(
