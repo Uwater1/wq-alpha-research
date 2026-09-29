@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
 import re
 import sqlite3
@@ -37,6 +38,8 @@ import compatibility
 import diversity
 import expression_grammar as grammar
 import generation_policy
+import quality_diagnostics
+import quality_prior
 import research_db
 import seed_bank
 
@@ -87,6 +90,11 @@ WARM_START_BANDS = seed_bank.BANDS
 FIELD_PRESERVING_OPERATIONS = (
     "normalization_change", "group_change", "subtree_replace", "motif_change",
 )
+#: How novel a rung is, for the P20.2 objective: a parameter move is barely new information, a
+#: semantic change genuinely is. Bounded by construction, and priced again by :data:`BAND_COST`.
+BAND_NOVELTY: dict[str, float] = {"D0": 0.0, "D1": 0.2, "D2": 0.45, "D3": 0.7, "D4": 1.0}
+#: Which band each ``BAND_COST`` entry belongs to (cheapest bet first).
+BAND_COST: dict[str, float] = {"D0": 0.5, "D1": 1.0, "D2": 1.1, "D3": 1.35, "D4": 1.6}
 #: Motifs tried, in order, when an ineligible/over-budget motif cannot be materialized.
 FALLBACK_MOTIFS = (
     "cross_sectional_level", "change", "ranked_level", "group_relative", "time_series_level",
@@ -487,17 +495,27 @@ class CandidateGenerator:
         exploration_reserve: float = generation_policy.DEFAULT_EXPLORATION_RESERVE,
         parent_pool: int = 24,
         force_motif: str | None = None,
+        prior: quality_prior.QualityPrior | None = None,
+        recipe_prior: Mapping[str, Mapping[str, int]] | None = None,
     ) -> generation_policy.Plan:
         """Build an archive-informed, deterministic campaign plan (no BRAIN calls, no queue writes).
 
         ``force_motif`` is applied *inside* planning (P16), so the plan's motif and skeleton
         hashes describe the tree materialization will emit instead of the one it replaced.
+        ``prior`` conditions the mode shares and the motif budget on measured evidence (P21.1).
+        ``recipe_prior`` conditions recipe sampling on the values the platform has actually
+        accepted; it defaults to the proven recipe counts in this catalog's scope (P21.3).
         """
+        if recipe_prior is None:
+            recipe_prior = seed_bank.proven_recipe_counts(
+                self.db, scope=getattr(self.catalog, "scope", None),
+            )
         return generation_policy.plan_campaign(
             self.db, self.catalog, campaign_id, budget, seed, mode,
             family=family, max_family_share=max_family_share,
             exploration_reserve=exploration_reserve, parent_pool=parent_pool,
-            generator_version=GENERATOR_VERSION_V3, force_motif=force_motif,
+            generator_version=GENERATOR_VERSION_V3, force_motif=force_motif, prior=prior,
+            recipe_prior=recipe_prior,
         )
 
     def _material_field_node(self, name: str) -> grammar.FieldNode:
@@ -566,6 +584,7 @@ class CandidateGenerator:
         seed: int = 0,
         limits: grammar.ComplexityLimits = V3_LIMITS,
         force_motif: str | None = None,
+        recipe_prior: Mapping[str, Mapping[str, int]] | None = None,
     ) -> Proposal | None:
         """Turn one planned slot into a validated, provenance-complete proposal.
 
@@ -638,7 +657,9 @@ class CandidateGenerator:
         rng = random.Random(generation_policy.recipe_seed(
             campaign_id, seed, [node.field_id for node in fields], motif_id, slot.recipe_index, slot.parent_ids,
         ))
-        recipe = generation_policy.sample_recipe(rng, motif_id)
+        # The same recipe prior the planner used for this slot's skeleton hash, so the emitted
+        # tree is the planned one (P4.2/P21.3).
+        recipe = generation_policy.sample_recipe(rng, motif_id, prior=recipe_prior)
         try:
             node = grammar.build_motif(motif_id, fields, recipe, limits=limits)
         except grammar.GrammarError:
@@ -776,6 +797,111 @@ class CandidateGenerator:
             self.db, as_of=as_of, stages=stages, scope=self.catalog.scope, datasets=datasets,
         )
 
+    def quality_prior(
+        self,
+        *,
+        as_of: str | None = None,
+        min_evidence: int = quality_prior.DEFAULT_MIN_EVIDENCE,
+        generator_versions: Sequence[str] | None = None,
+    ) -> quality_prior.QualityPrior:
+        """The conditional quality prior this campaign may consult (P21).
+
+        Note the difference from :meth:`seed_bank`: the prior is learned from **all** settled
+        evidence up to the clock, including failures, while the seed bank only offers regions
+        the platform already accepted.
+        """
+        return quality_prior.QualityPrior.build(
+            self.db, as_of=as_of, min_evidence=min_evidence,
+            generator_versions=generator_versions,
+        )
+
+    def _warm_start_context(self, record: seed_bank.Seed) -> quality_prior.Context:
+        """The pre-simulation context of "a child of this proven seed" (P21.1)."""
+        roles = sorted({role for field in record.fields for role in grammar.infer_field_roles(field)})
+        return quality_prior.Context(
+            motif_id=record.motif_id or "none",
+            mutation_operation="warm_start",
+            dataset=(record.datasets or ("unknown",))[0],
+            category=(record.categories or ("unknown",))[0],
+            role_signature="+".join(roles) or "generic",
+            recipe_bucket=quality_diagnostics.recipe_bucket(record.recipe),
+            parent_quality_bucket="proven_parent",
+            outer_operator=record.outer_operator,
+        )
+
+    def warm_start_plan(
+        self,
+        seeds: Sequence[seed_bank.Seed],
+        count: int,
+        prior: quality_prior.QualityPrior,
+        *,
+        exploration_floor: float = 0.15,
+        per_seed_cap: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Quality-conditioned ``(seed, rung, variant)`` plan for a warm-started campaign (P21.2).
+
+        Every pair is scored with ``quality x novelty x uncertainty / cost``: the seed's own
+        proven context supplies the quality term, the rung supplies its novelty and its price.
+        Selection then keeps an explicit exploration floor per rung, so a campaign cannot spend
+        everything on D1 just because parameter moves look cheapest today, and spreads the
+        rest across seeds so exploitation is not one lineage.
+
+        A rung is a *design*, not one child: D1 can alternate a settings move with a window
+        move and D2 can try several field-preserving edits, so a rung is enumerated as several
+        variants (``index``). Without them a single proven seed could never fill a budget
+        larger than the four rungs, and the campaign would silently under-spend it.
+        """
+        count = max(0, int(count))
+        if not seeds or count == 0:
+            return []
+        cap = int(per_seed_cap) if per_seed_cap else max(1, math.ceil(count / len(seeds)) + 1)
+        # D0 is skipped everywhere: an exact duplicate is refused by the canonical cache, so it
+        # can neither consume a BRAIN slot nor the campaign budget (P19.3).
+        rungs = [band for band in seed_bank.BANDS if band != "D0"]
+        variants_per_rung = max(1, math.ceil(count / max(1, len(seeds) * len(rungs))))
+        rows: list[dict[str, Any]] = []
+        for seed_index, record in enumerate(seeds):
+            context = self._warm_start_context(record)
+            for band in rungs:
+                score, look = prior.score(
+                    context, novelty=BAND_NOVELTY.get(band, 0.5), cost=BAND_COST.get(band, 1.0),
+                )
+                for variant in range(variants_per_rung):
+                    rows.append({
+                        "seed_index": seed_index, "candidate_id": record.candidate_id,
+                        "band": band, "index": variant,
+                        "score": round(float(score), 8), "look": look.as_dict(),
+                    })
+        rows.sort(key=lambda row: (-row["score"], row["candidate_id"],
+                                   seed_bank.BANDS.index(row["band"]), row["index"]))
+        chosen: list[dict[str, Any]] = []
+        chosen_keys: set[tuple[int, str, int]] = set()
+        used_per_seed: dict[int, int] = {}
+
+        def take(row: dict[str, Any]) -> bool:
+            key = (int(row["candidate_id"]), str(row["band"]), int(row["index"]))
+            if key in chosen_keys or used_per_seed.get(key[0], 0) >= cap:
+                return False
+            chosen.append(row)
+            chosen_keys.add(key)
+            used_per_seed[key[0]] = used_per_seed.get(key[0], 0) + 1
+            return True
+
+        floor_slots = max(1, int(round(count * max(0.0, min(1.0, exploration_floor)))))
+        for band in reversed(rungs):
+            filled = 0
+            for row in rows:
+                if filled >= floor_slots or len(chosen) >= count:
+                    break
+                if row["band"] == band and take(row):
+                    filled += 1
+        for row in rows:
+            if len(chosen) >= count:
+                break
+            take(row)
+        chosen.sort(key=lambda row: (-row["score"], row["candidate_id"]))
+        return chosen[:count]
+
     @staticmethod
     def _recipe_object(recipe: Mapping[str, Any]) -> grammar.Recipe:
         """Typed recipe from a loose mapping, ignoring keys the grammar does not know."""
@@ -821,13 +947,28 @@ class CandidateGenerator:
             node = None
 
         if band == "D1":
-            perturbed = seed_bank.perturb_recipe(
-                recipe, rng, dimensions=seed_bank.SETTINGS_RECIPE_DIMENSIONS,
-            )
-            for key in seed_bank.SETTINGS_RECIPE_DIMENSIONS:
-                if perturbed.get(key) is not None:
-                    settings[key] = perturbed[key]
-            operation = "recipe_perturbation"
+            # A parameter-only edit is *one* parameter: either a settings dimension or the
+            # window inside the expression, never both. Alternating with the magnitude growing
+            # by attempt index gives a small seed bank enough distinct children to fill a
+            # budget while every child stays on the same parameter-only rung (P22.1).
+            magnitude = 1 + (index % 3)
+            window = _first_window(record.expression)
+            if index % 2 == 1 and window is not None and node is not None:
+                options = tuple(
+                    value for value in DEFAULT_WINDOWS if value != window
+                )
+                target = options[rng.randrange(len(options))] if options else window
+                source = _replace_window(record.expression, target)
+                operation = "window_change"
+            else:
+                perturbed = seed_bank.perturb_recipe(
+                    recipe, rng, magnitude=magnitude,
+                    dimensions=seed_bank.SETTINGS_RECIPE_DIMENSIONS,
+                )
+                for key in seed_bank.SETTINGS_RECIPE_DIMENSIONS:
+                    if perturbed.get(key) is not None:
+                        settings[key] = perturbed[key]
+                operation = "recipe_perturbation"
         elif band == "D2":
             # Only field-preserving edits can realize "same sources, one structural edit"; the
             # realized rung is verified and an edit that moved more than asked is reported.
@@ -954,12 +1095,18 @@ class CandidateGenerator:
         limits: grammar.ComplexityLimits = V3_LIMITS,
         screen: bool = True,
         order_seeds: Any = None,
+        prior: quality_prior.QualityPrior | None = None,
+        exploration_floor: float = 0.15,
     ) -> tuple[dict[str, Any], list[Proposal]]:
         """An equal-budget warm-started campaign over the proven seed bank (P19.2).
 
         Seeds are used round-robin across datasets so exploitation cannot collapse onto one
         family, and exact duplicates are dropped rather than queued — a repeated proposal would
         spend a slot on work the cache already answered.
+
+        With a ``prior`` the ``(seed, rung)`` pairs are chosen by conditional quality evidence
+        with an explicit per-rung exploration floor (P21.2); without one the rungs follow the
+        fixed :data:`generation_policy.WARM_START_BAND_WEIGHTS` ladder.
         """
         count = max(0, int(count))
         bank = self.seed_bank(as_of=as_of, datasets=datasets)
@@ -980,30 +1127,58 @@ class CandidateGenerator:
             ordered = list(order_seeds(bank))
         else:
             ordered = _seeds_round_robin(bank)
-        schedule = generation_policy.warm_start_schedule(count, bands, seed=seed)
-        report["requested_bands"] = _counts(schedule)
+        if prior is not None:
+            plan = self.warm_start_plan(
+                ordered, count, prior, exploration_floor=exploration_floor,
+            )
+            report["prior_version"] = quality_prior.QUALITY_PRIOR_VERSION
+            report["selection"] = [
+                {"candidate_id": row["candidate_id"], "band": row["band"],
+                 "index": int(row["index"]), "score": row["score"],
+                 "level": row["look"].get("level")}
+                for row in plan[:10]
+            ]
+            report["selection_count"] = len(plan)
+            report["requested_bands"] = _counts(str(row["band"]) for row in plan)
+            schedule_pairs = [
+                (int(row["candidate_id"]), str(row["band"]), int(row["index"])) for row in plan
+            ]
+        else:
+            schedule = generation_policy.warm_start_schedule(count, bands, seed=seed)
+            schedule_pairs = [(ordered[index % len(ordered)].candidate_id, band, 0)
+                              for index, band in enumerate(schedule)]
+            report["requested_bands"] = _counts(schedule)
+        by_id = {seed.candidate_id: seed for seed in ordered}
 
         proposals: list[Proposal] = []
         seen: set[str] = set()
         used_seeds: set[int] = set()
-        # An equal-budget comparison needs the arms to actually materialize their budget, so an
-        # edit that cannot be realized is retried on the next seed rather than shrinking the
-        # campaign. Every retry is reported: this is not a silent top-up.
+        # An equal-budget comparison needs the arms to actually materialize their budget, so a
+        # pair that cannot be realized is retried on the next one rather than shrinking the
+        # campaign. Every retry is counted and reported: this is not a silent top-up.
         attempts = 0
-        max_attempts = max(count * 3, count + 12)
+        # A controlled neighborhood is finite: D1 can only reach so many distinct parameter
+        # moves from one seed. The headroom lets a campaign fill its budget from a small bank
+        # instead of silently shrinking; whatever is still unfilled is reported below.
+        max_attempts = max(count * 8, count + 60)
         seed_rows: dict[int, Mapping[str, Any]] = {}
-        while len(proposals) < count and attempts < max_attempts and ordered:
-            band = schedule[attempts % len(schedule)]
-            record = ordered[attempts % len(ordered)]
+        while len(proposals) < count and attempts < max_attempts and schedule_pairs:
+            # The planned variant is materialized first (cycle 0); later cycles of the same
+            # pair ask the rung for its next distinct child instead of re-proposing a duplicate.
+            cycle = attempts // len(schedule_pairs)
+            candidate_id, band, variant = schedule_pairs[attempts % len(schedule_pairs)]
             attempts += 1
-            if record.candidate_id not in seed_rows:
-                row = self.db.get_candidate(record.candidate_id)
+            record = by_id.get(candidate_id)
+            if record is None:
+                continue
+            if candidate_id not in seed_rows:
+                row = self.db.get_candidate(candidate_id)
                 if row is None:
                     continue
-                seed_rows[record.candidate_id] = row
+                seed_rows[candidate_id] = row
             proposal = self.warm_start(
-                seed_rows[record.candidate_id], band=band, campaign_id=campaign_id, seed=seed,
-                index=attempts // max(1, len(ordered)), limits=limits,
+                seed_rows[candidate_id], band=band, campaign_id=campaign_id, seed=seed,
+                index=variant + cycle, limits=limits,
             )
             if proposal is None:
                 continue
@@ -1012,7 +1187,7 @@ class CandidateGenerator:
                 report["duplicates_dropped"] += 1
                 continue
             seen.add(key)
-            used_seeds.add(record.candidate_id)
+            used_seeds.add(candidate_id)
             proposals.append(proposal)
         report["attempts"] = attempts
         if screen:
@@ -1025,6 +1200,9 @@ class CandidateGenerator:
         report["band_mismatch"] = sum(
             1 for proposal in proposals if proposal.parameters.get("band_mismatch")
         )
+        # An arm that could not spend its budget must say so: comparing pass rates per
+        # simulation across arms of different realized size would be misleading.
+        report["slots_unfilled"] = max(0, count - len(proposals))
         return report, proposals
 
     def generate(
@@ -1039,16 +1217,27 @@ class CandidateGenerator:
         max_family_share: float = generation_policy.DEFAULT_MAX_FAMILY_SHARE,
         limits: grammar.ComplexityLimits = V3_LIMITS,
         screen: bool = True,
+        prior: quality_prior.QualityPrior | None = None,
+        quality_conditioned: bool = True,
+        as_of: str | None = None,
     ) -> tuple[generation_policy.Plan, list[Proposal]]:
-        """Plan a campaign and materialize it into proposals (no queue writes)."""
+        """Plan a campaign and materialize it into proposals (no queue writes).
+
+        ``quality_conditioned`` (P21) learns the conditional quality prior from evidence settled
+        before ``as_of`` and conditions the mode shares and motif budget on it. Passing an
+        explicit ``prior`` overrides that; ``quality_conditioned=False`` keeps the previous
+        unconditioned distribution, which is what a control arm needs.
+        """
+        if prior is None and quality_conditioned:
+            prior = self.quality_prior(as_of=as_of)
         plan = self.plan(
             campaign_id=campaign_id, budget=count, seed=seed, mode=strategy,
-            family=family, max_family_share=max_family_share, force_motif=motif,
+            family=family, max_family_share=max_family_share, force_motif=motif, prior=prior,
         )
         proposals: list[Proposal] = []
         for slot in plan.slots:
             proposal = self.materialize(slot, campaign_id=campaign_id, seed=seed,
-                                        limits=limits)
+                                        limits=limits, recipe_prior=plan.recipe_prior)
             if proposal is not None:
                 proposals.append(proposal)
         if screen:

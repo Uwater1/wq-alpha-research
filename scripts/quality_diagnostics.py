@@ -41,6 +41,7 @@ import canonical
 import diversity
 import expression_grammar as grammar
 import research_db
+import seed_bank
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DIAGNOSTICS_VERSION = "quality-diagnostics-v1"
@@ -174,7 +175,7 @@ def failure_region(*, simulated: bool, error: str | None, checks: Sequence[Mappi
     return "other_check"
 
 
-def _recipe_bucket(recipe: Mapping[str, Any]) -> str:
+def recipe_bucket(recipe: Mapping[str, Any]) -> str:
     """Coarse recipe cell: the dimensions that changed between the V2 and V3 samples.
 
     Truncation and decay are the two settings that visibly separated the historical winners
@@ -233,6 +234,11 @@ def outer_operator(expression: str, metadata: Mapping[str, Any] | None = None) -
     return match.group(1).lower() if match else "unknown"
 
 
+#: Backwards-compatible alias: the recipe bucket was private before the conditional prior
+#: needed the same vocabulary (P21.1), and one definition must serve both.
+_recipe_bucket = recipe_bucket
+
+
 def _shape_family(row: Mapping[str, Any], metadata: Mapping[str, Any] | None = None) -> str:
     """Version-comparable expression shape: outermost operator plus source arity.
 
@@ -267,6 +273,12 @@ def evidence_row(
         # reads as dataset ``unknown`` and the matched cohort level is empty by construction.
         profile = diversity.derive_source_profile(expression, catalog_metadata) or profile
     settings = _json_map(candidate.get("settings_json"))
+    if not recipe:
+        # Legacy V2 rows also store no recipe, so every one of them bucketed as ``unknown`` and
+        # the recipe level of the P21 hierarchy was empty for exactly the population the proven
+        # bank came from. Reconstructing it from settings plus the first window is what makes
+        # "which recipe cells does the platform accept" answerable at all (P21.3).
+        recipe = seed_bank.recipe_from_settings(expression, settings)
     status = str(candidate.get("status") or "")
     simulated = bool(simulation) or status in SIMULATED_STATUSES
     checks = _checks_of(simulation.get("checks_json"))
@@ -289,7 +301,7 @@ def evidence_row(
         "mutation_operation": canonical.normalize_mutation_operation(parameters.get("operation")) or "none",
         "mutation_type": str(trial.get("mutation_type") or ""),
         "recipe": recipe,
-        "recipe_bucket": _recipe_bucket(recipe),
+        "recipe_bucket": recipe_bucket(recipe),
         "truncation": recipe.get("truncation"),
         "decay": recipe.get("decay"),
         "lookback": recipe.get("lookback"),

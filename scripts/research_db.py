@@ -1919,13 +1919,22 @@ class ResearchDB:
         ``mutation_parameters['operation']`` (alias-normalized), ``mutation_type`` is the
         broad repair class, ``source_family`` is the parent's family and ``target_family``
         is the child-derived family.
+
+        ``simulated`` counts *spent capacity*, so it is read from the linked simulation row
+        rather than the candidate status alone: a candidate refused by the IS gate is quickly
+        moved to ``REJECTED``, and counting only SIMULATED-or-beyond statuses dropped every
+        refused simulation out of the denominator. That inflated each learned pass rate
+        (``is_pass / simulated``) toward 100% — exactly the cells the adaptive allocation and
+        the P21 quality prior consume.
         """
         passing = {"IS_PASS", "CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
         corr_passing = {"CORR_PASS", "SUBMISSION_READY", "SUBMITTING", "ACTIVE"}
         rows = self.query(
             "SELECT t.scope_json, t.generator_version, t.generation_mode, t.motif_id,"
             " t.mutation_type, t.mutation_parameters_json, t.parent_ids_json, t.signal_family,"
-            " t.decision, t.validation_result, c.status AS candidate_status"
+            " t.decision, t.validation_result, c.status AS candidate_status,"
+            " (SELECT COUNT(*) FROM simulations s WHERE s.candidate_id=t.candidate_id"
+            "  AND s.status='DONE') AS completed_simulations"
             " FROM research_trials t LEFT JOIN candidates c ON c.id=t.candidate_id"
             " WHERE t.generation_mode IS NOT NULL OR t.motif_id IS NOT NULL"
         )
@@ -1967,9 +1976,16 @@ class ResearchDB:
             if (str(row["decision"] or "") == "SKIP_REDUNDANT"
                     or str(row["validation_result"] or "") == "skipped_redundant"):
                 continue
-            if status in VALIDATED_OR_BEYOND_STATUSES:
+            # BRAIN computed the request if the candidate reached SIMULATED-or-beyond *or* a
+            # finished simulation row exists. The second disjunct is what keeps a
+            # gate-refused (hence REJECTED) simulation in the denominator.
+            simulated = (
+                status in SIMULATED_OR_BEYOND_STATUSES
+                or int(row["completed_simulations"] or 0) > 0
+            )
+            if status in VALIDATED_OR_BEYOND_STATUSES or simulated:
                 counters["validated"] += 1
-            if status in SIMULATED_OR_BEYOND_STATUSES:
+            if simulated:
                 counters["simulated"] += 1
             if status in passing:
                 counters["is_pass"] += 1

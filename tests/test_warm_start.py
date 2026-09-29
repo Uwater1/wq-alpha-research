@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+import canonical
 import diversity
 import generation_policy as policy
 import generator
@@ -184,17 +185,25 @@ def test_warm_start_campaign_materializes_its_budget_from_a_point_in_time_bank(d
         campaign_id="ws-arms", count=24, seed=5,
     )
     assert report["seeds"] == 1
-    assert report["materialized"] == 24 == len(proposals)
     assert report["planned_budget"] == 24
-    assert report["band_mismatch"] <= report["materialized"]
+    assert report["materialized"] == len(proposals) <= 24
+    # A single proven seed has a *finite* controlled neighborhood: the campaign reports the
+    # slots it could not fill instead of silently shrinking the arm (equal-budget comparisons
+    # depend on knowing the realized size).
+    assert report["slots_unfilled"] == 24 - len(proposals)
+    assert report["duplicates_dropped"] > 0
+    assert report["band_mismatch"] <= len(proposals)
     assert set(report["requested_bands"]) <= set(seed_bank.BANDS)
-    assert sum(report["realized_bands"].values()) == 24
+    assert sum(report["realized_bands"].values()) == len(proposals)
     assert report["seeds_used"] == 1
     assert {proposal.parent_ids[0] for proposal in proposals} == {seeded}
     assert all(proposal.generation_mode == "exploit" for proposal in proposals)
     assert all(proposal.motif_id.startswith("warm_start:") for proposal in proposals)
     assert all(proposal.strategy == "exploit" for proposal in proposals)
-    assert len({p.expression for p in proposals}) > 1
+    # Distinct *requests*: the same expression under different settings is different work for
+    # BRAIN, so identity is the canonical key — exactly what the cache dedupes on.
+    keys = {canonical.canonical_key(p.expression, p.settings) for p in proposals}
+    assert len(keys) == len(proposals)
 
 
 def test_warm_start_campaign_spreads_over_seeds_and_never_repeats_a_proposal(db, catalog):

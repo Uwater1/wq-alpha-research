@@ -96,6 +96,12 @@ def cell_key(dimensions: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+#: The turnover centre the proven book actually occupies (P19.3 recipe prior: the passing
+#: alphas cluster around 0.09-0.11). Turnover is a *refusal* band, not a preference: being far
+#: from it on either side is what BRAIN refuses, so distance from this centre is penalised.
+TURNOVER_TARGET = 0.10
+
+
 def elite_score(row: Mapping[str, Any]) -> float:
     """Quality-diversity objective, not a submission gate."""
     sharpe = float(row.get("sharpe") or 0.0)
@@ -103,6 +109,43 @@ def elite_score(row: Mapping[str, Any]) -> float:
     turnover = float(row.get("turnover") or 0.0)
     corr = abs(float(row.get("self_corr") or 0.0))
     return round(sharpe + 0.75 * fitness - 0.25 * turnover - 0.25 * corr, 6)
+
+
+def quality_elite_score(row: Mapping[str, Any]) -> float:
+    """Point-in-time **quality** evidence for ranking inside one niche (P20.1).
+
+    The archive's job stopped being "keep the most novel member" once the ledger showed that
+    novelty without local competition spends capacity on junk. Inside a niche the retained
+    elite is now the candidate with the best evidence that the platform accepts alphas of this
+    kind:
+
+    * **stage reached is the primary term** (a gate pass, a bare simulation, or nothing). It is
+      deliberately worth more than the whole metric term can add, so a gate pass can never be
+      outranked by a large number from a candidate that never cleared a gate;
+    * **metrics are a bounded secondary term**: Sharpe and Fitness clamped to ``[-1, 3]`` each so
+      one outlier cannot outweigh a niche, turnover *acceptability* as a bounded bonus (distance
+      from :data:`TURNOVER_TARGET` on either side is what BRAIN refuses), and the
+      self-correlation distance so a proven-but-redundant member is not the elite.
+
+    The turnover distance is normalized by the wider admissible side rather than by the
+    distance itself, so the bonus is strictly decreasing in either direction instead of
+    saturating for every turnover more than one target-width away.
+    """
+    status = str(row.get("status") or "")
+    if status in PASSING:
+        stage = 1.0
+    elif status in {"SIMULATED"}:
+        stage = 0.35
+    else:
+        stage = 0.0
+    sharpe = min(3.0, max(-1.0, float(row.get("sharpe") or 0.0)))
+    fitness = min(3.0, max(-1.0, float(row.get("fitness") or 0.0)))
+    turnover = float(row.get("turnover") or 0.0)
+    corr = abs(float(row.get("self_corr") or 0.0))
+    span = max(TURNOVER_TARGET, 1.0 - TURNOVER_TARGET)
+    turnover_fit = 1.0 - min(1.0, abs(turnover - TURNOVER_TARGET) / span)
+    metric_term = 0.2 * sharpe + 0.1 * fitness + 0.2 * turnover_fit - 0.1 * corr
+    return round(stage + min(0.9, max(-0.5, metric_term)), 6)
 
 
 def rebuild(db: research_db.ResearchDB) -> dict[str, int]:
@@ -124,15 +167,82 @@ def rebuild(db: research_db.ResearchDB) -> dict[str, int]:
         # parent selection would keep reading pre-current-version niches forever (P5/P15).
         conn.execute("DELETE FROM archive_cells")
         for key, cell_members in members.items():
-            winner = max(cell_members, key=lambda row: (elite_score(row), -int(row["id"])))
+            # Local competition on quality evidence (P20.1), not on novelty or sparsity.
+            winner = max(cell_members, key=lambda row: (quality_elite_score(row), -int(row["id"])))
             conn.execute(
                 """INSERT INTO archive_cells(cell_key, dimensions_json, elite_candidate_id, elite_score, member_count, updated_at)
                    VALUES(?,?,?,?,?,?) ON CONFLICT(cell_key) DO UPDATE SET
                    dimensions_json=excluded.dimensions_json, elite_candidate_id=excluded.elite_candidate_id,
                    elite_score=excluded.elite_score, member_count=excluded.member_count, updated_at=excluded.updated_at""",
-                (key, json.dumps(dimensions[key], sort_keys=True), int(winner["id"]), elite_score(winner), len(cell_members), now),
+                (key, json.dumps(dimensions[key], sort_keys=True), int(winner["id"]),
+                 quality_elite_score(winner), len(cell_members), now),
             )
     return {"cells": len(members), "members": len(rows)}
+
+
+def quality_elites(
+    db: research_db.ResearchDB,
+    *,
+    per_niche: int = 1,
+    as_of: str | None = None,
+) -> list[dict[str, Any]]:
+    """The best ``per_niche`` members of every niche by quality evidence (P20.1).
+
+    ``archive_cells`` stores one elite per niche; exploitation sometimes needs a couple of
+    independent starting points inside the same niche, so this re-derives the members and keeps
+    the top few. Point-in-time safety: only candidates settled at or before ``as_of`` count.
+    """
+    per_niche = max(1, int(per_niche))
+    rows = db.query(
+        "SELECT c.*, s.completed_at AS completed_at FROM candidates c"
+        " LEFT JOIN simulations s ON s.id=(SELECT id FROM simulations WHERE candidate_id=c.id ORDER BY id DESC LIMIT 1)"
+    )
+    members: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if as_of and str(row.get("completed_at") or "") > as_of:
+            continue
+        members[cell_key(niche(row))].append(row)
+    elites: list[dict[str, Any]] = []
+    for key in sorted(members):
+        ordered = sorted(
+            members[key], key=lambda row: (-quality_elite_score(row), -int(row["id"])),
+        )
+        for row in ordered[:per_niche]:
+            elites.append({
+                "candidate_id": int(row["id"]),
+                "cell_key": key,
+                "quality": quality_elite_score(row),
+                "members": len(members[key]),
+                "signal_family": str(row.get("signal_family") or "unknown"),
+            })
+    return elites
+
+
+def under_tested_niches(
+    db: research_db.ResearchDB,
+    *,
+    limit: int = 8,
+    max_members: int = 1,
+) -> list[dict[str, Any]]:
+    """Niches with the least occupancy: where the exploration reserve should be spent (P20.1).
+
+    An empty niche cannot be enumerated (it has no members), so the reserve is measured as the
+    niches that exist with the fewest members and reported as such rather than fabricated.
+    """
+    cells = db.query(
+        "SELECT cell_key, dimensions_json, member_count, elite_score FROM archive_cells"
+        " ORDER BY member_count ASC, cell_key ASC LIMIT ?",
+        (max(0, int(limit)),),
+    )
+    return [
+        {
+            "cell_key": str(row["cell_key"]),
+            "members": int(row["member_count"]),
+            "elite_score": float(row["elite_score"]),
+            "sparse": int(row["member_count"]) <= max_members,
+        }
+        for row in cells
+    ]
 
 
 def structure_occupancy(db: research_db.ResearchDB) -> dict[str, int]:

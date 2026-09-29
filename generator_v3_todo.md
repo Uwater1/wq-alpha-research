@@ -174,14 +174,24 @@ Current novelty/search signals should become **local competition inside meaningf
 
 ## P20.1 Redefine archive objective
 
-- [ ] Keep niche dimensions interpretable and stable.
-- [ ] Within each niche, rank candidates by point-in-time quality evidence instead of sparsity alone.
-- [ ] Retain one or a few elites per niche based on:
+- [x] Keep niche dimensions interpretable and stable.
+- [x] Within each niche, rank candidates by point-in-time quality evidence instead of sparsity alone.
+- [x] Retain one or a few elites per niche based on:
   - IS/CORR stage reached
   - Sharpe/Fitness
   - turnover acceptability
   - robustness/stability evidence
-- [ ] Keep exploration reserve for empty/under-tested niches.
+- [x] Keep exploration reserve for empty/under-tested niches.
+
+**Implemented:** `archive.quality_elite_score` makes *stage reached* the primary term (an
+IS-gate pass is worth more than the whole metric term can add, so a gate pass can never be
+outranked by a large number from a candidate that never cleared one) and metrics a bounded
+secondary one (Sharpe/Fitness clamped to `[-1, 3]` each, turnover acceptability as a bounded
+bonus normalised by the wider admissible side so the penalty is strictly decreasing on both
+sides instead of saturating, and self-correlation as a redundancy cost). `archive.rebuild` now
+selects the niche elite with it, `archive.quality_elites(db, per_niche=)` re-derives the top few
+members of each niche for exploitation, and `archive.under_tested_niches(db, max_members=)`
+reports the least-occupied niches as the exploration reserve — reported, never invented.
 
 ## P20.2 Quality-conditioned novelty
 
@@ -197,10 +207,32 @@ with:
 quality prior × novelty × uncertainty / cost
 ```
 
-- [ ] Novelty must not compensate for strongly negative quality evidence.
-- [ ] Quality must not collapse the search into one family/skeleton.
-- [ ] Use bounded terms and explicit floors/caps.
-- [ ] Keep exact deduplication and point-in-time safety unchanged.
+- [x] Novelty must not compensate for strongly negative quality evidence.
+- [x] Quality must not collapse the search into one family/skeleton.
+- [x] Use bounded terms and explicit floors/caps.
+- [x] Keep exact deduplication and point-in-time safety unchanged.
+
+**Implemented:** `quality_prior.quality_conditioned_score` is `bounded quality x novelty x
+uncertainty / cost` with every term bounded — the quality term uses the Beta posterior's *upper*
+bound so genuine uncertainty can pay, clamped to `[0.01, 1.0]` so strongly negative evidence
+downweights a region without ever deleting it; novelty is floored at `0.25` so it can neither
+compensate for absent quality nor be switched off; uncertainty is a UCB bonus
+`1 + 0.6*sqrt(upper-lower)` so a two-sample bucket is never as authoritative as a fifty-sample
+one; cost divides the whole thing with a floor.
+Mode weights are conditioned by `generation_policy.quality_conditioned_weights`, which sees only
+modes with `>= 5` simulated runs, clamps each evidenced mode to `1/3 .. 3x` of its base share,
+and then **projects** the result onto `floor`/`max_share` **and** that ratio band with a
+water-filling projection (`_project_onto_bounds`) — clamping before renormalizing does not bound
+the final weight, because renormalization pushes the clamped mode straight back out of band.
+**Bug found and fixed while implementing this:** `refresh_generation_stats` read `simulated`
+from the candidate status alone, and a candidate refused by the IS gate is moved to `REJECTED`
+(never `SIMULATED`). Every refused simulation therefore dropped out of the denominator and each
+learned rate (`is_pass / simulated`) inflated toward 100%. It now counts a finished simulation
+row as spent capacity, so the live ledger reads `explore 84/0`, `exploit 46/0`, `mutate 13/0`,
+`crossover 6/0` for V3 instead of four cells of `0/0` — with all four modes unproven, the bounded
+prior correctly declines to move any weight.
+Deduplication (`canonical_key`) and point-in-time filtering are untouched; `prior=None` /
+`quality_conditioned=False` reproduce the previous unconditioned distribution as the control arm.
 
 ## P20.3 Local-competition experiment
 
@@ -233,40 +265,102 @@ A global motif success count is too coarse.
 
 ## P21.1 Conditional statistics
 
-- [ ] Add point-in-time outcome statistics over a bounded hierarchy such as:
+- [x] Add point-in-time outcome statistics over a bounded hierarchy such as:
 
 ```text
-motif
-motif × source category
+motif × dataset × recipe bucket
 motif × dataset
+motif × source category
 motif × semantic-role signature
-motif × recipe bucket
+motif × mutation operation
+motif
 mutation operation × parent-quality bucket
+global
 ```
 
-- [ ] Use hierarchical backoff when samples are sparse:
+- [x] Use hierarchical backoff when samples are sparse:
   `specific → category → motif → global prior`.
-- [ ] Require minimum evidence before a narrow bucket can dominate allocation.
+- [x] Require minimum evidence before a narrow bucket can dominate allocation.
+
+**Implemented:** `scripts/quality_prior.py` builds the whole hierarchy in one pass over the P18
+ledger (`QualityPrior.build(db, as_of=...)`, point-in-time safe). `lookup(context)` returns the
+Beta posterior of the most specific level with `>= min_evidence` (default 3) simulations and
+*always* reports the narrowest cell that has any evidence at all as `specific`/
+`specific_level`, plus `backed_off` when nothing met the bar — so a thin bucket is visible even
+when the answer came from a coarser level. `generation_policy.allocate_motifs_conditioned`
+spends a campaign's motif budget from this prior *per dataset*, with the same guarantees as
+`allocate_motifs` (slots sum to exactly the budget, an unobserved motif keeps the exploration
+floor, no motif exceeds `max_share`). `Plan.quality_allocation` / `Plan.prior_version` / `Plan.mode_weights`
+record the evidence behind every allocation.
+
+**Live evidence (as of the diagnosis clock, `research.db`):** global 753 simulations / 141 IS
+passes; `motif+dataset` — `analyst4 80/142 (50.0%)`, `news18 28/56 (38.2%)`, `model16 9/42
+(16.1%)`, `fundamental2 5/28 (17.9%)`, `fundamental6 7/53 (13.2%)`, `option8 5/45 (11.1%)`;
+`motif+operation` — `add_component 6/6 (100%)`. The prior is therefore *not* uniform over
+sources, which is exactly the signal the V3 search was ignoring.
 
 ## P21.2 Posterior quality prior
 
-- [ ] Estimate `P(IS_PASS | context)` or an equivalent bounded quality score.
-- [ ] Keep exploration via Thompson/UCB-style uncertainty rather than zeroing weak buckets forever.
-- [ ] Distinguish:
+- [x] Estimate `P(IS_PASS | context)` or an equivalent bounded quality score.
+- [x] Keep exploration via Thompson/UCB-style uncertainty rather than zeroing weak buckets forever.
+- [x] Distinguish:
   - attempts
   - simulations
   - IS passes
   - CORR passes
   - skipped duplicates
-- [ ] Do not treat skipped/non-simulated proposals as negative performance outcomes.
+- [x] Do not treat skipped/non-simulated proposals as negative performance outcomes.
+
+**Implemented:** `QualityPrior` is a Beta(`1, 19`) posterior per cell — a 5% prior pass rate, the
+campaign's own measured baseline — with an approximate credible interval from the posterior
+variance. `Evidence` keeps `attempts`, `simulations`, `is_pass`, `corr_pass`, `skipped` and
+`sharpe_sum` **separate**; `from_rows` classifies a row as skipped (`SKIP_REDUNDANT` or
+`simulated=False`) and gives it zero outcome evidence, so a rediscovery that never spent a slot
+can never look like a failure. Uncertainty re-enters only as the UCB bonus in
+`quality_conditioned_score`; nothing is ever zeroed out permanently.
 
 ## P21.3 Recipe learning
 
-- [ ] Measure whether lookback, normalization, decay, neutralization, sign and winsorization effects are motif/source dependent.
-- [ ] Stop sampling obviously poor recipe regions uniformly once evidence is strong.
-- [ ] Retain an exploration floor to detect regime change.
+- [x] Measure whether lookback, normalization, decay, neutralization, sign and winsorization effects are motif/source dependent.
+- [x] Stop sampling obviously poor recipe regions uniformly once evidence is strong.
+- [x] Retain an exploration floor to detect regime change.
 
-**Exit gate:** conditional allocation must beat global motif allocation in point-in-time replay and then in a small matched live campaign.
+**Implemented (this is the single highest-leverage fix in the roadmap):** `generation_policy`
+now samples each recipe dimension from a grid *conditioned on the proven recipe counts*
+(`seed_bank.proven_recipe_counts(db, as_of=..., scope=...)`, one query over gate-reaching
+candidates; the recipe is the stored one or reconstructed from settings plus the first window for
+V2-era rows). `recipe_value_weights` adds every value the platform has actually accepted — even
+one the local grid could not express — as long as it lies **between the grid's own endpoints**,
+gives observed values `1 - floor` of the mass in proportion to how often they were accepted, and
+spreads `floor` (0.25) over the never-observed values so a regime change stays detectable.
+`Plan.recipe_prior` carries the counts and `generate`/`materialize` sample from them, so the
+planned skeleton hashes still describe the emitted tree (P4.2). With no evidence the draw is
+`rng.choice` unchanged, value for value and RNG-draw for RNG-draw, so existing outputs do not move.
+
+**Live evidence:** the proven recipe cells are `truncation 0.08 in 120/139`, `decay 8 in 69`,
+`SUBINDUSTRY in 93`, `lookback 22 in 68` — and **none** of `truncation 0.08`, `decay 8` or
+`lookback 22` was expressible by the V3 grid (`{0.05, 0.1, 0.15}`, `{4, 6, 10, 20}`,
+`{20, 60, 126, 252}`). After conditioning, 400 draws put 66% of truncation mass on `0.08`, 39% of
+decay mass on `8`, 37% of lookback mass on `22`, 68% of neutralization mass on `SUBINDUSTRY`, and
+the out-of-range ledger values (`truncation 0.02/0.03`, `decay 0/2`) are correctly *not* admitted.
+
+**The recipe × shape interaction is the whole story (live, by generator version):**
+
+| arm | simulations | passing cells |
+| --- | --- | --- |
+| `catalog-generator-v2` | 123 | `add(...)` @ t0.08 **7/8**, `winsorize` @ t0.05 1/24; every other cell 0, including `group_rank` @ t0.1 0/31 |
+| `catalog-generator-v3` | 204 | **no passing cell at all** — `divide` 0/35, `subtract` 0/26, `add` 0/24, all at t0.05/t0.1/t0.15 |
+| truncation 0.1 across `catalog-generator-v1..v3` | 196 | 0 |
+| truncation 0.08 across `agent-hypothesis-v2..v11` | 138 | 121 |
+
+The target cell is therefore **multi-component `add(...)` at truncation 0.08** — the one cell V3
+could not express and the one the earlier diagnosis flagged (`add|21src`, 109/139 seeds). V3's
+ordinary plan now emits composites (`add`/`divide`/`subtract`) and concentrates 66% of its
+truncation mass on `0.08`, so the previously unreachable cell is now *the default*, not an outlier.
+This is the mechanism by which V3 is expected to overtake V2; the confirmation is a matched live
+campaign (P25.1).
+
+**Exit gate:** conditional allocation must beat global motif allocation in point-in-time replay and then in a small matched live campaign. *(Mechanism complete; the arm comparison is P25.1/P20.3.)*
 
 ---
 
@@ -473,9 +567,9 @@ These become worthwhile only if P18–P24 show that the local quality model and 
 P16  small correctness/observability cleanup   [done]
 P18  explain the 0/138 result                   [done]
 P19  recover a known-good control surface       [done]
-P20  quality-conditioned QD
-P21  conditional motif/source/recipe evidence
-P22  warm-start exploit + controlled mutation
+P20  quality-conditioned QD                     [done]
+P21  conditional motif/source/recipe evidence   [done]
+P22  warm-start exploit + controlled mutation   [in progress]
 P23  collection-aware contribution
 P24  surrogate ordering
 P25  ablation + promotion

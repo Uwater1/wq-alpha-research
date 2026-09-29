@@ -237,6 +237,54 @@ def build_seed_bank(
     return seeds[:limit] if limit else seeds
 
 
+def proven_recipe_counts(
+    db: research_db.ResearchDB,
+    *,
+    as_of: str | None = None,
+    stages: Sequence[str] = PASS_STAGES,
+    scope: Mapping[str, Any] | None = None,
+) -> dict[str, dict[str, int]]:
+    """Recipe value counts among gate-reaching candidates, straight from the ledger (P21.3).
+
+    The same evidence as :func:`proven_recipe_prior` without materializing seed records: one
+    query, and each recipe is the stored one or reconstructed from settings plus the first
+    window. This is what lets *ordinary* (non-warm-started) generation learn that truncation
+    ``0.08`` is a value the platform accepted, instead of sampling a grid that cannot express it.
+    """
+    stages = tuple(stages)
+    if not stages:
+        return {}
+    placeholders = ", ".join("?" for _ in stages)
+    rows = db.query(
+        "SELECT c.id, c.normalized_expression, c.settings_json, c.mutation_parameters_json,"
+        " t.recipe_json AS recipe_json, s.completed_at AS completed_at FROM candidates c"
+        " LEFT JOIN simulations s ON s.id=(SELECT id FROM simulations WHERE candidate_id=c.id ORDER BY id DESC LIMIT 1)"
+        " LEFT JOIN research_trials t ON t.id=(SELECT id FROM research_trials WHERE candidate_id=c.id ORDER BY id DESC LIMIT 1)"
+        f" WHERE c.status IN ({placeholders})",
+        tuple(stages),
+    )
+    prior: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if as_of and str(row.get("completed_at") or "") > as_of:
+            continue
+        settings = _json_map(row.get("settings_json"))
+        if scope:
+            normalized = canonical.normalize_settings(settings)
+            if any(normalized.get(key) != value for key, value in scope.items()):
+                continue
+        parameters = _json_map(row.get("mutation_parameters_json"))
+        recipe = _json_map(row.get("recipe_json")) or _json_map(parameters.get("recipe"))
+        if not recipe:
+            recipe = recipe_from_settings(str(row.get("normalized_expression") or ""), settings)
+        for dimension, value in recipe.items():
+            if value is None:
+                continue
+            counts = prior.setdefault(str(dimension), {})
+            key = str(value)
+            counts[key] = counts.get(key, 0) + 1
+    return prior
+
+
 def distance_band(seed: Seed | Mapping[str, Any], candidate: Mapping[str, Any]) -> str:
     """Where ``candidate`` sits on the ladder from ``seed`` (P19.3).
 

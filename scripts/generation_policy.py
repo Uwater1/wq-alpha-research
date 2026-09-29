@@ -35,6 +35,7 @@ if str(REPO_ROOT / "scripts") not in sys.path:
 import archive  # noqa: E402
 import diversity  # noqa: E402
 import expression_grammar as grammar  # noqa: E402
+import quality_prior  # noqa: E402
 
 GENERATION_POLICY_VERSION = "generation-policy-v1"
 #: ``meta`` key holding the last archive-refresh failure (P16). Readable without the DB logs,
@@ -87,7 +88,7 @@ SMOOTHING_WINDOWS = (5, 10, 22)
 DECAYS = (4, 6, 10, 20)
 NEUTRALIZATIONS = ("SUBINDUSTRY", "INDUSTRY", "SECTOR")
 GROUP_LEVELS = ("subindustry", "industry", "sector")
-TRUNCATIONS = (0.05, 0.1, 0.15)
+TRUNCATIONS = (0.05, 0.08, 0.1, 0.15)
 NORMALIZATIONS = ("rank", "zscore")
 
 #: Ladder rungs a warm-started campaign can budget (P19.3). Re-exported from the seed bank
@@ -172,6 +173,15 @@ class Plan:
     archive_refresh: bool = False
     #: The forced motif the whole plan was built for, when one was pinned (P16).
     forced_motif: str = ""
+    #: Bounded conditional motif allocation with the evidence behind each share (P21.1).
+    quality_allocation: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    #: Quality-prior identity used for this plan, empty when the plan was unconditioned.
+    prior_version: str = ""
+    #: Proven recipe value counts (dimension -> value -> count) the plan's recipes are sampled
+    #: from (P21.3). Empty means the uniform local grid.
+    recipe_prior: Mapping[str, Mapping[str, int]] = dataclass_field(default_factory=dict)
+    #: Mode weights before and after quality conditioning (P22.3).
+    mode_weights: Mapping[str, float] = dataclass_field(default_factory=dict)
 
     @property
     def planned_budget(self) -> int:
@@ -208,6 +218,12 @@ class Plan:
             "mutation_allocation": dict(self.mutation_allocation),
             "archive_refresh": bool(self.archive_refresh),
             "forced_motif": self.forced_motif,
+            "quality_allocation": dict(self.quality_allocation),
+            "prior_version": self.prior_version,
+            "mode_weights": dict(self.mode_weights),
+            "recipe_prior": {str(dimension): dict(counts)
+                             for dimension, counts in self.recipe_prior.items()},
+            "recipe_prior_dimensions": sorted(str(name) for name in self.recipe_prior),
             "slots": [slot.as_dict() for slot in self.slots],
         }
 
@@ -243,19 +259,136 @@ def recipe_seed(
     return int(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16], 16)
 
 
-def sample_recipe(rng: random.Random, motif_id: str, *, truncate: float | None = None) -> grammar.Recipe:
-    """Sample every recipe dimension independently for one proposal."""
+#: Share of recipe draws a *learned* dimension still spends on values the proven bank has never
+#: shown. Strong evidence conditions sampling; it never closes the grid, so a regime change
+#: stays detectable (P21.3).
+RECIPE_EXPLORATION_FLOOR = 0.25
+
+
+def _coerce_value(value: str, exemplar: Any) -> Any:
+    """Best-effort type match for a value learned from the ledger (which stores strings)."""
+    if isinstance(exemplar, bool):
+        return str(value).strip().lower() in {"true", "1", "yes"}
+    try:
+        if isinstance(exemplar, float):
+            return float(value)
+        if isinstance(exemplar, int):
+            return int(float(value))
+    except (TypeError, ValueError):
+        return value
+    return value
+
+
+def _inside_grid_range(value: Any, originals: Sequence[Any]) -> bool:
+    """Whether a learned numeric value lies inside the local grid's own range.
+
+    The ledger may extend the grid — that is how ``0.08`` becomes reachable — but only *between*
+    the designed endpoints. A value outside them is evidence about a setting the local search
+    space deliberately does not contain, and admitting it would spend capacity outside the
+    space the validator and the complexity budget were written for.
+    """
+    numbers = [float(item) for item in originals if isinstance(item, (int, float))
+               and not isinstance(item, bool)]
+    if not numbers or not isinstance(value, (int, float)) or isinstance(value, bool):
+        return True
+    return min(numbers) <= float(value) <= max(numbers)
+
+
+def recipe_value_weights(
+    values: Sequence[Any],
+    counts: Mapping[Any, int] | None = None,
+    *,
+    exploration_floor: float = RECIPE_EXPLORATION_FLOOR,
+) -> tuple[list[Any], list[float]]:
+    """``(values, weights)`` for one recipe dimension conditioned on proven evidence (P21.3).
+
+    Every value the proven bank has actually shown is added to the grid even when the local grid
+    cannot express it — V3's truncation grid had no ``0.08`` while 120 of 139 gate-reaching
+    seeds used exactly that — as long as it stays inside the grid's own range
+    (:func:`_inside_grid_range`). Observed values share ``1 - floor`` of the mass in proportion
+    to how often the platform accepted them; ``floor`` is spread over the values never observed.
+    """
+    grid = list(dict.fromkeys(values))
+    originals = list(grid)
+    exemplar = originals[0] if originals else None
+    observed: dict[str, int] = {str(value): 0 for value in grid}
+    for key, count in (counts or {}).items():
+        key = str(key)
+        if key not in observed:
+            candidate = _coerce_value(key, exemplar)
+            if not _inside_grid_range(candidate, originals):
+                continue  # the evidence is real, the setting is outside our search space
+            grid.append(candidate)
+            observed[key] = 0
+        observed[key] = observed[key] + max(0, int(count))
+    total = sum(observed.values())
+    if not grid or total <= 0:
+        return grid, [1.0 / len(grid)] * len(grid) if grid else []
+    floor = max(0.0, min(1.0, float(exploration_floor)))
+    unobserved = sum(1 for value in grid if not observed[str(value)])
+    weights: list[float] = []
+    for value in grid:
+        count = observed[str(value)]
+        if count:
+            weights.append((1.0 - floor) * count / total)
+        else:
+            weights.append(floor / unobserved if unobserved else 0.0)
+    grand = sum(weights) or 1.0
+    return grid, [weight / grand for weight in weights]
+
+
+def recipe_choice(
+    rng: random.Random,
+    values: Sequence[Any],
+    counts: Mapping[Any, int] | None,
+    *,
+    exploration_floor: float = RECIPE_EXPLORATION_FLOOR,
+) -> Any:
+    """One conditioned recipe draw.
+
+    Without evidence this is exactly ``rng.choice(values)`` — same value, same RNG
+    consumption — so an unconditioned campaign's recipes do not move (P3.1).
+    """
+    if not counts or not any(int(count) for count in counts.values()):
+        return rng.choice(list(values))
+    grid, weights = recipe_value_weights(values, counts, exploration_floor=exploration_floor)
+    return rng.choices(grid, weights=weights, k=1)[0]
+
+
+def sample_recipe(
+    rng: random.Random,
+    motif_id: str,
+    *,
+    truncate: float | None = None,
+    prior: Mapping[str, Mapping[str, int]] | None = None,
+) -> grammar.Recipe:
+    """Sample every recipe dimension for one proposal.
+
+    ``prior`` maps a recipe dimension to proven value counts (see
+    :func:`seed_bank.proven_recipe_counts`). Dimensions with evidence are drawn from the
+    conditioned grid with an exploration floor; dimensions without it are drawn uniformly over
+    the local grid exactly as before (P21.3).
+    """
+    prior = prior or {}
     return grammar.Recipe(
-        lookback=rng.choice(LOOKBACKS),
+        lookback=recipe_choice(rng, LOOKBACKS, prior.get("lookback")),
         smoothing_window=rng.choice(SMOOTHING_WINDOWS),
-        decay=rng.choice(DECAYS),
-        neutralization=rng.choice(NEUTRALIZATIONS),
+        decay=recipe_choice(rng, DECAYS, prior.get("decay")),
+        neutralization=recipe_choice(rng, NEUTRALIZATIONS, prior.get("neutralization")),
         group_level=rng.choice(GROUP_LEVELS),
-        truncation=float(truncate) if truncate is not None else rng.choice(TRUNCATIONS),
-        normalization=rng.choice(NORMALIZATIONS),
-        winsorization=rng.random() < 0.4,
+        truncation=(
+            float(truncate) if truncate is not None
+            else recipe_choice(rng, TRUNCATIONS, prior.get("truncation"))
+        ),
+        normalization=recipe_choice(rng, NORMALIZATIONS, prior.get("normalization")),
+        winsorization=(
+            recipe_choice(rng, (False, True), prior.get("winsorization"))
+            if prior.get("winsorization") else rng.random() < 0.4
+        ),
         rank_or_zscore=rng.choice(NORMALIZATIONS),
-        sign=1 if rng.random() < 0.8 else -1,
+        sign=recipe_choice(rng, (1, -1), prior.get("sign")) if prior.get("sign") else (
+            1 if rng.random() < 0.8 else -1
+        ),
     )
 
 
@@ -520,6 +653,244 @@ def allocate_mutation_operations(
     )
 
 
+#: A mode needs this many simulations before its measured rate may move its weight.
+DEFAULT_MODE_MIN_EVIDENCE = 5
+#: No mode may take more than this share of a campaign, however well it has performed (P20.2).
+DEFAULT_MODE_MAX_SHARE = 0.55
+#: Every mode keeps at least this share, so a mode that looks bad early can still be retested.
+DEFAULT_MODE_FLOOR = 0.05
+#: Quality evidence may move a mode's weight by at most this factor from its base share, so
+#: quality conditions the search without collapsing the campaign onto a single mode.
+MODE_WEIGHT_RATIO = 3.0
+
+
+def mode_outcomes(
+    db: Any,
+    *,
+    generator_version: str | None = None,
+) -> dict[str, tuple[int, int]]:
+    """``generation_mode -> (simulations, is_pass)`` from the persisted counters.
+
+    Modes are compared on *simulations*, not attempts: a slot that was planned as a mutation
+    and realized as exploration must not be charged against mutation's record (P9.2).
+    """
+    if db is None:
+        return {}
+    reader = getattr(db, "generation_stats", None)
+    if reader is None:
+        return {}
+    try:
+        rows = reader(generator_version=generator_version or None)
+    except Exception:  # pragma: no cover - advisory only
+        return {}
+    totals: dict[str, list[int]] = {}
+    for row in rows:
+        mode = str(row.get("generation_mode") or "none")
+        entry = totals.setdefault(mode, [0, 0])
+        entry[0] += int(row.get("simulated") or 0)
+        entry[1] += int(row.get("is_pass") or 0)
+    return {mode: (counts[0], counts[1]) for mode, counts in totals.items()}
+
+
+def _project_onto_bounds(
+    shares: Mapping[str, float],
+    lower: Mapping[str, float],
+    upper: Mapping[str, float],
+) -> dict[str, float]:
+    """Scale ``shares`` onto ``{sum == 1, lower <= w <= upper}`` (water-filling).
+
+    Clamping *before* normalizing does not bound the result: renormalizing pushes the clamped
+    coordinate back outside its bound. This fixes the coordinates whose scaled value violates a
+    bound and rescales the rest, repeating until the set is stable, so the returned weights
+    satisfy the bounds and sum to one exactly.
+    """
+    names = list(shares)
+    low = {name: max(0.0, float(lower.get(name, 0.0))) for name in names}
+    high = {name: float(upper.get(name, 1.0)) for name in names}
+    # Guard degenerate bounds so the projection always terminates with a usable vector: an
+    # infeasible set is repaired rather than silently returning weights that do not sum to one.
+    low_total = sum(low.values())
+    if low_total > 1.0:
+        low = {name: value / low_total for name, value in low.items()}
+    high_total = sum(high.values())
+    if high_total < 1.0:
+        widest = max(names, key=lambda name: high[name])
+        high = dict(high)
+        high[widest] = high[widest] + (1.0 - high_total)
+    fixed: dict[str, float] = {}
+    free = {name: max(0.0, float(shares[name])) for name in names}
+    for _ in range(len(names) + 2):
+        if not free:
+            break
+        budget = 1.0 - sum(fixed.values())
+        free_total = sum(free.values())
+        if free_total <= 0.0:
+            free = {name: budget / len(free) for name in free}
+            free_total = sum(free.values())
+        scale = budget / free_total if free_total else 0.0
+        scaled = {name: value * scale for name, value in free.items()}
+        violated = {
+            name: (low[name] if value < low[name] else high[name] if value > high[name] else None)
+            for name, value in scaled.items()
+        }
+        if not any(bound is not None for bound in violated.values()):
+            fixed.update(scaled)
+            free = {}
+            break
+        for name, bound in violated.items():
+            if bound is not None:
+                fixed[name] = bound
+                del free[name]
+    fixed.update({name: value for name, value in free.items()})
+    total = sum(fixed.values()) or 1.0
+    return {name: fixed.get(name, 0.0) / total for name in names}
+
+
+def quality_conditioned_weights(
+    base: Mapping[str, float] | None = None,
+    stats: Mapping[str, tuple[int, int]] | None = None,
+    *,
+    min_evidence: int = DEFAULT_MODE_MIN_EVIDENCE,
+    floor: float = DEFAULT_MODE_FLOOR,
+    max_share: float = DEFAULT_MODE_MAX_SHARE,
+    ratio: float = MODE_WEIGHT_RATIO,
+) -> dict[str, float]:
+    """Mode weights conditioned on measured mode quality, bounded at both ends (P22.3/P20.2).
+
+    * a mode with too little evidence keeps its base share — no verdict from a handful of runs;
+    * an evidenced mode's share is scaled by its posterior pass rate relative to the pooled
+      rate, clamped to ``1/ratio .. ratio`` so quality cannot collapse the campaign onto one
+      mode or delete another;
+    * the final weights are projected onto ``floor``/``max_share`` **and** the ratio band
+      around each mode's base share, so the bound holds on what a caller actually consumes.
+      Clamping before renormalizing would push the clamped mode straight back out of band.
+    """
+    weights = {name: max(0.0, float((base or STRATEGY_WEIGHTS).get(name, 0.0))) for name in GENERATION_MODES}
+    total = sum(weights.values())
+    if total <= 0:
+        weights = dict.fromkeys(GENERATION_MODES, 0.0)
+        weights["explore"] = 1.0
+        total = 1.0
+    # ``plain`` is the unconditioned share the ratio band is measured against: the band must
+    # bound the *final* weight relative to where the mode started, not relative to the
+    # already-conditioned number (which would make the bound vacuous).
+    plain = {name: weights[name] / total for name in GENERATION_MODES}
+    shares = dict(plain)
+    observed = {
+        name: value for name, value in (stats or {}).items()
+        if name in shares and int(value[0]) >= max(1, int(min_evidence))
+    }
+    if observed:
+        pooled_sims = sum(int(value[0]) for value in observed.values())
+        pooled_passes = sum(int(value[1]) for value in observed.values())
+        pooled_rate = pooled_passes / pooled_sims if pooled_sims else 0.0
+        for name, (simulations, passes) in observed.items():
+            mean, _, _ = quality_prior._beta_interval(
+                int(passes), int(simulations), 1.0, 19.0,
+            )
+            if pooled_rate <= 0:
+                continue
+            factor = min(ratio, max(1.0 / ratio, mean / pooled_rate))
+            shares[name] = shares[name] * factor
+    total = sum(shares.values())
+    if total <= 0:
+        return {name: 1.0 / len(GENERATION_MODES) for name in GENERATION_MODES}
+    shares = {name: shares[name] / total for name in GENERATION_MODES}
+    lower = {name: max(floor, plain[name] / ratio) for name in GENERATION_MODES}
+    upper = {name: min(max_share, plain[name] * ratio) for name in GENERATION_MODES}
+    projected = _project_onto_bounds(shares, lower, upper)
+    return {name: round(projected[name], 8) for name in GENERATION_MODES}
+
+
+def allocate_motifs_conditioned(
+    motifs: Sequence[str],
+    datasets: Sequence[str],
+    budget: int,
+    prior: Any,
+    *,
+    seed: int = 0,
+    exploration_floor: float = DEFAULT_MOTIF_EXPLORATION_FLOOR,
+    max_share: float = DEFAULT_MOTIF_MAX_SHARE,
+    min_evidence: int = quality_prior.DEFAULT_MIN_EVIDENCE,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    """Bounded allocation from conditional evidence rather than a global motif count (P21.1).
+
+    Every motif is scored in the *dataset* context it would actually run in, through the
+    hierarchical prior, so a motif that pays in one source and not another keeps its budget
+    where the evidence puts it. Guarantees are the same as :func:`allocate_motifs`: the slots
+    sum to exactly ``budget``, an unproven motif keeps an exploration floor and no motif may
+    exceed ``max_share``.
+    """
+    names = sorted({str(motif) for motif in motifs if str(motif)})
+    budget = int(budget)
+    if not names or budget <= 0 or prior is None:
+        return {}, {}
+    sources = sorted({str(name) for name in datasets if str(name)}) or ["unknown"]
+    scored: dict[str, dict[str, Any]] = {}
+    for motif in names:
+        best: dict[str, Any] | None = None
+        for dataset in sources:
+            context = quality_prior.Context(motif_id=motif, dataset=dataset)
+            score, look = prior.score(context)
+            detail = {
+                "score": round(float(score), 8),
+                "dataset": dataset,
+                "level": look.level,
+                "specific_level": look.specific_level,
+                "simulations": look.simulations,
+                "specific_simulations": look.specific.simulations,
+                "mean": round(look.mean, 8),
+                "upper": round(look.upper, 8),
+            }
+            if best is None or detail["score"] > best["score"]:
+                best = detail
+        if best is not None:
+            scored[motif] = best
+    if not scored:
+        return {}, {}
+    # An untested motif is not a bad motif: it holds the exploration floor (P20.2).
+    untested = [motif for motif, detail in scored.items() if detail["specific_simulations"] == 0]
+    allocation = {motif: 0 for motif in names}
+    reserve = min(budget, max(1, int(round(budget * max(0.0, min(1.0, exploration_floor))))))
+    for index in range(reserve):
+        if untested:
+            allocation[untested[index % len(untested)]] += 1
+    remaining = budget - sum(allocation.values())
+    reference = max(detail["score"] for detail in scored.values()) or 1.0
+    while remaining > 0:
+        cap = max(
+            1, int(math.ceil(budget * max(0.0, min(1.0, max_share)))),
+            int(math.ceil(budget / len(names))),
+        )
+        allowed = [motif for motif in names if allocation[motif] < cap]
+        if not allowed:
+            break
+        # Score-proportional with a deterministic tie-break by remaining deficit: the
+        # highest-scoring motif takes the next slot until it reaches its cap.
+        picked = max(
+            allowed,
+            key=lambda motif: (
+                scored[motif]["score"] / reference,
+                -allocation[motif],
+                names.index(motif),
+            ),
+        )
+        allocation[picked] += 1
+        remaining -= 1
+    if remaining > 0:
+        for index in range(remaining):
+            allocation[names[index % len(names)]] += 1
+    report = {
+        "version": quality_prior.QUALITY_PRIOR_VERSION,
+        "min_evidence": int(min_evidence),
+        "exploration_floor": float(exploration_floor),
+        "max_share": float(max_share),
+        "untested": sorted(untested),
+        "contexts": scored,
+    }
+    return allocation, report
+
+
 def _proven_motifs(db: Any, families: Sequence[str]) -> dict[str, set[str]]:
     """Motifs with at least one settled pass, per family — the exploit prior."""
     proven: dict[str, set[str]] = {family: set() for family in families}
@@ -585,15 +956,17 @@ def planned_recipe(
     motif_id: str,
     recipe_index: int,
     parent_ids: Sequence[int] = (),
+    *,
+    prior: Mapping[str, Mapping[str, int]] | None = None,
 ) -> grammar.Recipe:
     """The exact recipe materialization samples for this slot (P3.1/P4.2).
 
-    Same ``recipe_seed`` inputs as ``generator.materialize`` uses, so the planner and the
-    materializer cannot disagree about lookback/window/decay or the topology-changing
-    dimensions (rank vs zscore, winsorization, sign).
+    Same ``recipe_seed`` inputs *and the same recipe prior* as ``generator.materialize`` uses,
+    so the planner and the materializer cannot disagree about lookback/window/decay or the
+    topology-changing dimensions (rank vs zscore, winsorization, sign).
     """
     rng = random.Random(recipe_seed(campaign_id, seed, list(field_ids), motif_id, recipe_index, parent_ids))
-    return sample_recipe(rng, motif_id)
+    return sample_recipe(rng, motif_id, prior=prior)
 
 
 def _structure_hashes(
@@ -779,6 +1152,8 @@ def plan_campaign(
     generator_version: str = "",
     refresh_archive_state: bool = True,
     force_motif: str | None = None,
+    prior: Any = None,
+    recipe_prior: Mapping[str, Mapping[str, int]] | None = None,
 ) -> Plan:
     """Turn a campaign budget into an explicit, archive-informed generation plan.
 
@@ -796,6 +1171,10 @@ def plan_campaign(
     exact recipe materialization will sample, so ``plan.slots[i].planned_grammar_hash``
     describes the tree that is actually emitted. Lineage modes are not planned under a pin,
     because a mutation or crossover child has no planner-known motif.
+
+    ``recipe_prior`` conditions recipe sampling on the values the platform has actually accepted
+    (P21.3). It is stored on the plan so materialization samples the same recipes the planned
+    skeleton hashes were computed over.
     """
     budget = max(0, int(budget))
     if force_motif is not None and force_motif not in grammar.MOTIF_BY_ID:
@@ -806,6 +1185,15 @@ def plan_campaign(
         # A pinned motif is generated, never edited, so the effective mode is exploration.
         resolved_mode = "explore"
     resolved_weights = {name: float((weights or STRATEGY_WEIGHTS).get(name, 0.0)) for name in GENERATION_MODES}
+    # Mode shares are conditioned on measured mode quality when a prior is supplied (P22.3):
+    # a mode that keeps paying earns budget, a mode with no positive marginal value is shrunk
+    # toward the exploration floor rather than switched off.
+    mode_quality: dict[str, Any] = {}
+    if prior is not None:
+        stats = mode_outcomes(db, generator_version=generator_version or None)
+        conditioned = quality_conditioned_weights(weights or STRATEGY_WEIGHTS, stats)
+        mode_quality = {"weights": conditioned, "measured": {name: list(value) for name, value in stats.items()}}
+        resolved_weights = conditioned
     families = _families(catalog, family)
     scope = getattr(catalog, "scope", None)
     # Real field metadata for structural identities: without it every source parses as
@@ -823,10 +1211,15 @@ def plan_campaign(
         allocation = [{"family": families[0], "budget": budget, "share": 1.0,
                        "exploration": int(len(families) > 1), "max_family_share": float(max_family_share)}]
 
+    recipe_prior = {
+        str(dimension): {str(value): int(count) for value, count in counts.items()}
+        for dimension, counts in dict(recipe_prior or {}).items()
+    }
     if budget == 0:
         return Plan(campaign_id, resolved_mode, budget, seed, (), resolved_weights, tuple(allocation),
                     generator_version, max_family_share=max_family_share,
-                    archive_refresh=archive_refreshed, forced_motif=force_motif or "")
+                    archive_refresh=archive_refreshed, forced_motif=force_motif or "",
+                    recipe_prior=recipe_prior)
 
     family_slots = _expand_family_slots(allocation, budget)
     if len(family_slots) < budget:
@@ -862,8 +1255,18 @@ def plan_campaign(
             except Exception:  # pragma: no cover - advisory only
                 pass
     motif_stats = motif_outcome_stats(db, generator_version=generator_version or None)
-    motif_budget = allocate_motifs(list(grammar.MOTIF_BY_ID), budget, motif_stats,
-                                   seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share)
+    if prior is not None:
+        # Conditional allocation: every motif is scored in the source context it would run in,
+        # through the hierarchical prior, instead of on a global motif count (P21.1).
+        motif_budget, quality_report = allocate_motifs_conditioned(
+            list(grammar.MOTIF_BY_ID), sorted(set(family_slots)), budget, prior,
+            seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share,
+        )
+    else:
+        quality_report = {}
+        motif_budget = allocate_motifs(list(grammar.MOTIF_BY_ID), budget, motif_stats,
+                                       seed=seed, exploration_floor=exploration_floor,
+                                       max_share=motif_max_share)
     if force_motif is not None:
         # The pin is the allocation: reporting a Thompson spread the campaign cannot spend
         # would be fiction (P16).
@@ -969,7 +1372,8 @@ def plan_campaign(
             so the planner budgets the structure it will actually build.
             """
             field_ids = [node.field_id for node in stage_fields]
-            recipe = planned_recipe(campaign_id, seed, field_ids, name, recipe_index, parent_ids)
+            recipe = planned_recipe(campaign_id, seed, field_ids, name, recipe_index, parent_ids,
+                                    prior=recipe_prior)
             return _structure_hashes(name, stage_fields, recipe=recipe)
 
         def cross_dataset_option() -> str | None:
@@ -1097,6 +1501,10 @@ def plan_campaign(
         mutation_allocation=dict(mutation_budget),
         archive_refresh=archive_refreshed,
         forced_motif=force_motif or "",
+        quality_allocation=quality_report,
+        prior_version=quality_prior.QUALITY_PRIOR_VERSION if prior is not None else "",
+        mode_weights={str(key): float(value) for key, value in mode_quality.get("weights", {}).items()},
+        recipe_prior=recipe_prior,
     )
 
 
