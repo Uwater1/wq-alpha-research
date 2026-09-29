@@ -38,6 +38,7 @@ import diversity
 import expression_grammar as grammar
 import generation_policy
 import research_db
+import seed_bank
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PATH = REPO_ROOT / "references" / "wq_usa_top3000_delay1_data_fields.json"
@@ -77,6 +78,15 @@ def _crossover_limits(left: grammar.ExprNode, right: grammar.ExprNode) -> gramma
         max_binary_ops=min(CROSSOVER_LIMITS.max_binary_ops,
                            grammar.binary_op_count(left) + grammar.binary_op_count(right) + 2),
     )
+#: Ladder rung of a warm-started child (P19.3). The exploitation policy budgets these; the
+#: materializer records the rung it *requested* and the one it *realized*.
+WARM_START_BANDS = seed_bank.BANDS
+#: Structural edits that keep a parent's source set. Only these can realize D2 ("same sources,
+#: one structural edit"); ``dataset_swap`` and ``add_component`` move the sources by design and
+#: would realize D3/D4, so an exploitation step must not sample them (P22.1).
+FIELD_PRESERVING_OPERATIONS = (
+    "normalization_change", "group_change", "subtree_replace", "motif_change",
+)
 #: Motifs tried, in order, when an ineligible/over-budget motif cannot be materialized.
 FALLBACK_MOTIFS = (
     "cross_sectional_level", "change", "ranked_level", "group_relative", "time_series_level",
@@ -751,6 +761,271 @@ class CandidateGenerator:
             grammar_skeleton_hash=grammar.grammar_skeleton_hash(expression, metadata),
             semantic_skeleton_hash=grammar.semantic_skeleton_hash(expression, metadata),
         )
+
+    # -- Generator V3 / P19: warm-started exploitation around proven seeds -----
+
+    def seed_bank(
+        self,
+        *,
+        as_of: str | None = None,
+        stages: Sequence[str] = seed_bank.PASS_STAGES,
+        datasets: Sequence[str] | None = None,
+    ) -> list[seed_bank.Seed]:
+        """Proven candidates in this catalog's scope as of ``as_of`` (P19.1)."""
+        return seed_bank.build_seed_bank(
+            self.db, as_of=as_of, stages=stages, scope=self.catalog.scope, datasets=datasets,
+        )
+
+    @staticmethod
+    def _recipe_object(recipe: Mapping[str, Any]) -> grammar.Recipe:
+        """Typed recipe from a loose mapping, ignoring keys the grammar does not know."""
+        allowed = set(grammar.Recipe.__dataclass_fields__)
+        return grammar.Recipe(**{key: value for key, value in recipe.items() if key in allowed})
+
+    def warm_start(
+        self,
+        seed_row: Mapping[str, Any],
+        *,
+        band: str = "D1",
+        campaign_id: str = "warm-start",
+        seed: int = 0,
+        index: int = 0,
+        limits: grammar.ComplexityLimits = V3_LIMITS,
+    ) -> Proposal | None:
+        """One controlled child of a proven seed at one ladder rung (P19.2/P22.1).
+
+        The rung is the *design*: D1 moves one recipe/settings dimension, D3 substitutes one
+        compatible source, D2 applies one typed structural edit and D4 rebuilds the seed's
+        sources under a compatible new motif. D0 reproduces the seed exactly as a control.
+        The realized rung is measured with :func:`seed_bank.distance_band` and stored next to
+        the requested one, so an edit that quietly changed more than asked is visible.
+        """
+        if band not in seed_bank.BANDS:
+            raise ValueError(f"unknown distance band {band!r}; known: {list(seed_bank.BANDS)}")
+        record = seed_bank.seed_from_candidate(seed_row)
+        if not record.expression:
+            return None
+        metadata = self.metadata()
+        settings = _settings(seed_row)
+        recipe = dict(record.recipe)
+        parent_ids = (record.candidate_id,) if record.candidate_id else ()
+        generation = self.db.next_generation(parent_ids) if parent_ids else 0
+        source = record.expression
+        operation = ""
+        rng = random.Random(generation_policy.recipe_seed(
+            campaign_id, seed, list(record.fields), f"warm_start:{band}", index, parent_ids,
+        ))
+        try:
+            node: grammar.ExprNode | None = grammar.parse_expression(record.expression, metadata)
+        except grammar.GrammarError:
+            node = None
+
+        if band == "D1":
+            perturbed = seed_bank.perturb_recipe(
+                recipe, rng, dimensions=seed_bank.SETTINGS_RECIPE_DIMENSIONS,
+            )
+            for key in seed_bank.SETTINGS_RECIPE_DIMENSIONS:
+                if perturbed.get(key) is not None:
+                    settings[key] = perturbed[key]
+            operation = "recipe_perturbation"
+        elif band == "D2":
+            # Only field-preserving edits can realize "same sources, one structural edit"; the
+            # realized rung is verified and an edit that moved more than asked is reported.
+            order = list(FIELD_PRESERVING_OPERATIONS)
+            rng.shuffle(order)
+            fallback: Proposal | None = None
+            for name in order:
+                child = self.structural_mutation(
+                    seed_row, operation=name, campaign_id=campaign_id, seed=index,
+                )
+                if child is None:
+                    continue
+                labelled = self._label_warm_start(child, record, band, index)
+                if labelled.parameters.get("realized_band") == band:
+                    return labelled
+                fallback = fallback or labelled
+            return fallback
+        elif band == "D3":
+            choice = seed_bank.substitute_field_choice(
+                record.fields, self.catalog, rng, metadata=metadata,
+            )
+            if choice is None or node is None:
+                return None
+            replaced, replacement = choice
+            source = grammar.render(
+                _substitute_fields(node, {replaced: self._material_field_node(replacement)})
+            )
+            operation = "source_transfer"
+        elif band == "D4":
+            field_nodes = [self._material_field_node(name) for name in record.fields]
+            if not field_nodes:
+                return None
+            candidates = [
+                motif for motif in grammar.eligible_motifs(field_nodes)
+                if len(motif.input_roles) <= len(field_nodes)
+            ]
+            if not candidates:
+                return None
+            motif = candidates[rng.randrange(len(candidates))]
+            recipe = seed_bank.perturb_recipe(recipe, rng)
+            try:
+                node = grammar.build_motif(
+                    motif.id, field_nodes, self._recipe_object(recipe), limits=limits,
+                )
+            except grammar.GrammarError:
+                return None
+            source = grammar.render(node)
+            operation = f"motif_change:{motif.id}"
+
+        realized = seed_bank.distance_band(record, {
+            "normalized_expression": source,
+            "settings_json": json.dumps(canonical.normalize_settings(settings), sort_keys=True),
+        })
+        parameters: dict[str, Any] = {
+            "operation": operation or "control",
+            "requested_band": band,
+            "realized_band": realized,
+            "band_mismatch": realized != band,
+            "seed_candidate_id": record.candidate_id,
+            "seed_stage": record.stage,
+            "seed_sharpe": record.sharpe,
+            "seed_grammar_skeleton_hash": record.grammar_skeleton_hash,
+            "source_profile": diversity.derive_source_profile(source, self.catalog),
+        }
+        proposal = self._proposal(
+            source, settings, str(seed_row.get("signal_family") or "warm_start"),
+            "warm_start", parameters, parent_ids, generation,
+            seed_bank.BAND_DESCRIPTIONS.get(band, band),
+        )
+        profile = diversity.derive_source_profile(source, self.catalog)
+        return replace(
+            proposal,
+            generation_mode="exploit",
+            strategy="exploit",
+            motif_id=f"warm_start:{band}",
+            recipe_index=index,
+            source_profile=profile,
+            grammar_skeleton_hash=grammar.grammar_skeleton_hash(source, metadata),
+            semantic_skeleton_hash=grammar.semantic_skeleton_hash(source, metadata),
+            recipe=recipe,
+        )
+
+    def _label_warm_start(
+        self,
+        child: Proposal,
+        record: seed_bank.Seed,
+        band: str,
+        index: int,
+    ) -> Proposal:
+        """Attach the ladder provenance to a structural-edit child (P19.3)."""
+        realized = seed_bank.distance_band(record, {
+            "normalized_expression": child.expression,
+            "settings_json": json.dumps(canonical.normalize_settings(child.settings), sort_keys=True),
+        })
+        parameters = dict(child.parameters)
+        profile = diversity.derive_source_profile(child.expression, self.catalog)
+        parameters.update({
+            "requested_band": band,
+            "realized_band": realized,
+            "band_mismatch": realized != band,
+            "seed_candidate_id": record.candidate_id,
+            "seed_stage": record.stage,
+            "seed_sharpe": record.sharpe,
+            "source_profile": profile,
+        })
+        metadata = self.metadata()
+        return replace(
+            child, parameters=parameters, generation_mode="exploit", strategy="exploit",
+            motif_id=f"warm_start:{band}", recipe_index=index, recipe=record.recipe,
+            source_profile=profile,
+            grammar_skeleton_hash=grammar.grammar_skeleton_hash(child.expression, metadata),
+            semantic_skeleton_hash=grammar.semantic_skeleton_hash(child.expression, metadata),
+        )
+
+    def warm_start_campaign(
+        self,
+        *,
+        campaign_id: str,
+        count: int,
+        seed: int = 0,
+        bands: Mapping[str, float] | None = None,
+        as_of: str | None = None,
+        datasets: Sequence[str] | None = None,
+        limits: grammar.ComplexityLimits = V3_LIMITS,
+        screen: bool = True,
+        order_seeds: Any = None,
+    ) -> tuple[dict[str, Any], list[Proposal]]:
+        """An equal-budget warm-started campaign over the proven seed bank (P19.2).
+
+        Seeds are used round-robin across datasets so exploitation cannot collapse onto one
+        family, and exact duplicates are dropped rather than queued — a repeated proposal would
+        spend a slot on work the cache already answered.
+        """
+        count = max(0, int(count))
+        bank = self.seed_bank(as_of=as_of, datasets=datasets)
+        report: dict[str, Any] = {
+            "strategy": "warm_start",
+            "seeds": len(bank),
+            "planned_budget": count,
+            "requested_bands": {},
+            "realized_bands": {},
+            "band_mismatch": 0,
+            "duplicates_dropped": 0,
+            "materialized": 0,
+            "seeds_used": 0,
+        }
+        if not bank or count == 0:
+            return report, []
+        if order_seeds is not None:
+            ordered = list(order_seeds(bank))
+        else:
+            ordered = _seeds_round_robin(bank)
+        schedule = generation_policy.warm_start_schedule(count, bands, seed=seed)
+        report["requested_bands"] = _counts(schedule)
+
+        proposals: list[Proposal] = []
+        seen: set[str] = set()
+        used_seeds: set[int] = set()
+        # An equal-budget comparison needs the arms to actually materialize their budget, so an
+        # edit that cannot be realized is retried on the next seed rather than shrinking the
+        # campaign. Every retry is reported: this is not a silent top-up.
+        attempts = 0
+        max_attempts = max(count * 3, count + 12)
+        seed_rows: dict[int, Mapping[str, Any]] = {}
+        while len(proposals) < count and attempts < max_attempts and ordered:
+            band = schedule[attempts % len(schedule)]
+            record = ordered[attempts % len(ordered)]
+            attempts += 1
+            if record.candidate_id not in seed_rows:
+                row = self.db.get_candidate(record.candidate_id)
+                if row is None:
+                    continue
+                seed_rows[record.candidate_id] = row
+            proposal = self.warm_start(
+                seed_rows[record.candidate_id], band=band, campaign_id=campaign_id, seed=seed,
+                index=attempts // max(1, len(ordered)), limits=limits,
+            )
+            if proposal is None:
+                continue
+            key = canonical.canonical_key(proposal.expression, proposal.settings)
+            if key in seen:
+                report["duplicates_dropped"] += 1
+                continue
+            seen.add(key)
+            used_seeds.add(record.candidate_id)
+            proposals.append(proposal)
+        report["attempts"] = attempts
+        if screen:
+            proposals = self.screen_proposals(proposals, campaign_id=campaign_id, seed=seed)
+        report["materialized"] = len(proposals)
+        report["seeds_used"] = len(used_seeds)
+        report["realized_bands"] = _counts(
+            str(proposal.parameters.get("realized_band") or "unknown") for proposal in proposals
+        )
+        report["band_mismatch"] = sum(
+            1 for proposal in proposals if proposal.parameters.get("band_mismatch")
+        )
+        return report, proposals
 
     def generate(
         self,
@@ -1505,6 +1780,42 @@ class CandidateGenerator:
 # ---------------------------------------------------------------------------
 
 
+def _counts(values: Iterable[str]) -> dict[str, int]:
+    """Value counts, largest first then alphabetical; used for every honest distribution report."""
+    tally: dict[str, int] = {}
+    for value in values:
+        tally[str(value)] = tally.get(str(value), 0) + 1
+    return dict(sorted(tally.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _seeds_round_robin(seeds: Sequence[seed_bank.Seed]) -> list[seed_bank.Seed]:
+    """Best-first inside each primary dataset, datasets in rotation (P19.2).
+
+    Taking the global top-N seeds would concentrate exploitation in whichever dataset happens
+    to hold the best Sharpe. Rotating across datasets keeps the exploit arm diverse without
+    giving up the quality ordering inside each one.
+    """
+    groups: dict[str, list[seed_bank.Seed]] = {}
+    for seed in seeds:
+        dataset = (seed.datasets or ("unknown",))[0]
+        groups.setdefault(str(dataset), []).append(seed)
+    for members in groups.values():
+        members.sort(key=lambda item: (-item.quality, item.candidate_id))
+    ordered: list[seed_bank.Seed] = []
+    depth = 0
+    while True:
+        progressed = False
+        for dataset in sorted(groups):
+            members = groups[dataset]
+            if depth < len(members):
+                ordered.append(members[depth])
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
+    return ordered
+
+
 def _as_repair(proposal: Proposal, repair_type: str) -> Proposal:
     """Label a child with the *diagnosed failure mode* it answers.
 
@@ -1721,6 +2032,10 @@ def _build_parser() -> argparse.ArgumentParser:
                           default=generation_policy.DEFAULT_MAX_FAMILY_SHARE)
     generate.add_argument("--dry-plan", action="store_true",
                           help="materialize and print the V3 plan distribution without queueing")
+    generate.add_argument("--warm-start", action="store_true",
+                          help="P19.2: exploit the point-in-time seed bank across the distance ladder")
+    generate.add_argument("--seed-as-of", dest="seed_as_of",
+                          help="campaign clock: only gate evidence settled before it may seed the campaign")
     generate.add_argument("--db", type=Path)
     mutate = sub.add_parser("mutate")
     mutate.add_argument("candidate_id", type=int)
@@ -1788,7 +2103,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(diversity.campaign_diversity_report(db, args.campaign), indent=2, sort_keys=True))
             return 0
         generator = CandidateGenerator(db, seed=args.seed)
-        if args.command == "generate" and (args.strategy or args.motif or args.dry_plan):
+        if args.command == "generate" and args.warm_start:
+            report, proposals = generator.warm_start_campaign(
+                campaign_id=args.campaign, count=args.count, seed=args.seed,
+                as_of=args.seed_as_of,
+                datasets=None if args.family in (None, "all") else [args.family],
+            )
+            if args.dry_plan:
+                print(json.dumps(report, indent=2, sort_keys=True))
+                return 0
+            queued = generator.queue(args.campaign, proposals)
+            report["queued"] = sum(1 for outcome in queued if outcome["action"] == "queued")
+            report["decisions"] = _counts(str(outcome["action"]) for outcome in queued)
+            print(json.dumps(report, indent=2, sort_keys=True))
+        elif args.command == "generate" and (args.strategy or args.motif or args.dry_plan):
             plan, proposals = generator.generate(
                 campaign_id=args.campaign, count=args.count, seed=args.seed,
                 strategy=args.strategy or "mixed", family=None if args.family in (None, "all") else args.family,

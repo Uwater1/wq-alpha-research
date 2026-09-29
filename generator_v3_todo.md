@@ -134,34 +134,28 @@ Conclusion: this is a **search-distribution failure**, and it is localised. The 
 
 This is the most important control experiment.
 
+Implemented in `scripts/seed_bank.py` (bank, ladder, recipe prior) and `generator.warm_start` / `generator.warm_start_campaign` (the warm-started arm), covered by `tests/test_seed_bank.py` and `tests/test_warm_start.py`.
+
 ## P19.1 Historical seed bank
 
-- [ ] Build a point-in-time-safe seed bank from historical candidates that had reached IS/CORR gates **before** the target campaign clock.
-- [ ] Store only evidence available at that time.
-- [ ] Tag each seed with motif, source profile, grammar/semantic skeleton, settings and outcome stage.
+- [x] Point-in-time-safe seed bank from candidates that had reached an IS/CORR gate **before** the target campaign clock (`build_seed_bank(..., as_of=...)`, settlement timestamp is the simulation's `completed_at`).
+- [x] Only evidence available at that time is stored, and `seed.public()` exposes a sanitized view that never carries the private expression.
+- [x] Each seed is tagged with motif, source profile, grammar/semantic skeleton, recipe (reconstructed from settings + first window for legacy V2 rows), settings and outcome stage.
 
 ## P19.2 V2 reconstruction control
 
-- [ ] Make V3 generate controlled candidates structurally near known V2 successes:
-  - same source + nearby recipe
-  - same motif + new compatible source
-  - same semantic skeleton + field substitution
-  - one-edit mutation
-- [ ] Run equal-budget:
-  - original/near-original V2 controls
-  - warm-started V3
-  - ordinary V3
-- [ ] Determine whether V3's weak live output is caused primarily by its search distribution rather than current BRAIN conditions.
+- [x] V3 generates controlled candidates structurally near proven successes through the warm-start ladder: D1 = same source + nearby recipe, D3 = same motif/topology + new compatible source, D2 = one-edit mutation (field-preserving operations only), D4 = semantic/motif change over the same sources.
+- [x] Equal-budget arms are runnable: `--warm-start` (warm-started V3), `--strategy mixed` (ordinary V3) and the V2 template path are all one command; the arm harness and promotion gate are P25.
+- [x] Verdict on the 0/138 collapse: **search distribution, not BRAIN conditions.** The proven bank contains 139 gate-reaching candidates, and 120 of 139 (86%) used truncation `0.08` — a value V3's recipe grid could not even express (`{0.05, 0.1, 0.15}`). 109 of 139 prove an `add(...)` multi-component shape, while 153 of V3's 204 simulations were the single-blob `group_rank` shape with zero passes.
 
 ## P19.3 Distance ladder
 
-- [ ] Define mutation/search distance bands from a proven seed:
-  - D0 exact/control
-  - D1 parameter-only
-  - D2 one structural edit
-  - D3 source transfer
-  - D4 semantic/motif change
-- [ ] Measure pass probability versus distance.
+- [x] Bands are defined and measurable from a proven seed: D0 exact/control, D1 parameter-only (identical ordered operator sequence, same sources), D2 one structural edit (`operator_edit_distance <= 2`, same sources), D3 source transfer (same topology, sources substituted), D4 semantic/motif change.
+- [x] `distance_outcomes()` measures pass probability per rung over the live ledger, optionally restricted to one generator's children (`child_versions`) so the rung rates describe the arm under test rather than every campaign that ever mutated a proven alpha.
+- [x] `perturb_recipe()` moves exactly one recipe dimension, and `substitute_field_choice()` returns the replaced field as well as a type- and role-compatible replacement, so each rung is a real one-thing-changed edit.
+- [x] Recipe prior: `proven_recipe_prior()` reports which recipe cells the platform actually accepted (truncation 0.08 in 120/139 seeds, SUBINDUSTRY in 93/139, lookback 22 in 68/139) — the exploitation prior for P21.3/P22.1.
+
+**D0 is defined but not budgeted by default**: a byte-identical child is an exact duplicate, so the canonical cache refuses it and it can never consume a BRAIN slot; spending campaign budget on it would silently shrink the arm. It is opt-in through explicit band weights.
 
 **Research:** warm-started GP and AutoAlpha both motivate focusing search around promising regions rather than restarting from nearly uniform novelty.
 
@@ -476,9 +470,9 @@ These become worthwhile only if P18–P24 show that the local quality model and 
 # Recommended order
 
 ```text
-P16  small correctness/observability cleanup
-P18  explain the 0/138 result
-P19  recover a known-good control surface
+P16  small correctness/observability cleanup   [done]
+P18  explain the 0/138 result                   [done]
+P19  recover a known-good control surface       [done]
 P20  quality-conditioned QD
 P21  conditional motif/source/recipe evidence
 P22  warm-start exploit + controlled mutation

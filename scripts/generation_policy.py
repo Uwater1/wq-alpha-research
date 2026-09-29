@@ -90,6 +90,10 @@ GROUP_LEVELS = ("subindustry", "industry", "sector")
 TRUNCATIONS = (0.05, 0.1, 0.15)
 NORMALIZATIONS = ("rank", "zscore")
 
+#: Ladder rungs a warm-started campaign can budget (P19.3). Re-exported from the seed bank
+#: vocabulary so the policy never invents a band the ladder cannot measure.
+WARM_START_BANDS = ("D0", "D1", "D2", "D3", "D4")
+
 #: Concrete V3 structural mutation operations (P4.4). The planning vocabulary for adaptive
 #: mutation allocation (P9.2); the typed edits that realize them live in the generator.
 V3_MUTATION_OPERATIONS = (
@@ -302,6 +306,69 @@ def mode_allocation(budget: int, mode: str, weights: Mapping[str, float] | None 
         for name in GENERATION_MODES:
             if queues[name]:
                 result.append(queues[name].pop())
+                progressed = True
+                if len(result) >= budget:
+                    break
+        if not progressed:
+            break
+    return result[:budget]
+
+
+#: How a warm-started exploitation campaign spends its slots across the distance ladder
+#: (P19.3/P22.1). The bulk stays close to a proven seed: one controlled change at a time. D4
+#: keeps a real exploration floor, because a ladder that never leaves the proven region cannot
+#: notice that the region stopped working.
+#:
+#: ``D0`` is deliberately **not** budgeted by default. A byte-identical child is an exact
+#: duplicate of an existing candidate, so the canonical cache refuses it and it can never
+#: consume a BRAIN simulation: spending campaign budget on it would shrink the arm. It stays a
+#: defined band (and a measurable rung) and is opt-in through explicit weights, e.g. when the
+#: control arm's job is to prove the harness reproduces a seed exactly.
+WARM_START_BAND_WEIGHTS: dict[str, float] = {
+    "D0": 0.0,
+    "D1": 0.32,
+    "D2": 0.37,
+    "D3": 0.21,
+    "D4": 0.10,
+}
+
+
+def warm_start_schedule(
+    budget: int,
+    weights: Mapping[str, float] | None = None,
+    *,
+    seed: int = 0,
+) -> list[str]:
+    """Per-slot ladder rungs for a warm-started campaign, interleaved and deterministic.
+
+    Same contract as :func:`mode_allocation`: the returned list length is exactly ``budget``,
+    the largest-remainder fill is deterministic, and the rungs are interleaved so no rung
+    front-loads the campaign.
+    """
+    budget = int(budget)
+    if budget <= 0:
+        return []
+    active = {band: max(0.0, float((weights or WARM_START_BAND_WEIGHTS).get(band, 0.0))) for band in WARM_START_BANDS}
+    total = sum(active.values())
+    if total <= 0:
+        active = dict.fromkeys(WARM_START_BANDS, 0.0)
+        active["D1"] = 1.0
+        total = 1.0
+    # Every band keeps an entry, so the largest-remainder fill can look all of them up even
+    # when a weighting zeroes some out.
+    exact = {band: budget * active[band] / total for band in WARM_START_BANDS}
+    counts = {band: int(math.floor(value)) for band, value in exact.items()}
+    remainder = budget - sum(counts.values())
+    order = sorted(WARM_START_BANDS, key=lambda band: (-(exact[band] - counts[band]), WARM_START_BANDS.index(band)))
+    for band in order[:remainder]:
+        counts[band] += 1
+    queues = {band: [band] * counts[band] for band in WARM_START_BANDS}
+    result: list[str] = []
+    while len(result) < budget:
+        progressed = False
+        for band in WARM_START_BANDS:
+            if queues[band]:
+                result.append(queues[band].pop())
                 progressed = True
                 if len(result) >= budget:
                     break

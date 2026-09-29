@@ -665,6 +665,25 @@ def _levenshtein(left: Sequence[str], right: Sequence[str]) -> int:
     return previous[-1]
 
 
+def operator_edit_distance(left: "str | ExprNode", right: "str | ExprNode") -> int:
+    """Edits needed to turn one expression's *ordered* operator sequence into the other.
+
+    ``grammar_distance`` is a blended structural distance; the distance ladder (P19.3) needs
+    the unblended count so "one structural edit" means exactly one edit to the operator tree
+    rather than "somewhere below a threshold".
+    """
+    left_seq = _operator_sequence(_node_or_parse(left)) if isinstance(left, str) else _operator_sequence(left)
+    right_seq = _operator_sequence(_node_or_parse(right)) if isinstance(right, str) else _operator_sequence(right)
+    return _levenshtein(left_seq, right_seq)
+
+
+def _node_or_parse(expression: str) -> ExprNode:
+    try:
+        return parse_expression(str(expression), None)
+    except GrammarError:
+        return FieldNode(field_id=str(expression or ""))
+
+
 def _jaccard_distance(left: Iterable[str], right: Iterable[str]) -> float:
     left_set, right_set = set(left), set(right)
     if not left_set and not right_set:
