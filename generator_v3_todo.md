@@ -231,6 +231,15 @@ learned rate (`is_pass / simulated`) inflated toward 100%. It now counts a finis
 row as spent capacity, so the live ledger reads `explore 84/0`, `exploit 46/0`, `mutate 13/0`,
 `crossover 6/0` for V3 instead of four cells of `0/0` — with all four modes unproven, the bounded
 prior correctly declines to move any weight.
+**Bounded shape preference:** because the ledger's only paying shape is a *repeat*, pure
+novelty-first planning is structurally biased against it (`grammar_seen >= 1` is exactly what
+novelty penalises). So quality may claim a **bounded share** of explore seats ahead of archive
+novelty: at most `OPERATOR_PREFERENCE_SHARE = 0.6` of explore slots, and only for a shape whose
+measured rate is at least `OPERATOR_PREFERENCE_RATIO = 1.5x` the campaign's own global rate (a
+self-calibrating bar, not a magic constant). Outside that share ordering is byte-for-byte the
+previous novelty-first one, and the random tiebreak stays last, so the number of RNG draws per
+motif is unchanged and an unconditioned plan is unchanged. Live effect on a 40-slot conditioned
+plan: `add`-rooted composites 10-14 of 40 (control 4/40) with 25-26 of 40 at truncation `0.08`.
 Deduplication (`canonical_key`) and point-in-time filtering are untouched; `prior=None` /
 `quality_conditioned=False` reproduce the previous unconditioned distribution as the control arm.
 
@@ -293,11 +302,20 @@ spends a campaign's motif budget from this prior *per dataset*, with the same gu
 floor, no motif exceeds `max_share`). `Plan.quality_allocation` / `Plan.prior_version` / `Plan.mode_weights`
 record the evidence behind every allocation.
 
+**Implemented (emitted-shape level):** the hierarchy carries an `outer_operator` level — the
+emitted root operator, which is the one cell that spans every generator version (a motif name is
+vocabulary-local). Planning reads it through `generation_policy._operator_evidence` and
+`Plan.operator_preference` reports the seat budget, the seats claimed, the earning bar and the
+evidence.
+
 **Live evidence (as of the diagnosis clock, `research.db`):** global 753 simulations / 141 IS
 passes; `motif+dataset` — `analyst4 80/142 (50.0%)`, `news18 28/56 (38.2%)`, `model16 9/42
 (16.1%)`, `fundamental2 5/28 (17.9%)`, `fundamental6 7/53 (13.2%)`, `option8 5/45 (11.1%)`;
-`motif+operation` — `add_component 6/6 (100%)`. The prior is therefore *not* uniform over
-sources, which is exactly the signal the V3 search was ignoring.
+`motif+operation` — `add_component 6/6 (100%)`; `outer_operator` — **`add` 110/190 (57.9%)**,
+`winsorize` 5/43 (11.6%), `group_rank` 21/249 (8.4%), `rank` 3/51 (5.9%), `hump` 0/13,
+`ts_rank` 0/12, `divide`/`subtract`/`ts_delta` none among the well-sampled cells. The prior is
+therefore *not* uniform over sources or shapes, which is exactly the signal the V3 search was
+ignoring.
 
 ## P21.2 Posterior quality prior
 

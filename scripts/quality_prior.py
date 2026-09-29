@@ -84,6 +84,11 @@ HIERARCHY: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("motif+operation", ("motif_id", "mutation_operation")),
     ("motif", ("motif_id",)),
     ("operation+parent_quality", ("mutation_operation", "parent_quality_bucket")),
+    # The emitted root operator, not a motif name: the ledger shows that what a candidate's
+    # expression *is* (a multi-component sum vs a single normalized blob) separates passing
+    # cells from empty ones, and that is vocabulary-independent — it spans every generator
+    # version, which a motif name cannot (P21.1).
+    ("outer_operator", ("outer_operator",)),
     ("global", ()),
 )
 

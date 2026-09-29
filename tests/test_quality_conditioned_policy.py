@@ -6,6 +6,7 @@ lucky cell rewrite the whole campaign — a bounded prior is the point.
 """
 from __future__ import annotations
 
+import collections
 import json
 import math
 
@@ -13,6 +14,7 @@ import pytest
 
 import archive
 import generation_policy as policy
+from generation_policy import _operator_evidence as generation_policy_operator_evidence
 import generator
 import quality_prior as qp
 import research_db
@@ -265,6 +267,81 @@ def test_conditioning_can_be_switched_off_for_a_control_arm(db, catalog):
     )
     assert plan.prior_version == ""
     assert len(proposals) == 12
+
+
+# ---------------------------------------------------------------------------
+# P21.1/P20.2: the emitted shape is conditioned, with a bounded paid share
+# ---------------------------------------------------------------------------
+
+
+def _settle_operator(db, operator, *, is_pass, index):
+    """Settle one candidate whose emitted root operator is ``operator``."""
+    if operator == "add":
+        expression = (f"add(ts_rank(ebit,{60 + index}),ts_rank(close,{60 + index}))")
+    else:
+        expression = f"group_rank(ts_rank(ebit,{60 + index}),subindustry)"
+    _settle(db, expression, motif_id=operator, is_pass=is_pass)
+
+
+def test_operator_evidence_reads_only_cells_with_minimum_evidence():
+    assert generation_policy_operator_evidence(None) == {}
+    assert generation_policy_operator_evidence(qp.QualityPrior()) == {}
+    assert generation_policy_operator_evidence(_StubPrior({})) == {}, (
+        "a prior without the operator level yields no preference at all"
+    )
+    prior = qp.QualityPrior.from_rows([
+        {"decision": "KEEP", "simulated": True, "is_pass": True, "outer_operator": "add"}
+        for _ in range(6)
+    ] + [
+        {"decision": "KEEP", "simulated": True, "is_pass": False, "outer_operator": "divide"}
+        for _ in range(6)
+    ] + [
+        {"decision": "KEEP", "simulated": True, "is_pass": True, "outer_operator": "hump"}
+        for _ in range(2)
+    ], min_evidence=3)
+    evidence = generation_policy_operator_evidence(prior)
+    assert evidence == {"add": 1.0, "divide": 0.0}, "a thin cell is not a verdict"
+
+
+def test_the_paid_shape_is_preferred_inside_a_bounded_share_of_explore_seats(db, catalog):
+    for index in range(4):
+        _settle_operator(db, "add", is_pass=True, index=index)
+        _settle_operator(db, "group_rank", is_pass=False, index=index)
+
+    def shape_counts(quality_conditioned):
+        _, proposals = generator.CandidateGenerator(db, catalog, seed=31).generate(
+            campaign_id=f"paid-{quality_conditioned}", count=40, seed=31, strategy="mixed",
+            quality_conditioned=quality_conditioned,
+        )
+        return collections.Counter(p.expression.split("(", 1)[0] for p in proposals), proposals
+
+    conditioned, conditioned_proposals = shape_counts(True)
+    control, _ = shape_counts(False)
+    assert conditioned["add"] > control["add"], (
+        "the only shape the ledger has paid for must be reachable in preference to novelty"
+    )
+    assert len(conditioned) >= 4, "and the search must not collapse onto it"
+    assert len(conditioned_proposals) == 40
+
+    gen = generator.CandidateGenerator(db, catalog, seed=31)
+    _, proposals = gen.generate(campaign_id="paid-seats", count=40, seed=31, strategy="mixed")
+    report = gen.plan(campaign_id="paid-seats", budget=40, seed=31, mode="mixed",
+                      prior=gen.quality_prior()).operator_preference
+    assert "add" in report["evidence"]
+    assert report["evidence"]["add"] > report["earning_bar"] > 0.0
+    assert report["seats"] <= math.ceil(report["explore_seats"] * policy.OPERATOR_PREFERENCE_SHARE)
+    assert report["used"] <= report["seats"]
+
+
+def test_a_conditioned_plan_still_materializes_its_whole_budget(db, catalog):
+    for index in range(4):
+        _settle_operator(db, "add", is_pass=True, index=index)
+    _, proposals = generator.CandidateGenerator(db, catalog, seed=33).generate(
+        campaign_id="paid-budget", count=30, seed=33, strategy="mixed",
+    )
+    assert len(proposals) == 30
+    assert all(not p.parameters.get("planned_grammar_hash")
+               or p.parameters.get("planned_structure_matched") for p in proposals)
 
 
 # ---------------------------------------------------------------------------

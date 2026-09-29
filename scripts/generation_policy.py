@@ -180,6 +180,9 @@ class Plan:
     #: Proven recipe value counts (dimension -> value -> count) the plan's recipes are sampled
     #: from (P21.3). Empty means the uniform local grid.
     recipe_prior: Mapping[str, Mapping[str, int]] = dataclass_field(default_factory=dict)
+    #: How the measured emitted-shape preference was spent (P21.1/P20.2): the bounded seat
+    #: budget, the seats it actually claimed, the earning bar, and the evidence itself.
+    operator_preference: Mapping[str, Any] = dataclass_field(default_factory=dict)
     #: Mode weights before and after quality conditioning (P22.3).
     mode_weights: Mapping[str, float] = dataclass_field(default_factory=dict)
 
@@ -224,6 +227,7 @@ class Plan:
             "recipe_prior": {str(dimension): dict(counts)
                              for dimension, counts in self.recipe_prior.items()},
             "recipe_prior_dimensions": sorted(str(name) for name in self.recipe_prior),
+            "operator_preference": dict(self.operator_preference),
             "slots": [slot.as_dict() for slot in self.slots],
         }
 
@@ -652,6 +656,13 @@ def allocate_mutation_operations(
         seed=seed, exploration_floor=exploration_floor, max_share=max_share,
     )
 
+
+#: An emitted shape earns preference only when its measured rate is at least this multiple of
+#: the campaign's own global rate — a self-calibrating bar, not a magic constant (P20.2).
+OPERATOR_PREFERENCE_RATIO = 1.5
+#: And it may claim at most this share of explore seats. The rest stays novelty-first, so the
+#: measured shape is preferred *without* collapsing the search onto one motif (P20.2).
+OPERATOR_PREFERENCE_SHARE = 0.6
 
 #: A mode needs this many simulations before its measured rate may move its weight.
 DEFAULT_MODE_MIN_EVIDENCE = 5
@@ -1376,6 +1387,23 @@ def plan_campaign(
                                     prior=recipe_prior)
             return _structure_hashes(name, stage_fields, recipe=recipe)
 
+        def emitted_operator(name: str) -> str:
+            """The root operator ``name`` would actually emit over this slot's sources.
+
+            Built with the same typed grammar and the same planned recipe the materializer uses,
+            so the preference is about the expression that will be emitted, not the motif's name.
+            """
+            stage_fields = motif_fields(name)
+            try:
+                recipe = planned_recipe(
+                    campaign_id, seed, [node.field_id for node in stage_fields], name,
+                    recipe_index, parent_ids, prior=recipe_prior,
+                )
+                node = grammar.build_motif(name, stage_fields, recipe, limits=_PLANNING_LIMITS)
+            except grammar.GrammarError:
+                return ""
+            return str(node.operator).lower() if isinstance(node, grammar.CallNode) else ""
+
         def cross_dataset_option() -> str | None:
             """A constructible, structurally unseen cross-dataset motif for this slot, if any."""
             field_set = motif_fields("cross_dataset_composite")
@@ -1389,6 +1417,41 @@ def plan_campaign(
                 return None  # a repeat: never spend the reachability seat on a known structure
             return "cross_dataset_composite"
 
+        operator_evidence = _operator_evidence(prior) if prior is not None else {}
+        explore_slots = sum(1 for mode in modes if mode == "explore")
+        paid_seats = int(math.ceil(explore_slots * OPERATOR_PREFERENCE_SHARE)) if operator_evidence else 0
+        paid_floor = 0.0
+        if operator_evidence:
+            baseline = float(getattr(prior, "global_prior", 0.0) or 0.0)
+            paid_floor = (
+                max(operator_evidence.values()) if baseline <= 0
+                else OPERATOR_PREFERENCE_RATIO * baseline
+            )
+
+        paid_used = 0
+
+        def _explore_key(name: str) -> tuple:
+            """Explore ordering: novelty first, then the shape the ledger has paid for (P4.2/P21.1).
+
+            The operator term is a *tie-break* appended to the novelty key, never in front of it:
+            an unseen structure still wins, and the random draw stays last so exploration stays
+            random among structures the ledger has no opinion about. The number of RNG draws per
+            motif is unchanged, so an unconditioned plan is bit-for-bit what it was.
+            """
+            novelty = _structure_novelty(
+                hashes_for(name, motif_fields(name)),
+                grammar_counts=grammar_counts, semantic_counts=semantic_counts,
+                occupancy=occupancy, used=used_structures, rng=slot_rng,
+            )
+            if not operator_evidence:
+                return novelty
+            paid = operator_evidence.get(emitted_operator(name), 0.0)
+            if prefer_paid:
+                return (0 if paid >= paid_floor else 1, *novelty[:5], -paid, novelty[5])
+            # Outside the paid share, ordering is exactly the previous novelty-first one: the
+            # measured shape is preferred, never imposed (P20.2).
+            return (*novelty[:5], -paid, novelty[5])
+
         if force_motif is not None:
             # Pinned at planning time: identical to what materialization will build (P16).
             motif_id = force_motif
@@ -1398,6 +1461,11 @@ def plan_campaign(
             # Budget grammar/semantic novelty *before* materialization (P4.2): explore slots go
             # to structures that are unseen or sparse in the archive, never to a repeat while
             # an untested structure is still reachable.
+            # Quality may claim a bounded, explicit share of explore seats ahead of archive
+            # novelty (P20.2): the ledger's only paying shape so far is a multi-component
+            # composite, which pure novelty-first ordering is structurally biased against,
+            # because "this shape already exists" is exactly what novelty penalises.
+            prefer_paid = bool(operator_evidence) and explore_seats < paid_seats
             reachable_cross = (
                 cross_dataset_option() if not cross_dataset_seated and explore_seats >= 1 else None
             )
@@ -1407,12 +1475,12 @@ def plan_campaign(
             else:
                 motif_id = min(
                     (motif.id for motif in eligible),
-                    key=lambda name: _structure_novelty(
-                        hashes_for(name, motif_fields(name)),
-                        grammar_counts=grammar_counts, semantic_counts=semantic_counts,
-                        occupancy=occupancy, used=used_structures, rng=slot_rng,
-                    ),
+                    key=lambda name: _explore_key(name),
                 )
+            if prefer_paid and operator_evidence.get(emitted_operator(motif_id), 0.0) >= paid_floor:
+                # Only a seat that actually landed on an earning shape is counted, so the
+                # diagnostic cannot claim a preference the plan did not spend (P21.1).
+                paid_used += 1
             explore_seats += 1
         else:
             # exploit / mutate / crossover: spend the bounded adaptive allocation, preferring a
@@ -1505,7 +1573,37 @@ def plan_campaign(
         prior_version=quality_prior.QUALITY_PRIOR_VERSION if prior is not None else "",
         mode_weights={str(key): float(value) for key, value in mode_quality.get("weights", {}).items()},
         recipe_prior=recipe_prior,
+        operator_preference={
+            "seats": paid_seats,
+            "used": paid_used,
+            "earning_bar": round(float(paid_floor), 6),
+            "explore_seats": explore_slots,
+            "evidence": {name: round(value, 6) for name, value in sorted(operator_evidence.items())},
+        },
     )
+
+
+def _operator_evidence(prior: Any) -> dict[str, float]:
+    """Measured pass rate per *emitted root operator*, from a conditional prior (P21.1).
+
+    This is the one cell in the hierarchy that spans every generator version — a motif name is
+    vocabulary-local, an outer operator is not — and the ledger separates it sharply:
+    multi-component ``add`` composites pass at a far higher rate than single normalized blobs.
+    Only cells with minimum evidence count, and a prior without the level (or without tables at
+    all, as a test stub has) yields no preference at all.
+    """
+    tables = getattr(prior, "tables", None)
+    if not isinstance(tables, Mapping):
+        return {}
+    table = tables.get("outer_operator") or {}
+    minimum = int(getattr(prior, "min_evidence", 1) or 1)
+    evidence: dict[str, float] = {}
+    for key, cell in table.items():
+        simulations = int(getattr(cell, "simulations", 0) or 0)
+        if simulations < minimum:
+            continue
+        evidence[str(key).strip().lower()] = int(getattr(cell, "is_pass", 0) or 0) / simulations
+    return evidence
 
 
 def _pick_parent(
