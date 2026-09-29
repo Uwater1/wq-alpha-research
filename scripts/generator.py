@@ -65,21 +65,44 @@ V3_LIMITS = grammar.ComplexityLimits(max_depth=5, max_nodes=16, max_fields=2, ma
 CROSSOVER_LIMITS = grammar.ComplexityLimits(max_depth=8, max_nodes=40, max_fields=6, max_binary_ops=6)
 
 
+def _child_budget(parent_metric: int, cap: int, slack: int) -> int:
+    """One dimension of a derived child's budget: the parent's own size plus bounded growth.
+
+    ``cap`` is the budget for a *fresh* candidate of the current generation, and it must never be
+    applied as a ceiling to a parent that already exceeds it. The gate-reaching alphas in this
+    ledger are 73-113 nodes against a 40-node ceiling, so ``min(cap, parent + slack)`` made every
+    one of their own structures illegal, every derivation of them failed validation, and the
+    whole lineage machinery (mutation and crossover) was silently inert on exactly the parents
+    worth exploiting: the slot fell back to a fresh exploration proposal instead.
+
+    The rule is therefore: unchanged for a parent the old rule could already handle, and
+    ``parent + slack`` otherwise, so growth stays bounded by ``slack`` per generation and a child
+    can never be smaller than the structure it derives from (P4.4/P22.1).
+    """
+    parent_metric, cap, slack = int(parent_metric), int(cap), int(slack)
+    if parent_metric >= cap:
+        return parent_metric + slack
+    return min(cap, parent_metric + slack)
+
+
 def _crossover_limits(left: grammar.ExprNode, right: grammar.ExprNode) -> grammar.ComplexityLimits:
     """Budget a crossover child against its parents instead of a fresh-generation budget.
 
     Archive elites have usually been mutated once or twice, so a fixed 16-node budget refuses
     almost every real pair and silently turns the whole crossover allocation into exploration.
-    The child is allowed what its parents need plus a small margin, never more than
-    ``CROSSOVER_LIMITS``.
+    The child is allowed what its parents need plus a small margin; a parent larger than
+    ``CROSSOVER_LIMITS`` raises the allowance rather than being refused (see
+    :func:`_child_budget`).
     """
+    depth = max(grammar.node_depth(left), grammar.node_depth(right))
+    nodes = grammar.node_count(left) + grammar.node_count(right)
     return grammar.ComplexityLimits(
-        max_depth=min(CROSSOVER_LIMITS.max_depth, max(grammar.node_depth(left), grammar.node_depth(right)) + 2),
-        max_nodes=min(CROSSOVER_LIMITS.max_nodes, grammar.node_count(left) + grammar.node_count(right) + 4),
-        max_fields=min(CROSSOVER_LIMITS.max_fields,
-                       len(grammar.source_fields(left)) + len(grammar.source_fields(right))),
-        max_binary_ops=min(CROSSOVER_LIMITS.max_binary_ops,
-                           grammar.binary_op_count(left) + grammar.binary_op_count(right) + 2),
+        max_depth=_child_budget(depth, CROSSOVER_LIMITS.max_depth, 2),
+        max_nodes=_child_budget(nodes, CROSSOVER_LIMITS.max_nodes, 4),
+        max_fields=_child_budget(len(grammar.source_fields(left)) + len(grammar.source_fields(right)),
+                                 CROSSOVER_LIMITS.max_fields, 0),
+        max_binary_ops=_child_budget(grammar.binary_op_count(left) + grammar.binary_op_count(right),
+                                     CROSSOVER_LIMITS.max_binary_ops, 2),
     )
 #: Ladder rung of a warm-started child (P19.3). The exploitation policy budgets these; the
 #: materializer records the rung it *requested* and the one it *realized*.
@@ -2043,17 +2066,18 @@ def _crossover_leg(node: grammar.ExprNode, form: str) -> grammar.ExprNode:
 
 
 def _mutation_limits(parent: grammar.ExprNode) -> grammar.ComplexityLimits:
-    """Budget a structural mutation child against its parent, never above the hard ceiling.
+    """Budget a structural mutation child against its parent.
 
     A typed edit adds at most a handful of nodes to the parent; charging the child against a
     fresh-candidate budget would refuse edits of already-evolved elites, exactly like the
-    crossover budget used to before it was scaled to its parents.
+    crossover budget used to before it was scaled to its parents. A parent above the fresh
+    ceiling raises the allowance instead of being rejected (see :func:`_child_budget`).
     """
     return grammar.ComplexityLimits(
-        max_depth=min(CROSSOVER_LIMITS.max_depth, grammar.node_depth(parent) + 2),
-        max_nodes=min(CROSSOVER_LIMITS.max_nodes, grammar.node_count(parent) + 6),
-        max_fields=min(CROSSOVER_LIMITS.max_fields, len(grammar.source_fields(parent)) + 1),
-        max_binary_ops=min(CROSSOVER_LIMITS.max_binary_ops, grammar.binary_op_count(parent) + 2),
+        max_depth=_child_budget(grammar.node_depth(parent), CROSSOVER_LIMITS.max_depth, 2),
+        max_nodes=_child_budget(grammar.node_count(parent), CROSSOVER_LIMITS.max_nodes, 6),
+        max_fields=_child_budget(len(grammar.source_fields(parent)), CROSSOVER_LIMITS.max_fields, 1),
+        max_binary_ops=_child_budget(grammar.binary_op_count(parent), CROSSOVER_LIMITS.max_binary_ops, 2),
     )
 
 

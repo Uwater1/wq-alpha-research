@@ -271,6 +271,63 @@ def parent_score(row: Mapping[str, Any]) -> float:
     return round(quality + 0.5 * novelty - lineage_penalty, 6)
 
 
+def exploitation_parents(
+    db: research_db.ResearchDB,
+    *,
+    count: int = 10,
+    seed: int = 0,
+    per_family_cap: int | None = None,
+) -> list[dict[str, Any]]:
+    """Elites that demonstrably reached a gate, best evidence first (P22.2).
+
+    Exploration wants a parent pool spread over sparse niches; a mutation or a crossover wants a
+    parent whose *outcome* says the region is real. Mixing the two pools is what lets a lineage
+    spend a whole campaign descending from a plausible-looking candidate that never cleared
+    anything. The pool is still spread over families (``per_family_cap``), because a lineage
+    narrowed to one family is how a campaign collapses onto a single idea.
+
+    Returns an empty list when no elite has reached a gate — the caller keeps its diversity
+    pool in that case rather than spending the slots differently than planned.
+    """
+    placeholders = ", ".join("?" for _ in PASSING)
+    rows = db.query(
+        "SELECT a.*, c.status, c.generation, c.signal_family, c.sharpe, c.fitness, c.turnover,"
+        "       c.self_corr, c.normalized_expression, c.motif_id, c.generation_mode "
+        f"FROM archive_cells a JOIN candidates c ON c.id=a.elite_candidate_id WHERE c.status IN ({placeholders})",
+        tuple(sorted(PASSING)),
+    )
+    wanted = max(0, int(count))
+    if not rows or wanted == 0:
+        return []
+    cap = int(per_family_cap) if per_family_cap else max(1, math.ceil(wanted / 3))
+    rng = random.Random(int(seed))
+    ordered = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (-quality_elite_score(row), str(row["cell_key"])),
+    )
+    selected: list[dict[str, Any]] = []
+    per_family: dict[str, int] = defaultdict(int)
+    for row in ordered:
+        family = str(row["signal_family"] or "unknown")
+        if per_family[family] >= cap:
+            continue
+        per_family[family] += 1
+        selected.append(row)
+        if len(selected) >= wanted:
+            break
+    if len(selected) < wanted:
+        # Fewer families than the cap allows: top the pool up by evidence rather than by luck.
+        chosen = {id(row) for row in selected}
+        for row in ordered:
+            if id(row) in chosen:
+                continue
+            selected.append(row)
+            if len(selected) >= wanted:
+                break
+    rng.shuffle(selected)  # seeded tie-break; the caller re-ranks by use count
+    return selected[:wanted]
+
+
 def parents(db: research_db.ResearchDB, *, count: int = 10, seed: int = 0) -> list[dict[str, Any]]:
     """Round-robin across families and niches, best-first inside each, seeded.
 

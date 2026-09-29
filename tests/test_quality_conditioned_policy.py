@@ -222,6 +222,50 @@ def test_under_tested_niches_are_reported_not_invented(db):
 
 
 # ---------------------------------------------------------------------------
+# P22.2: lineage modes descend from parents that reached a gate
+# ---------------------------------------------------------------------------
+
+
+def test_the_lineage_pool_holds_only_gate_reaching_elites(db):
+    failed = _settle(db, "rank(close)", is_pass=False, sharpe=0.1)
+    passed = _settle(db, "group_rank(ts_rank(ebit,126),industry)", is_pass=True, sharpe=2.0)
+    archive.rebuild(db)
+    pool = archive.exploitation_parents(db, count=8)
+    assert [row["elite_candidate_id"] for row in pool] == [passed]
+    assert failed not in {row["elite_candidate_id"] for row in pool}
+
+
+def test_a_young_campaign_has_no_lineage_pool_and_keeps_its_diversity_pool(db):
+    _settle(db, "rank(close)", is_pass=False, sharpe=0.1)
+    archive.rebuild(db)
+    assert archive.exploitation_parents(db, count=8) == []
+    assert archive.parents(db, count=8), "the diversity pool is unaffected"
+
+
+def test_a_mutation_parent_comes_from_the_proven_pool_when_one_exists(db, catalog):
+    passed = _settle(db, "group_rank(ts_rank(ebit,126),industry)", is_pass=True, sharpe=2.0)
+    _settle(db, "rank(close)", is_pass=False, sharpe=0.1)
+    archive.rebuild(db)
+    plan = generator.CandidateGenerator(db, catalog, seed=12).plan(
+        campaign_id="lineage", budget=12, seed=12, mode="mutate",
+    )
+    lineages = [slot for slot in plan.slots if slot.generation_mode == "mutate" and slot.parent_ids]
+    assert lineages
+    assert {slot.parent_ids[0] for slot in lineages} == {passed}
+
+
+def test_the_lineage_pool_spreads_over_families(db):
+    for index in range(4):
+        _settle(db, f"group_rank(ts_rank(ebit,{120 + index}),industry)", is_pass=True,
+                motif_id=f"ratio{index}")
+    _settle(db, "rank(close)", is_pass=True)
+    archive.rebuild(db)
+    pool = archive.exploitation_parents(db, count=4)
+    families = collections.Counter(str(row["signal_family"]) for row in pool)
+    assert max(families.values()) <= math.ceil(4 / 3), "one family must not own the lineage pool"
+
+
+# ---------------------------------------------------------------------------
 # The conditioned plan itself
 # ---------------------------------------------------------------------------
 

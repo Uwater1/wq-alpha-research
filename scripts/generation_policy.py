@@ -1241,6 +1241,16 @@ def plan_campaign(
 
     context = diversity.novelty_context(db, catalog) if db is not None else diversity.NoveltyContext.empty()
     parents = archive.parents(db, count=parent_pool, seed=seed) if db is not None else []
+    # Lineage modes descend from parents whose *outcome* says the region is real (P22.2);
+    # exploration keeps the diversity-aware pool. When no elite has reached a gate yet the
+    # lineage pool is empty and the diversity pool is used unchanged, so a young campaign's
+    # mode mix is not silently rewritten.
+    lineage_parents: list[Mapping[str, Any]] = []
+    if db is not None:
+        try:
+            lineage_parents = archive.exploitation_parents(db, count=parent_pool, seed=seed)
+        except Exception:  # pragma: no cover - advisory only
+            lineage_parents = []
     proven = _proven_motifs(db, sorted(set(family_slots)))
     # P4.3 (narrowed contract): evidence is not keyed to one family. A *motif* proven
     # anywhere may seed a compatible new source here before any unproven structure is
@@ -1319,7 +1329,7 @@ def plan_campaign(
         mutation_operation = ""
         substitution = ""
         if generation_mode == "mutate":
-            parent = _pick_parent(parents, used_parents, slot_rng, families)
+            parent = _pick_parent(lineage_parents or parents, used_parents, slot_rng, families)
             if parent is None:
                 effective_mode, substitution = "explore", "no archive elite to mutate"
             else:
@@ -1336,7 +1346,8 @@ def plan_campaign(
                         0, remaining_mutation_budget.get(mutation_operation, 0) - 1,
                     )
         elif generation_mode == "crossover":
-            pair = _pick_crossover_pair(parents, used_parents, slot_rng, metadata=metadata)
+            pair = _pick_crossover_pair(lineage_parents or parents, used_parents, slot_rng,
+                                        metadata=metadata)
             if len(pair) < 2:
                 effective_mode, substitution = "explore", "no distant parent pair in the archive"
             else:
