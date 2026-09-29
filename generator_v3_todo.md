@@ -71,9 +71,11 @@ IS_PASS per 100 BRAIN simulations
 
 Do not tune policy weights until this stage can localize the failure.
 
+Implemented in `scripts/quality_diagnostics.py` (`--out quality_diagnostics.json`, git-ignored artifact), covered by `tests/test_quality_diagnostics.py`.
+
 ## P18.1 Outcome cube
 
-- [ ] Build a reusable diagnostic over the permanent trial ledger with:
+- [x] Reusable diagnostic over the permanent trial ledger with:
   - generation mode
   - motif
   - source dataset/category
@@ -84,32 +86,45 @@ Do not tune policy weights until this stage can localize the failure.
   - parent lineage quality
   - Sharpe / Fitness / turnover
   - BRAIN failure reason
-- [ ] Report attempts, simulations, IS pass rate, median/quantiles of Sharpe/Fitness/turnover and failure-reason shares.
-- [ ] Include confidence intervals / minimum-sample warnings; do not rank a bucket from 1–2 trials.
+- [x] Reports attempts, simulations, IS pass rate, median/quantiles of Sharpe/Fitness/turnover and failure-reason shares.
+- [x] Wilson confidence intervals plus explicit `low_confidence` / `thin` minimum-sample flags; a bucket below the minimum sample is excluded from ranking rather than allowed to look extreme.
 
 ## P18.2 Matched V2/V3 comparison
 
-- [ ] Build matched cohorts by scope/universe/delay/time window and comparable simulation budget.
-- [ ] Separate:
-  1. field/source selection gap
-  2. expression/motif gap
-  3. recipe/settings gap
-  4. search-policy gap
-- [ ] Compare live V3 failures against historical successful and failed V2 candidates.
+- [x] Matched cohorts by scope/universe/delay, source dataset, expression shape and recipe cell, compared only on strata present in **both** versions.
+- [x] Separates:
+  1. field/source selection gap (`scope → scope+source`)
+  2. expression/motif gap (`+source → +shape`)
+  3. recipe/settings gap (`+shape → +recipe`)
+  4. search-policy residual (once source, shape and recipe are held fixed)
+- [x] Compare live V3 failures against historical successful and failed V2 candidates.
+
+Legacy V2 rows have no stored source profile, so the profile is derived from the expression; without that every V2 row reads as dataset `unknown` and the source level is empty by construction.
 
 ## P18.3 Failure taxonomy
 
-- [ ] Quantify how much of the gap is explained by:
-  - low Sharpe
-  - low Fitness
-  - turnover
-  - correlation
-  - invalid/unsupported expressions
-  - weak source families
-  - specific motifs / recipe combinations
-- [ ] Produce a machine-readable artifact, e.g. `quality_diagnostics.json`, so later policy tests use the same evidence.
+- [x] Quantifies how much of the gap is explained by low Sharpe, low Fitness, turnover, correlation, invalid/unsupported expressions, weak source families and specific motif/recipe cells. One failed simulation is attributed to exactly one region; an unknown check name is reported as `other_check` rather than guessed.
+- [x] Machine-readable artifact `quality_diagnostics.json` (git-ignored; no expression, alpha id or canonical key ever enters it — enforced by `test_artifact_carries_no_expression_and_no_alpha_id`).
 
-**Exit gate:** identify at least the dominant failure regions and show which candidate dimensions materially separate better from worse outcomes.
+**Exit gate: met.** Findings on the 2026-09-29 ledger (point-in-time clock enforced, `leakage_check` green):
+
+```text
+catalog-generator-v2   123 sims   9 pass   7.3%   ci95 [3.9%, 13.3%]
+catalog-generator-v3   204 sims   0 pass   0.0%   ci95 [0.0%,  1.8%]
+```
+
+- The collapse is **`LOW_SHARPE` (146 of 204 V3 simulations)**, not turnover, concentration or correlation. Median Sharpe is 0.00 and p90 is 0.80, so V3 is not bottlenecked by recipe hygiene — it reaches regions with no economic signal at all.
+- **Sources are not the cause.** The matched `field_or_source_gap` is `0.0`: once V2 rows get a derived source profile, both versions search comparable datasets.
+- **Expression shape is the first material separation.** 153 of 204 V3 simulations have the shape `group_rank(<single blob with two sources>)` with 0 passes, while every well-sampled multi-component `add(...)` composite passes. `add|21src` (13 sims) is the best cell and `group_rank|2src` (153 sims) is the worst.
+- **The largest single term is the residual search-policy gap (-0.077)**: within a comparable source/shape/recipe region V3 still picks the worse cells. The other terms are `expression_or_motif_gap` -0.051, `recipe_or_settings_gap` +0.055 and `field_or_source_gap` 0.0.
+- Single-source wrappers (`|1src`) never passed once in 382 simulations across all generator versions.
+
+Conclusion: this is a **search-distribution failure**, and it is localised. The fix is P19–P22 — warm-start around proven structures and condition allocation on quality evidence — not more grammar.
+
+## P18.4 Point-in-time safety
+
+- [x] Every row is filtered by its settlement clock, the report clock is explicit (`as_of`), and `leakage_check` re-verifies afterwards that no later outcome entered the report.
+
 
 ---
 

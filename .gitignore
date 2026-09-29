@@ -10,6 +10,7 @@ credentials.json
 research.db
 research.db-wal
 research.db-shm
+quality_diagnostics.json
 *.pyc
 __pycache__/
 .DS_Store
