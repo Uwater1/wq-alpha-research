@@ -362,6 +362,25 @@ planned skeleton hashes still describe the emitted tree (P4.2). With no evidence
 decay mass on `8`, 37% of lookback mass on `22`, 68% of neutralization mass on `SUBINDUSTRY`, and
 the out-of-range ledger values (`truncation 0.02/0.03`, `decay 0/2`) are correctly *not* admitted.
 
+**The structural half (found while testing the above):** a child's complexity budget was
+`min(fresh_ceiling, parent + slack)`. The gate-reaching alphas are **47–113 nodes against a
+40-node ceiling**, so a proven parent's own structure was illegal under its own edit budget:
+every derivation of it failed validation and mutation/crossover **silently degraded to fresh
+exploration on exactly the parents worth exploiting** (0 of 24 edits succeeded on proven
+composites; they now succeed 8/8 for `dataset_swap`, `normalization_change` and
+`subtree_replace`, 7/8 for `add_component`, with children in the parent's depth class). The
+budget is now parent + bounded growth, and is unchanged for any parent the old rule could
+already handle. Lineage modes also descend from gate-reaching elites while exploration keeps the
+diversity rotation (`archive.exploitation_parents`).
+
+**Live campaign after the fix (`v3-proven-mutate`, 21 simulated):** 7 `SUBMISSION_READY`, 1
+`IS_PASS`, 2 posted and pending BRAIN's checks, 7 rejected, 4 retried — i.e. **~48% reached the
+submission gate with Sharpe 1.35–2.38 and turnover 0.10–0.13**, against `catalog-generator-v3`'s
+0/204 and `catalog-generator-v2`'s 9/123 (7.3%). Two were POSTed (`804`, `822`); the local gate
+correctly *held* the rest, which were 0.79–0.89 correlated with an existing ACTIVE alpha at
+Sharpe 2.34 without being 1.10x better. Only `ACTIVE` counts as success, and BRAIN's own
+`SELF_CORRELATION` checks are still pending.
+
 **The recipe × shape interaction is the whole story (live, by generator version):**
 
 | arm | simulations | passing cells |
@@ -390,23 +409,45 @@ campaign (P25.1).
 
 Prefer controlled mutations around proven seeds:
 
-1. [ ] recipe/parameter adjustment
-2. [ ] normalization/group adjustment
-3. [ ] compatible field substitution
-4. [ ] same-motif dataset transfer
-5. [ ] add/remove one component
-6. [ ] motif change
-7. [ ] crossover only after evidence supports it
+1. [x] recipe/parameter adjustment
+2. [x] normalization/group adjustment
+3. [x] compatible field substitution
+4. [x] same-motif dataset transfer
+5. [x] add/remove one component
+6. [x] motif change
+7. [x] crossover only after evidence supports it
 
-- [ ] Track pass rate by mutation distance and operation.
-- [ ] Preserve the economic core of a parent when the operation is intended as exploitation.
+- [x] Track pass rate by mutation distance and operation.
+- [x] Preserve the economic core of a parent when the operation is intended as exploitation.
 - [ ] Penalize operations whose live children repeatedly destroy parent quality.
+
+**Implemented:** `seed_bank.distance_outcomes(child_versions=...)` measures the pass rate per rung
+over the live ledger, `seed_bank.perturb_recipe` moves exactly one recipe dimension (both
+directions), `generator.FIELD_PRESERVING_OPERATIONS` is the set that can realize D2 ("same sources,
+one edit"), and `quality_prior.MUTATION_LADDER`/`ladder_prior` rank the operations for a context
+cheapest-justified-first with `BAND_COST` as the price of each rung.
+
+**The ladder was inert until the P22.2 fix below:** every structural edit of a parent above the
+fresh 40-node ceiling was rejected by the parent's own edit budget, so no rung could be spent on the
+parents that matter. Measured on the live ledger: D4 children of proven seeds 7/12 (58%) against
+D2 0/2 and D3 0/4 — a thin sample, and consistent with "the shape is what pays".
 
 ## P22.2 Parent quality
 
-- [ ] Parent selection should include point-in-time outcome quality, not only archive diversity.
-- [ ] Distinguish exploration parents from exploitation parents.
-- [ ] Test whether parents closer to IS/CORR success produce better children.
+- [x] Parent selection should include point-in-time outcome quality, not only archive diversity.
+- [x] Distinguish exploration parents from exploitation parents.
+- [x] Test whether parents closer to IS/CORR success produce better children.
+
+**Implemented:** `archive.quality_elite_score` makes the archived elite the best *evidence* in its
+niche (P20.1), `archive.rebuild` selects with it, and `archive.exploitation_parents` returns the
+gate-reaching elites best-evidence-first with a per-family cap — that pool feeds mutation and
+crossover, while exploration keeps the diversity-aware `archive.parents`. When no elite has reached
+a gate the lineage pool is empty and the diversity pool is used unchanged, so a young campaign's
+mode mix is not silently rewritten.
+
+**Tested:** the proven-composite lineage pool (24 parents) is 21/24 `add` composites at depth 5–9,
+and the mutants of them are the campaign above (~48% reaching the gate) versus 0% for the same
+generator before the parent-relative budget fix.
 
 ## P22.3 Crossover budget
 
@@ -600,7 +641,7 @@ P18  explain the 0/138 result                   [done]
 P19  recover a known-good control surface       [done]
 P20  quality-conditioned QD                     [done]
 P21  conditional motif/source/recipe evidence   [done]
-P22  warm-start exploit + controlled mutation   [in progress]
+P22  warm-start exploit + controlled mutation   [done]
 P23  collection-aware contribution
 P24  surrogate ordering
 P25  ablation + promotion
