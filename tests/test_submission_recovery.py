@@ -12,6 +12,7 @@ import json
 import pytest
 
 import brain_api
+import reconcile_check_pending as rcp
 import research_db as rdb
 import submission_worker as sw
 from test_scheduler import FakeClock
@@ -36,6 +37,7 @@ class FakeSubmitClient:
         self.submit_errors = list(submit_errors or [])
         self.posts: list[str] = []
         self.check_reads = 0
+        self.status_reads = 0
 
     def submit_alpha(self, alpha_id):
         if self.submit_errors:
@@ -48,6 +50,7 @@ class FakeSubmitClient:
         return list(self.checks)
 
     def alpha_status(self, alpha_id):
+        self.status_reads += 1
         return self.status
 
     def close(self):
@@ -296,6 +299,127 @@ def test_uncertain_submit_response_is_reconciled_before_any_retry(db):
 
     assert client.posts == [candidate["brain_alpha_id"]]
     assert db.counts("submissions") == {"ACTIVE": 1}
+
+
+# ---------------------------------------------------------------------------
+# Reconcile throttling and the submit-checks cache
+# ---------------------------------------------------------------------------
+
+
+def _check_pending_row(db, candidate) -> int:
+    """A submission whose POST outcome is unknown, i.e. reconcilable."""
+    submission_id = db.enqueue_submission(candidate["id"])
+    db.claim_submission("worker-1", lease_seconds=-1)
+    db.mark_submission_posted(submission_id)
+    db.recover_expired_leases()
+    return submission_id
+
+
+def test_reconcile_ttl_stops_repeat_brain_queries_while_checks_are_pending(db):
+    candidate = _ready_candidate(db)
+    _check_pending_row(db, candidate)
+    client = FakeSubmitClient(status="UNSUBMITTED",
+                              checks=[{"name": "SELF_CORRELATION", "result": "PENDING"}])
+
+    _worker(db, client, max_submissions=1).run()
+
+    assert db.counts("submissions") == {"CHECK_PENDING": 1}
+    assert client.status_reads == 1 and client.check_reads == 1
+    assert _open_submission(db)["last_reconciled_at"] is not None
+
+    # A second run inside the TTL window must not touch BRAIN for the same row.
+    _worker(db, client, max_submissions=1).run()
+    assert client.status_reads == 1 and client.check_reads == 1
+
+    # An explicit full sweep (TTL 0) re-checks it.
+    _worker(db, client, max_submissions=1, reconcile_ttl=0).run()
+    assert client.status_reads == 2 and client.check_reads == 2
+
+
+def test_cached_conclusive_checks_are_reused_instead_of_refetching(db):
+    candidate = _ready_candidate(db)
+    client = FakeSubmitClient(
+        status="UNSUBMITTED",
+        checks=[{"name": "SELF_CORRELATION", "result": "PASS", "value": 0.31}],
+    )
+    # The poll sees a PASS immediately, but the alpha is not ACTIVE yet: the run ends
+    # CHECK_PENDING with a conclusive check snapshot persisted by the poll.
+    _worker(db, client, max_submissions=1, max_polls=1).run()
+
+    assert db.counts("submissions") == {"CHECK_PENDING": 1}
+    assert client.check_reads == 1
+    cached = {c["name"]: c for c in db.latest_submission_checks(candidate["brain_alpha_id"])}
+    assert cached["SELF_CORRELATION"]["result"] == "PASS"
+    assert cached["SELF_CORRELATION"]["value"] == 0.31
+
+    client.status = "ACTIVE"
+    _worker(db, client, max_submissions=1, reconcile_ttl=0).run()
+
+    assert db.counts("submissions") == {"ACTIVE": 1}
+    assert client.check_reads == 1  # the cached snapshot was conclusive
+    assert client.status_reads == 2  # only the platform status needed a fresh read
+    assert _open_submission(db)["max_corr"] == 0.31
+
+
+def test_cached_self_correlation_failure_settles_without_touching_brain(db):
+    candidate = _ready_candidate(db)
+    submission_id = _check_pending_row(db, candidate)
+    db.record_submission_checks(
+        candidate["brain_alpha_id"],
+        [{"name": "SELF_CORRELATION", "result": "FAIL", "value": 0.93}],
+        submission_id=submission_id, candidate_id=candidate["id"],
+    )
+    client = FakeSubmitClient(status="UNSUBMITTED",
+                              checks=[{"name": "SELF_CORRELATION", "result": "PASS"}])
+
+    _worker(db, client, max_submissions=1).run()
+
+    row = _open_submission(db)
+    assert row["status"] == "SELF_CORR_FAIL" and row["max_corr"] == 0.93
+    assert client.status_reads == 0 and client.check_reads == 0
+    assert client.posts == []
+
+
+def test_reconcile_script_exits_without_calls_when_the_gate_is_full(db, monkeypatch, capsys):
+    db.acquire_gate(rcp.GATE_NAME, "other-run", slots=1, lease_seconds=600)
+    candidate = _ready_candidate(db)
+    _check_pending_row(db, candidate)
+    client = FakeSubmitClient(status="ACTIVE")
+    monkeypatch.setattr(rcp.brain_api, "BrainClient", lambda: client)
+
+    assert rcp.main(["--db", str(db.path), "--max-concurrent", "1"]) == 0
+
+    assert "gate full" in capsys.readouterr().out
+    assert client.status_reads == 0 and client.check_reads == 0
+    assert db.counts("submissions") == {"CHECK_PENDING": 1}  # untouched
+
+
+def test_reconcile_script_persists_checks_and_throttles_until_the_ttl(db, monkeypatch):
+    candidate = _ready_candidate(db)
+    _check_pending_row(db, candidate)
+    client = FakeSubmitClient(
+        status="UNSUBMITTED",
+        checks=[{"name": "SELF_CORRELATION", "result": "PENDING", "value": 0.5}],
+    )
+    monkeypatch.setattr(rcp.brain_api, "BrainClient", lambda: client)
+
+    assert rcp.main(["--db", str(db.path), "--reconcile-ttl", "300"]) == 0
+    assert client.status_reads == 1 and client.check_reads == 1
+    cached = {c["name"]: c for c in db.latest_submission_checks(candidate["brain_alpha_id"])}
+    assert cached["SELF_CORRELATION"]["result"] == "PENDING"
+
+    assert rcp.main(["--db", str(db.path), "--reconcile-ttl", "300", "--owner", "second"]) == 0
+    assert client.status_reads == 1 and client.check_reads == 1  # throttled inside the TTL
+
+    client.checks = [{"name": "SELF_CORRELATION", "result": "PASS", "value": 0.5}]
+    client.status = "ACTIVE"
+    assert rcp.main(["--db", str(db.path), "--reconcile-ttl", "0", "--owner", "third"]) == 0
+    assert db.counts("submissions") == {"ACTIVE": 1}
+    # A PENDING snapshot is not conclusive, so the zero-TTL sweep fetched once more and
+    # replaced the cached result with the settled PASS.
+    assert client.status_reads == 2 and client.check_reads == 2
+    cached = {c["name"]: c for c in db.latest_submission_checks(candidate["brain_alpha_id"])}
+    assert cached["SELF_CORRELATION"]["result"] == "PASS"
 
 
 @pytest.mark.parametrize(

@@ -121,6 +121,7 @@ wq-alpha-research/
 │   ├── staged_search.py     # per-structure search budget (volume-gated funnel)
 │   ├── correlation.py       # ACTIVE-book PnL cache + local daily-return correlation
 │   ├── submission_worker.py # drains the submission queue, recovers uncertain submits
+│   ├── reconcile_check_pending.py # gated, TTL-throttled CHECK_PENDING sweep
 │   └── multi_sim.py         # multi-simulation capability check
 ├── legacy/
 │   └── wq_brain/            # batch simulate / scrape / submit tooling
@@ -290,6 +291,18 @@ queue that is drained independently, one leased row at a time. With `--require-c
 the worker also compares aligned daily returns against the locally cached ACTIVE book and
 holds anything too redundant, while an uncertain POST is reconciled against BRAIN instead
 of being blindly retried.
+
+Reconciliation is throttled and cached: a `CHECK_PENDING` row is queried at most once per
+`--reconcile-ttl` (default 300 s), every `submit_checks` fetch is persisted to
+`research.db.submission_checks`, and a conclusive cached snapshot settles the row without
+re-asking BRAIN. The standalone sweep shares the same guards:
+
+```bash
+./.venv/bin/python scripts/reconcile_check_pending.py --max-concurrent 1 --reconcile-ttl 300
+```
+
+`--max-concurrent` admits that many concurrent reconcile runs through a DB-backed gate; a
+run that finds the gate full exits without calling BRAIN.
 
 P2/P3/P4 services are available without changing live scheduler behavior:
 

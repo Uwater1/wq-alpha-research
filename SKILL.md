@@ -114,7 +114,7 @@ A submit response only means the request was accepted for evaluation. Success is
 alpha.status == ACTIVE
 ```
 
-Non-idempotent submission safety is mandatory: if the POST outcome is ambiguous, reconcile the alpha/check state before another POST. Never blindly retry an uncertain submission.
+Non-idempotent submission safety is mandatory: if the POST outcome is ambiguous, reconcile the alpha/check state before another POST. Never blindly retry an uncertain submission. Repeat reconciliation is throttled and cached: a `CHECK_PENDING` row is re-queried at most once per `--reconcile-ttl`, `submit_checks` results are reused from `submission_checks`, and a standalone sweep exits when `--max-concurrent` runs already hold the gate.
 
 Passing standalone metrics is insufficient if the candidate duplicates the existing book. Prefer a somewhat weaker but genuinely different candidate over a near-clone only when it still clears all required gates.
 
@@ -204,6 +204,7 @@ Use deterministic code rather than copying API examples into prompts:
 - `scripts/sim_scheduler.py` — bounded persistent simulation dispatcher.
 - `scripts/correlation.py` — ACTIVE-book sync and daily-return correlation.
 - `scripts/submission_worker.py` — gated, recoverable submission.
+- `scripts/reconcile_check_pending.py` — gated, TTL-throttled `CHECK_PENDING` reconciliation sweep.
 - `scripts/ranking.py` / `scripts/surrogate.py` — advisory candidate ordering.
 - `scripts/knowledge_cli.py` — recall, observations, proposals, evaluation, lifecycle.
 - `AGENTS.md` — environment, secrets, operational commands, testing, and repository-change rules.

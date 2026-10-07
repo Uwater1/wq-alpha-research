@@ -266,6 +266,105 @@ def test_expired_submission_lease_after_post_becomes_reconcilable(db):
     assert "reconcile" in row["message"]
 
 
+def _check_pending_submission(db, brain_alpha_id="A1") -> int:
+    """A submission whose POST outcome is unknown, i.e. reconcilable."""
+    outcome = db.queue_candidate("rank(close)")
+    db.claim_simulation("worker-1")
+    db.record_simulation_result(candidate_id=outcome.candidate_id, status="DONE",
+                                checks=[{"name": "LOW_SHARPE", "result": "PASS"}],
+                                brain_alpha_id=brain_alpha_id)
+    submission_id = db.enqueue_submission(outcome.candidate_id)
+    db.claim_submission("worker-1", lease_seconds=-1)
+    db.mark_submission_posted(submission_id)
+    db.recover_expired_leases()
+    return submission_id
+
+
+def test_claim_reconcile_throttles_repeat_queries_per_row(db):
+    """One PENDING row is claimed once per TTL window, so overlapping runs cannot duplicate it."""
+    submission_id = _check_pending_submission(db)
+
+    assert db.claim_reconcile(submission_id, ttl_seconds=300, owner="run-a") is True
+    assert db.claim_reconcile(submission_id, ttl_seconds=300, owner="run-b") is False
+    # A deliberate zero-TTL sweep is still allowed.
+    assert db.claim_reconcile(submission_id, ttl_seconds=0, owner="run-b") is True
+
+    row = db.query("SELECT * FROM submissions WHERE id=?", (submission_id,))[0]
+    assert row["status"] == "CHECK_PENDING"
+    assert row["last_reconciled_at"] is not None
+
+
+def test_claim_reconcile_refuses_rows_that_are_not_check_pending(db):
+    outcome = db.queue_candidate("rank(close)")
+    db.claim_simulation("worker-1")
+    db.record_simulation_result(candidate_id=outcome.candidate_id, status="DONE",
+                                checks=[{"name": "LOW_SHARPE", "result": "PASS"}], brain_alpha_id="A1")
+    submission_id = db.enqueue_submission(outcome.candidate_id)
+
+    assert db.claim_reconcile(submission_id, ttl_seconds=0) is False
+
+
+def test_leaving_check_pending_clears_the_reconcile_stamp(db):
+    """A fresh POST cycle must not inherit the previous pending streak's throttle."""
+    submission_id = _check_pending_submission(db)
+    assert db.claim_reconcile(submission_id, ttl_seconds=300) is True
+
+    db.finish_submission(submission_id, "READY", message="reconciled: proved not submitted")
+    row = db.query("SELECT * FROM submissions WHERE id=?", (submission_id,))[0]
+    assert row["last_reconciled_at"] is None
+
+    # A manual requeue of an open row opens a fresh reconcile window too.
+    db.query("UPDATE submissions SET status='CHECK_PENDING'")
+    assert db.claim_reconcile(submission_id, ttl_seconds=300) is True
+    db.enqueue_submission(int(row["candidate_id"]))
+    row = db.query("SELECT * FROM submissions WHERE id=?", (submission_id,))[0]
+    assert row["status"] == "READY"
+    assert row["last_reconciled_at"] is None
+
+
+def test_submission_checks_are_cached_per_alpha(db):
+    written = db.record_submission_checks("A1", [
+        {"name": "SELF_CORRELATION", "result": "PENDING", "value": 0.4, "limit": 0.7},
+        {"name": "LOW_SHARPE", "result": "PASS"},
+    ], submission_id=7, candidate_id=3)
+    assert written == 2
+
+    checks = {c["name"]: c for c in db.latest_submission_checks("A1")}
+    assert checks["SELF_CORRELATION"]["result"] == "PENDING"
+    assert checks["SELF_CORRELATION"]["value"] == 0.4
+
+    # A later fetch upserts the same alpha instead of stacking duplicate rows.
+    db.record_submission_checks("A1", [{"name": "SELF_CORRELATION", "result": "FAIL", "value": 0.91}],
+                                submission_id=7)
+    checks = {c["name"]: c for c in db.latest_submission_checks("A1")}
+    assert checks["SELF_CORRELATION"]["result"] == "FAIL"
+    assert checks["LOW_SHARPE"]["result"] == "PASS"  # unrelated checks survive the upsert
+    assert db.latest_submission_checks("A2") == []
+
+
+def test_coordination_gate_limits_concurrent_holders(db):
+    assert db.acquire_gate("reconcile", "run-a", slots=1, lease_seconds=600) is True
+    assert db.acquire_gate("reconcile", "run-b", slots=1, lease_seconds=600) is False
+    assert db.acquire_gate("reconcile", "run-a", slots=1, lease_seconds=600) is True  # refresh is idempotent
+
+    assert db.release_gate("reconcile", "run-a") is True
+    assert db.acquire_gate("reconcile", "run-b", slots=1, lease_seconds=600) is True
+    assert db.acquire_gate("reconcile", "run-c", slots=2, lease_seconds=600) is True
+    assert db.release_gate("reconcile", "run-missing") is False
+
+
+def test_coordination_gate_reclaims_an_expired_slot(db):
+    assert db.acquire_gate("reconcile", "crashed", slots=1, lease_seconds=-1) is True
+    assert db.acquire_gate("reconcile", "fresh", slots=1, lease_seconds=600) is True
+
+
+def test_schema_carries_reconcile_throttle_and_check_cache(db):
+    submission_columns = {row["name"] for row in db.query("PRAGMA table_info(submissions)")}
+    assert "last_reconciled_at" in submission_columns
+    tables = {row["name"] for row in db.query("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"submission_checks", "coordination_gates"} <= tables
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------

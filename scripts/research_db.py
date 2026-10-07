@@ -2,12 +2,14 @@
 
 One SQLite file is the single source of truth for the pipeline:
 
-    candidates     lifecycle + priority + metrics of one canonical research idea
-    research_trials permanent per-campaign ledger of every research decision
-    simulations    reusable simulation cache, one row per canonical request
-    submissions    submission queue state, leased like simulations
-    active_alphas  ACTIVE portfolio snapshot + correlation bookkeeping
-    events         append-only audit trail of every state transition
+    candidates        lifecycle + priority + metrics of one canonical research idea
+    research_trials   permanent per-campaign ledger of every research decision
+    simulations       reusable simulation cache, one row per canonical request
+    submissions       submission queue state, leased like simulations
+    submission_checks latest observed result per alpha/check (submit_checks cache)
+    active_alphas     ACTIVE portfolio snapshot + correlation bookkeeping
+    coordination_gates DB-backed semaphore slots for run-level gates
+    events            append-only audit trail of every state transition
 
 State machine:
 
@@ -20,6 +22,10 @@ Submission rows have their own recovery contract:
     RETRY backs off and is claimable again until its attempt budget is spent (EXHAUSTED).
     An expired SUBMITTING lease returns to READY when the POST never left the process and
     to CHECK_PENDING when it did, so a retry always consults BRAIN before re-POSTing.
+    A CHECK_PENDING row is claimed via `claim_reconcile` before BRAIN is queried, so
+    overlapping runs cannot duplicate the same call and a still-PENDING row is re-checked
+    at most once per reconcile TTL. Every `submit_checks` fetch is upserted into
+    `submission_checks` for reuse by a later session.
 
 ``candidates`` and ``simulations`` are 1:1 on ``canonical_key`` by design:
 ``candidates`` answers "what should we work on and why", ``simulations`` answers
@@ -84,7 +90,7 @@ META_TRIALS_BACKFILLED = "research_trials_backfilled"
 #: approval step (scripts/finding_calibration.py --approve), never automatically.
 META_VALIDATION_SEVERITY_POLICY = "validation_severity_policy"
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Columns added after the first release; `_ensure_columns` upgrades an existing file in
 # place so a long-running research.db never has to be rebuilt by hand.
@@ -133,7 +139,8 @@ ADDED_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     # `post_attempted_at` is the write-ahead marker that separates "never POSTed"
     # from "POST outcome unknown" after a crash; `last_error` keeps the last reconcile note.
-    "submissions": ("post_attempted_at TEXT", "last_error TEXT"),
+    # `last_reconciled_at` throttles repeat BRAIN queries for a row that is still PENDING.
+    "submissions": ("post_attempted_at TEXT", "last_error TEXT", "last_reconciled_at TEXT"),
     "events": (
         "operation TEXT",
         "candidate_id INTEGER",
@@ -223,6 +230,14 @@ FINAL_SUBMISSION_STATUSES = frozenset({"ACTIVE", "SELF_CORR_FAIL", "PLATFORM_REJ
 DEFAULT_SUBMISSION_MAX_ATTEMPTS = 5
 SUBMISSION_BACKOFF_BASE_SECONDS = 30.0
 SUBMISSION_BACKOFF_MAX_SECONDS = 3600.0
+
+# Reconciliation policy for CHECK_PENDING rows. A row BRAIN still reports PENDING is
+# queried at most once per TTL; re-asking every run is what turns a slow check into a 429
+# storm for the next batch. A TTL of 0 disables the throttle for a deliberate sweep.
+DEFAULT_RECONCILE_TTL_SECONDS = 300.0
+# A run-level gate slot is reclaimed after this long even if the process died without
+# releasing it, so a crashed reconcile run cannot wedge the gate forever.
+DEFAULT_GATE_LEASE_SECONDS = 900.0
 
 # Knowledge and tracked-skill privacy/lifecycle vocabulary. Privacy is ordered from
 # publishable to most sensitive; PUBLIC/SANITIZED are the only classes allowed into
@@ -428,6 +443,33 @@ SCHEMA: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_submissions_queue ON submissions(status, priority DESC, id)",
+    # Latest observed result per (alpha, check). Upserted on every `submit_checks` fetch so
+    # a later session can settle or skip a row from cached evidence instead of re-querying
+    # BRAIN for the same alpha.
+    """
+    CREATE TABLE IF NOT EXISTS submission_checks (
+        brain_alpha_id TEXT NOT NULL,
+        name           TEXT NOT NULL,
+        submission_id  INTEGER,
+        candidate_id   INTEGER,
+        result         TEXT,
+        value          REAL,
+        limit_value    REAL,
+        payload_json   TEXT NOT NULL,
+        fetched_at     TEXT NOT NULL,
+        PRIMARY KEY(brain_alpha_id, name)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_submission_checks_submission ON submission_checks(submission_id)",
+    """
+    CREATE TABLE IF NOT EXISTS coordination_gates (
+        gate_name   TEXT NOT NULL,
+        owner       TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        PRIMARY KEY(gate_name, owner)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS active_alphas (
         brain_alpha_id  TEXT PRIMARY KEY,
@@ -2876,7 +2918,7 @@ class ResearchDB:
             if open_row is not None:
                 conn.execute(
                     "UPDATE submissions SET status='READY', next_attempt_at=NULL, worker_id=NULL, lease_until=NULL, "
-                    "priority=?, updated_at=? WHERE id=?",
+                    "last_reconciled_at=NULL, priority=?, updated_at=? WHERE id=?",
                     (quality_priority, timestamp, open_row["id"]),
                 )
                 self.log_event("submission", open_row["id"], "requeued", to_status="READY",
@@ -2995,6 +3037,10 @@ class ResearchDB:
                 """,
                 (status, message, max_corr, max_corr_alpha_id, brain_alpha_id, next_attempt, timestamp, submission_id),
             )
+            if status != "CHECK_PENDING":
+                # The pending streak is over, so its reconcile stamp must not throttle a
+                # later cycle (reconcile -> READY -> re-POST lands back in CHECK_PENDING).
+                conn.execute("UPDATE submissions SET last_reconciled_at=NULL WHERE id=?", (submission_id,))
             self.log_event("submission", submission_id, "result", from_status=row["status"], to_status=status,
                            payload={"message": message, "max_corr": max_corr, "attempt": attempt}, conn=conn)
 
@@ -3042,6 +3088,127 @@ class ResearchDB:
             "UPDATE submissions SET post_attempted_at=COALESCE(post_attempted_at, ?), updated_at=? WHERE id=?",
             (timestamp, timestamp, submission_id),
         )
+
+    # -- submission check cache -------------------------------------------
+
+    def record_submission_checks(
+        self,
+        brain_alpha_id: str,
+        checks: Iterable[Mapping[str, Any]],
+        *,
+        submission_id: int | None = None,
+        candidate_id: int | None = None,
+    ) -> int:
+        """Upsert the latest observed result of every submission check for an alpha.
+
+        Called after each ``BrainClient.submit_checks`` fetch. Upsert rather than append:
+        the table answers "what does BRAIN currently say about this alpha", and a check
+        result is fixed per alpha (PENDING flips to PASS/FAIL exactly once). The raw check
+        payload is kept so a later session does not have to re-query BRAIN to replay it.
+        """
+        timestamp = now_iso()
+        written = 0
+        with self._tx() as conn:
+            for check in checks:
+                if not isinstance(check, Mapping):
+                    continue
+                name = str(check.get("name") or "").strip()
+                if not name:
+                    continue
+                value = check.get("value")
+                limit = check.get("limit")
+                conn.execute(
+                    """
+                    INSERT INTO submission_checks(
+                        brain_alpha_id, name, submission_id, candidate_id, result, value,
+                        limit_value, payload_json, fetched_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(brain_alpha_id, name) DO UPDATE SET
+                        submission_id=excluded.submission_id,
+                        candidate_id=excluded.candidate_id,
+                        result=excluded.result,
+                        value=excluded.value,
+                        limit_value=excluded.limit_value,
+                        payload_json=excluded.payload_json,
+                        fetched_at=excluded.fetched_at
+                    """,
+                    (
+                        str(brain_alpha_id), name, submission_id, candidate_id,
+                        str(check.get("result")) if check.get("result") is not None else None,
+                        float(value) if isinstance(value, (int, float)) else None,
+                        float(limit) if isinstance(limit, (int, float)) else None,
+                        json.dumps(dict(check), sort_keys=True, default=str),
+                        timestamp,
+                    ),
+                )
+                written += 1
+        return written
+
+    def latest_submission_checks(self, brain_alpha_id: str) -> list[dict[str, Any]]:
+        """Last observed snapshot of an alpha's submission checks (empty when never fetched).
+
+        Rows are shaped like BRAIN's own check payloads, so the same verdict helpers work
+        on cached and freshly fetched checks.
+        """
+        rows = self._conn.execute(
+            "SELECT name, result, value, limit_value, payload_json FROM submission_checks "
+            "WHERE brain_alpha_id=? ORDER BY name",
+            (str(brain_alpha_id),),
+        ).fetchall()
+        checks: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except ValueError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.setdefault("name", str(row["name"]))
+            payload.setdefault("result", row["result"])
+            if row["value"] is not None:
+                payload.setdefault("value", row["value"])
+            checks.append(payload)
+        return checks
+
+    def claim_reconcile(
+        self,
+        submission_id: int,
+        *,
+        ttl_seconds: float = DEFAULT_RECONCILE_TTL_SECONDS,
+        owner: str | None = None,
+    ) -> bool:
+        """Atomically claim a CHECK_PENDING row for one reconciliation query.
+
+        The claim stamps ``last_reconciled_at`` *before* BRAIN is called, so two overlapping
+        runs cannot both ask about the same alpha, and a row BRAIN still reports PENDING is
+        not re-queried until the TTL elapses (``ttl_seconds=0`` disables the throttle). A
+        failed query keeps the stamp: waiting out the TTL is the intended back-pressure, so
+        transient errors never turn into a retry storm.
+        """
+        timestamp = now_iso()
+        cutoff = plus_seconds_iso(-max(float(ttl_seconds), 0.0))
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT status, last_reconciled_at FROM submissions WHERE id=?", (submission_id,)
+            ).fetchone()
+            if row is None or str(row["status"]) != "CHECK_PENDING":
+                return False
+            last = row["last_reconciled_at"]
+            if ttl_seconds and last and str(last) > cutoff:
+                return False
+            cursor = conn.execute(
+                "UPDATE submissions SET last_reconciled_at=?, updated_at=? "
+                "WHERE id=? AND status='CHECK_PENDING' "
+                "AND (last_reconciled_at IS NULL OR last_reconciled_at <= ?)",
+                (timestamp, timestamp, submission_id, cutoff),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self.log_event(
+                "submission", submission_id, "reconcile_claimed",
+                payload={"owner": owner, "ttl_seconds": ttl_seconds}, conn=conn,
+            )
+            return True
 
     def expire_exhausted_submissions(self, max_attempts: int = DEFAULT_SUBMISSION_MAX_ATTEMPTS) -> int:
         """Retire RETRY rows that already spent their attempt budget.
@@ -4322,6 +4489,55 @@ class ResearchDB:
                 "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, str(value)),
             )
+
+    # -- coordination gates -------------------------------------------------
+
+    def acquire_gate(
+        self,
+        gate_name: str,
+        owner: str,
+        *,
+        slots: int = 1,
+        lease_seconds: float = DEFAULT_GATE_LEASE_SECONDS,
+    ) -> bool:
+        """Claim one of N concurrent slots for a named activity (a DB-backed semaphore).
+
+        Expired slots are reclaimed first, so a crashed holder cannot wedge the gate, and
+        an owner refreshing its own slot is idempotent. A caller that gets False should
+        exit without doing the guarded work rather than queue behind the gate.
+        """
+        timestamp = now_iso()
+        expires = plus_seconds_iso(lease_seconds)
+        slot_count = max(int(slots), 1)
+        with self._tx() as conn:
+            conn.execute(
+                "DELETE FROM coordination_gates WHERE gate_name=? AND expires_at <= ?",
+                (gate_name, timestamp),
+            )
+            existing = conn.execute(
+                "SELECT 1 FROM coordination_gates WHERE gate_name=? AND owner=?",
+                (gate_name, owner),
+            ).fetchone()
+            held = int(conn.execute(
+                "SELECT COUNT(*) AS n FROM coordination_gates WHERE gate_name=?", (gate_name,)
+            ).fetchone()["n"])
+            if existing is None and held >= slot_count:
+                return False
+            conn.execute(
+                "INSERT INTO coordination_gates(gate_name, owner, acquired_at, expires_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(gate_name, owner) DO UPDATE SET "
+                "acquired_at=excluded.acquired_at, expires_at=excluded.expires_at",
+                (gate_name, owner, timestamp, expires),
+            )
+            return True
+
+    def release_gate(self, gate_name: str, owner: str) -> bool:
+        """Release a gate slot; idempotent and safe after the lease already expired."""
+        with self._tx() as conn:
+            cursor = conn.execute(
+                "DELETE FROM coordination_gates WHERE gate_name=? AND owner=?", (gate_name, owner)
+            )
+            return cursor.rowcount > 0
 
     # -- generic read access -----------------------------------------------
 

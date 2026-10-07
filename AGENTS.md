@@ -70,6 +70,7 @@ Before submission, sync the complete ACTIVE book and require a fresh local corre
 ./.venv/bin/python scripts/correlation.py status
 ./.venv/bin/python scripts/submission_worker.py --dry-run
 ./.venv/bin/python scripts/submission_worker.py --require-correlation --max-submissions 1
+./.venv/bin/python scripts/reconcile_check_pending.py --max-concurrent 1
 ```
 
 Submission invariants:
@@ -78,6 +79,7 @@ Submission invariants:
 - the ACTIVE list must be fully paginated and fresh;
 - missing/short/flat/incomplete/stale correlation data is a hold, not a pass;
 - an ambiguous non-idempotent submission POST must reconcile against BRAIN before another POST;
+- reconciliation is TTL-throttled per row and reuses cached `submission_checks`; overlapping sweeps are bounded by the `--max-concurrent` gate;
 - `201`/accepted is not success; only `status == ACTIVE` is final success;
 - BRAIN `SELF_CORRELATION` remains the platform confirmation.
 

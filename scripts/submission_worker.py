@@ -18,6 +18,12 @@ left the process; after a POST the row is CHECK_PENDING and is reconciled agains
 before any retry. Transient failures back off automatically and retire as EXHAUSTED once
 their attempt budget is spent, so nothing has to be re-enqueued or deleted by hand.
 
+Reconciliation is throttled and cached: each CHECK_PENDING row is claimed with a TTL
+(`--reconcile-ttl`) before BRAIN is queried, so overlapping runs cannot duplicate the
+same alpha_status/submit_checks calls, and every submit_checks fetch is persisted to
+`submission_checks` so a later session settles or skips an already-evaluated row without
+asking BRAIN again.
+
 Local self-correlation is a real gate: `--require-correlation` syncs the ACTIVE
 book, fetches candidate PnL, checks a fresh local `self_corr` and refuses anything at or
 above the limit; BRAIN's own SELF_CORRELATION check stays the final confirmation.
@@ -71,6 +77,7 @@ class SubmissionWorker:
         poll_interval: float = CHECK_POLL_SECONDS,
         max_polls: int = MAX_CHECK_POLLS,
         max_submission_attempts: int = research_db.DEFAULT_SUBMISSION_MAX_ATTEMPTS,
+        reconcile_ttl: float = research_db.DEFAULT_RECONCILE_TTL_SECONDS,
         require_correlation: bool = False,
         correlation_limit: float = 0.7,
         correlation_exception_ratio: float = research_db.CORRELATION_EXCEPTION_RATIO,
@@ -87,6 +94,7 @@ class SubmissionWorker:
         self.poll_interval = poll_interval
         self.max_polls = max_polls
         self.max_submission_attempts = max(int(max_submission_attempts), 1)
+        self.reconcile_ttl = max(float(reconcile_ttl), 0.0)
         self.require_correlation = require_correlation
         self.correlation_limit = correlation_limit
         self.correlation_exception_ratio = correlation_exception_ratio
@@ -100,6 +108,7 @@ class SubmissionWorker:
         self.rejected = 0
         self.retried = 0
         self.reconciled = 0
+        self.reconcile_skipped = 0
         self.skipped = 0
         self.correlations = 0
 
@@ -223,9 +232,19 @@ class SubmissionWorker:
         BRAIN is the source of truth after an uncertain POST: ACTIVE and rejected alphas are
         final, a pending check keeps the row reconcilable, and READY is used only when BRAIN
         shows the alpha is not submitted and exposes no pending submission checks.
+
+        Each row is claimed with a TTL before BRAIN is touched, so overlapping runs cannot
+        duplicate the same queries and a check the platform still reports PENDING is left
+        alone until the TTL elapses. A conclusive cached snapshot is reused instead of
+        re-fetching checks, and a cached SELF_CORRELATION failure settles with no BRAIN call.
         """
         for row in self.db.query("SELECT * FROM submissions WHERE status='CHECK_PENDING'"):
             submission_id = int(row["id"])
+            if not self.db.claim_reconcile(
+                submission_id, ttl_seconds=self.reconcile_ttl, owner=self.worker_id
+            ):
+                self.reconcile_skipped += 1
+                continue
             alpha_id = row.get("brain_alpha_id") or self._candidate_alpha_id(int(row["candidate_id"]))
             if not alpha_id:
                 self.db.finish_submission(submission_id, "RETRY",
@@ -236,14 +255,32 @@ class SubmissionWorker:
                 continue
 
             candidate_id = int(row["candidate_id"])
+            cached = self.db.latest_submission_checks(str(alpha_id))
+            verdict = _self_correlation_verdict(cached)
+            if verdict["result"] == "FAIL":
+                # BRAIN already failed this alpha on the platform correlation check; there is
+                # nothing left to ask and no reason to re-POST it.
+                self.db.finish_submission(submission_id, "SELF_CORR_FAIL",
+                                          message="reconciled: cached platform SELF_CORRELATION failed",
+                                          max_corr=verdict["value"], brain_alpha_id=str(alpha_id))
+                self.rejected += 1
+                self.reconciled += 1
+                continue
+
             status = self._call_with_transport(
                 operation="submission.reconcile_status", submission_id=submission_id,
                 candidate_id=candidate_id, call=lambda: self.client.alpha_status(str(alpha_id)),
             )
-            checks = self._call_with_transport(
-                operation="submission.reconcile_checks", submission_id=submission_id,
-                candidate_id=candidate_id, call=lambda: self.client.submit_checks(str(alpha_id)),
-            )
+            if cached and not _checks_pending(cached):
+                # Every check already settled in an earlier session; only the platform
+                # status is still open, so skip the submit_checks round-trip.
+                checks = cached
+            else:
+                checks = self._call_with_transport(
+                    operation="submission.reconcile_checks", submission_id=submission_id,
+                    candidate_id=candidate_id, call=lambda: self.client.submit_checks(str(alpha_id)),
+                )
+                self._persist_submission_checks(submission_id, candidate_id, str(alpha_id), checks)
             verdict = _self_correlation_verdict(checks)
             if status == "ACTIVE":
                 self.db.finish_submission(submission_id, "ACTIVE", message="reconciled: confirmed ACTIVE",
@@ -278,6 +315,20 @@ class SubmissionWorker:
     def _candidate_alpha_id(self, candidate_id: int) -> str | None:
         candidate = self.db.get_candidate(candidate_id)
         return str(candidate["brain_alpha_id"]) if candidate and candidate.get("brain_alpha_id") else None
+
+    def _persist_submission_checks(self, submission_id: int, candidate_id: int,
+                                   alpha_id: str, checks: Iterable[Mapping[str, Any]]) -> None:
+        """Cache a submit_checks snapshot so a later session does not re-query BRAIN.
+
+        A cache write must never cost a submission verdict: the fetch already happened and
+        the decision below does not depend on the write succeeding.
+        """
+        try:
+            self.db.record_submission_checks(
+                str(alpha_id), checks, submission_id=submission_id, candidate_id=candidate_id,
+            )
+        except Exception as exc:
+            print(f"[submit] could not cache submission checks for {_mask(alpha_id)}: {exc}")
 
     def _log_transport(self, *, operation: str, submission_id: int,
                        candidate_id: int, result_class: str) -> None:
@@ -408,6 +459,7 @@ class SubmissionWorker:
                 operation="submission.poll_checks", submission_id=submission_id,
                 candidate_id=candidate_id, call=lambda: self.client.submit_checks(alpha_id),
             )
+            self._persist_submission_checks(submission_id, candidate_id, alpha_id, checks)
             self_corr = next((c for c in checks if c.get("name") == "SELF_CORRELATION"), None)
             if self_corr is not None:
                 value = self_corr.get("value")
@@ -447,6 +499,7 @@ class SubmissionWorker:
             "retried": self.retried,
             "skipped_by_gate": self.skipped,
             "reconciled": self.reconciled,
+            "reconcile_skipped_ttl": self.reconcile_skipped,
             "correlations": self.correlations,
             "active_set_version": self.db.active_set_version(),
             "queue_remaining": self.db.counts("submissions").get("READY", 0),
@@ -515,6 +568,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how long this worker owns a claimed submission")
     parser.add_argument("--max-submission-attempts", type=int, default=research_db.DEFAULT_SUBMISSION_MAX_ATTEMPTS,
                         help="retries a submission may spend before it is marked EXHAUSTED")
+    parser.add_argument("--reconcile-ttl", type=float, default=research_db.DEFAULT_RECONCILE_TTL_SECONDS,
+                        help="seconds before a CHECK_PENDING row is reconciled against BRAIN again "
+                             "(0 disables the throttle)")
     parser.add_argument("--require-correlation", action="store_true",
                         help="demand a fresh local self-correlation before submitting")
     parser.add_argument("--correlation-limit", type=float, default=0.7,
@@ -552,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
             max_runtime=None if not args.max_runtime else args.max_runtime * 60.0,
             lease_seconds=args.lease_seconds,
             max_submission_attempts=args.max_submission_attempts,
+            reconcile_ttl=args.reconcile_ttl,
             require_correlation=args.require_correlation,
             correlation_limit=args.correlation_limit,
             correlation_exception_ratio=args.correlation_exception_ratio,
