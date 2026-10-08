@@ -36,6 +36,21 @@ These are robustness cleanups, not a new redesign.
 
 ---
 
+# P16A — 2026-10-07 audit corrections (code fixed, experiments still open)
+
+This section supersedes any broad "P20/P21/P22 done" claim below. Implemented components are not equivalent to an evaluated, default-ready policy.
+
+- [x] **P21 family-conditioned motif budget:** allocation now computes and consumes independent budgets for each planned primary source family, rather than taking each motif's best observed dataset and spending that globally. `Plan.quality_allocation.by_family` records the allocation for audit. Still test actual live effect in P25.
+- [x] **P20 operator preference seat accounting:** move `paid_used`, `explore_seats`, `paid_seats` and evidence outside the per-slot loop; `Plan.operator_preference.used` now aggregates the whole campaign and the seat cap is real.
+- [x] **Historical generator replay now fails closed:** `CandidateGenerator.generate(as_of=...)` raises until archive, parent, coverage, novelty and stats are reconstructed at the same historical clock. Only `policy_replay.py` provides event-clock-safe *selection* replay today; it cannot prove V3 would have generated those candidates. Tracked in [#12](https://github.com/Uwater1/wq-alpha-research/issues/12).
+- [x] **Operational privacy hygiene:** remove three tracked alpha-ID dump files and ignore future copies. Public git history is **not** scrubbed; follow [#14](https://github.com/Uwater1/wq-alpha-research/issues/14).
+- [ ] **Reconstruct end-to-end point-in-time V3 generation** instead of silently time-traveling through archived elites and coverage ([#12](https://github.com/Uwater1/wq-alpha-research/issues/12)).
+- [ ] **Joint emitted-shape × recipe learning** with failure denominators, lineage/near-clone awareness and calibration. Separate observed correlations from demonstrated causal improvements ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13)).
+- [ ] **Run/verify CI on this exact head**, not infer it from earlier green runs.
+- [ ] **Live ablations and downstream BRAIN checks** before closing P20/P21/P22 or promoting V3 ([#11](https://github.com/Uwater1/wq-alpha-research/issues/11)).
+
+---
+
 # P17 — Promotion gate status
 
 - [x] P0–P15 implementation complete.
@@ -168,6 +183,8 @@ Implemented in `scripts/seed_bank.py` (bank, ladder, recipe prior) and `generato
 
 # P20 — Quality-conditioned quality-diversity
 
+**Status: implementation largely complete; P20.3 empirical exit gate OPEN.**
+
 **Question:** how do we keep diversity without spending most capacity on diverse junk?
 
 Current novelty/search signals should become **local competition inside meaningful niches**.
@@ -245,6 +262,8 @@ Deduplication (`canonical_key`) and point-in-time filtering are untouched; `prio
 
 ## P20.3 Local-competition experiment
 
+- [ ] Run matched, equal-*realized*-simulation-budget arms and report confidence intervals (combined with P22.3 / P25; [#11](https://github.com/Uwater1/wq-alpha-research/issues/11)).
+
 Run equal-budget arms:
 
 ```text
@@ -267,6 +286,8 @@ Measure IS_PASS/simulation first, then survivor diversity.
 ---
 
 # P21 — Learn conditional motif/source/recipe quality
+
+**Status: conditional-prior mechanics implemented, but shape×recipe joint calibration and matched live validation OPEN** ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13), [#11](https://github.com/Uwater1/wq-alpha-research/issues/11)).
 
 **Question:** which hypotheses work **where**, rather than which motif works globally?
 
@@ -297,7 +318,7 @@ Beta posterior of the most specific level with `>= min_evidence` (default 3) sim
 *always* reports the narrowest cell that has any evidence at all as `specific`/
 `specific_level`, plus `backed_off` when nothing met the bar — so a thin bucket is visible even
 when the answer came from a coarser level. `generation_policy.allocate_motifs_conditioned`
-spends a campaign's motif budget from this prior *per dataset*, with the same guarantees as
+spends a separate motif budget for each planned primary source family (using the corresponding dataset evidence), with the same guarantees as
 `allocate_motifs` (slots sum to exactly the budget, an unobserved motif keeps the exploration
 floor, no motif exceeds `max_share`). `Plan.quality_allocation` / `Plan.prior_version` / `Plan.mode_weights`
 record the evidence behind every allocation.
@@ -403,6 +424,8 @@ campaign (P25.1).
 
 # P22 — Warm-started exploit and structure-preserving mutation
 
+**Status: parent-relative editing fixed; mutation-quality suppression and crossover ablation remain OPEN** ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13)).
+
 **Question:** can exploitation produce useful novelty by changing one justified component at a time?
 
 ## P22.1 Mutation ladder
@@ -462,6 +485,8 @@ generator before the parent-relative budget fix.
 ---
 
 # P23 — Optimize marginal contribution, not isolated alpha quality
+
+**Defer until P25 yields a credible, settled IS/CORR survivor set.** This is portfolio-stage work, not a replacement for improving first-stage pass rate.
 
 **Question:** does a candidate improve the **set** of surviving alphas?
 
@@ -540,15 +565,16 @@ Train/calibrate separate targets where possible:
 
 - [ ] probability of LOW_SHARPE
 - [ ] probability of LOW_FITNESS
-- [ ] turnover risk
-- [ ] IS_PASS probability
+- [x] turnover **point prediction** exists in `surrogate.py` (risk calibration is still open)
+- [x] advisory IS_PASS probability exists (chronological calibration and comparative value still open)
 - [ ] expected robustness/stability
 
 ## P24.3 Validation
 
-- [ ] strict time split / rolling validation
-- [ ] calibration curves
-- [ ] precision/recall in the top-ranked simulation bucket
+- [x] chronological 70/30 train/test holdout in `surrogate.evaluate` (not rolling)
+- [ ] expanding/rolling walk-forward validation across repeated seeds/windows
+- [ ] calibration curves, reliability tables and Brier/log loss
+- [x] `top_pass_recall` / `top_pass_rate` in held-out slice (no fixed-budget comparison yet)
 - [ ] compare against simple priors before using complex models
 - [ ] measure **passes captured per fixed simulation budget**
 
@@ -636,18 +662,19 @@ These become worthwhile only if P18–P24 show that the local quality model and 
 # Recommended order
 
 ```text
-P16  small correctness/observability cleanup   [done]
-P18  explain the 0/138 result                   [done]
-P19  recover a known-good control surface       [done]
-P20  quality-conditioned QD                     [done]
-P21  conditional motif/source/recipe evidence   [done]
-P22  warm-start exploit + controlled mutation   [done]
-P23  collection-aware contribution
-P24  surrogate ordering
-P25  ablation + promotion
+P16/P16A  correctness and audit carryovers       [code partly done; #12/#14 open]
+P18       explain the 0/138 result             [done]
+P19       recover a proven control region      [mechanism done; live replicated exit pending]
+P20       quality-conditioned QD               [mechanism done; ablation open #11]
+P21       conditional source/recipe prior      [partial; joint shape×recipe open #13]
+P22       proven-parent mutations              [partial; crossover/operator evidence open #13]
+P25       matched live ablation FIRST          [OPEN #11; V2 remains default]
+P24       surrogate ordering/calibration       [basic ridge/OOS exists; rolling/live open]
+P23       collection-aware contribution        [defer until credible CORR survivor pool]
+P17       final promotion                      [BLOCKED by P25]
 ```
 
-P23 and P24 may proceed in parallel after P20/P21 produce stable evidence tables.
+Do not start P23 merely because its code can be written; settle P25's downstream survivor outcomes first. P24 can be developed in parallel only as advisory and time-sliced, then evaluated against the simple conditional prior before consuming live capacity.
 
 ---
 
