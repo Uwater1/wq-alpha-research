@@ -35,10 +35,10 @@ def test_motif_allocations_are_conditioned_by_family_not_best_other_dataset():
     prior = _DatasetPrior()
     motifs = ["ratio", "ranked_level"]
     analyst, analyst_report = policy.allocate_motifs_conditioned(
-        motifs, ["analyst4"], 24, prior,
+        motifs, ["analyst4"], 24, prior, max_share=0.8,
     )
     fundamental, fundamental_report = policy.allocate_motifs_conditioned(
-        motifs, ["fundamental6"], 24, prior,
+        motifs, ["fundamental6"], 24, prior, max_share=0.8,
     )
     assert sum(analyst.values()) == sum(fundamental.values()) == 24
     assert analyst["ratio"] > analyst["ranked_level"]
