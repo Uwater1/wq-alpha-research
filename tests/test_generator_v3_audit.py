@@ -57,8 +57,8 @@ def test_plan_reports_separate_family_budgets(tmp_path):
     family_counts = plan.distribution("family")
     assert set(by_family) == set(family_counts)
     assert sum(plan.motif_allocation.values()) == plan.budget
+    assert sum(row["budget"] for row in plan.family_allocation) == plan.budget
     for family, report in by_family.items():
-        assert sum(plan_family_budget["budget"] for plan_family_budget in plan.family_allocation) == plan.budget
         assert all(cell["dataset"] == family for cell in report["contexts"].values())
 
 
