@@ -1312,9 +1312,20 @@ def plan_campaign(
                                        seed=seed, exploration_floor=exploration_floor,
                                        max_share=motif_max_share)
     if force_motif is not None:
-        # The pin is the allocation: reporting a Thompson spread the campaign cannot spend
-        # would be fiction (P16).
+        # The pin is the allocation, even when a prior was passed: never report quotas the
+        # forced plan cannot spend (P16).
         motif_budget = {force_motif: budget}
+        family_motif_budgets = {
+            name: {force_motif: family_slots.count(name)}
+            for name in sorted(set(family_slots))
+        }
+        if prior is not None:
+            quality_report = {
+                "version": quality_prior.QUALITY_PRIOR_VERSION,
+                "forced_motif": force_motif,
+                "by_family": {},
+                "contexts": {},
+            }
     remaining_motif_budget = dict(motif_budget)
     remaining_family_motif_budgets = {name: dict(counts) for name, counts in family_motif_budgets.items()}
     # Bounded adaptive mutation allocation (P9.2): mutate slots are budgeted across the
@@ -1476,14 +1487,25 @@ def plan_campaign(
                 grammar_counts=grammar_counts, semantic_counts=semantic_counts,
                 occupancy=occupancy, used=used_structures, rng=slot_rng,
             )
-            if not operator_evidence:
+            # With no outcome evidence, leave the old novelty-first ordering unchanged.
+            # A quality-conditioned plan with evidence must *spend* its family-specific motif
+            # quota on explore slots too; otherwise P21 allocation is just a report while the
+            # largest generation mode ignores it. When no eligible motif has quota left, the
+            # ranking naturally falls back to sparse/novel structures.
+            global_evidence = getattr(prior, "global_evidence", None)
+            if prior is None or (
+                global_evidence is not None and int(global_evidence.simulations) == 0
+            ):
                 return novelty
+            family_remaining = remaining_family_motif_budgets.get(slot_family, {})
+            quota_rank = 0 if family_remaining.get(name, 0) > 0 else 1
             paid = operator_evidence.get(emitted_operator(name), 0.0)
             if prefer_paid:
-                return (0 if paid >= paid_floor else 1, *novelty[:5], -paid, novelty[5])
-            # Outside the paid share, ordering is exactly the previous novelty-first one: the
-            # measured shape is preferred, never imposed (P20.2).
-            return (*novelty[:5], -paid, novelty[5])
+                return (0 if paid >= paid_floor else 1, quota_rank,
+                        *novelty[:5], -paid, novelty[5])
+            # Off the earned-shape reserve, respect the family quota first and rank
+            # eligible within-quota motifs by the old novelty key.
+            return (quota_rank, *novelty[:5], -paid, novelty[5])
 
         if force_motif is not None:
             # Pinned at planning time: identical to what materialization will build (P16).
