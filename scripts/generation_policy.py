@@ -1475,12 +1475,11 @@ def plan_campaign(
             return "cross_dataset_composite"
 
         def _explore_key(name: str) -> tuple:
-            """Explore ordering: novelty first, then the shape the ledger has paid for (P4.2/P21.1).
+            """Explore ordering: quality-reserved shape, per-family quota, then novelty.
 
-            The operator term is a *tie-break* appended to the novelty key, never in front of it:
-            an unseen structure still wins, and the random draw stays last so exploration stays
-            random among structures the ledger has no opinion about. The number of RNG draws per
-            motif is unchanged, so an unconditioned plan is bit-for-bit what it was.
+            Without evidence, preserve the original novelty-first tuple and RNG calls exactly.
+            With evidence, spend the paid-shape reserve first, consume eligible family quota,
+            and retain novelty as the ordering *within* the eligible quota class.
             """
             novelty = _structure_novelty(
                 hashes_for(name, motif_fields(name)),
