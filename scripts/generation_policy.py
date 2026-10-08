@@ -1276,13 +1276,25 @@ def plan_campaign(
             except Exception:  # pragma: no cover - advisory only
                 pass
     motif_stats = motif_outcome_stats(db, generator_version=generator_version or None)
+    family_motif_budgets: dict[str, dict[str, int]] = {}
     if prior is not None:
-        # Conditional allocation: every motif is scored in the source context it would run in,
-        # through the hierarchical prior, instead of on a global motif count (P21.1).
-        motif_budget, quality_report = allocate_motifs_conditioned(
-            list(grammar.MOTIF_BY_ID), sorted(set(family_slots)), budget, prior,
-            seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share,
-        )
+        # Do NOT allocate against the best-performing dataset and spend those seats globally:
+        # a motif can succeed in A and fail in B. Each family's motif budget is conditioned
+        # on that family's own evidence, and consumed only by slots in the same family.
+        family_counts = {name: family_slots.count(name) for name in sorted(set(family_slots))}
+        family_reports: dict[str, Any] = {}
+        for name, family_budget in family_counts.items():
+            allocated, report = allocate_motifs_conditioned(
+                list(grammar.MOTIF_BY_ID), [name], family_budget, prior,
+                seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share,
+            )
+            family_motif_budgets[name] = allocated
+            family_reports[name] = report
+        motif_budget = {
+            motif: sum(counts.get(motif, 0) for counts in family_motif_budgets.values())
+            for motif in sorted(grammar.MOTIF_BY_ID)
+        }
+        quality_report = {"by_family": family_reports}
     else:
         quality_report = {}
         motif_budget = allocate_motifs(list(grammar.MOTIF_BY_ID), budget, motif_stats,
@@ -1293,6 +1305,7 @@ def plan_campaign(
         # would be fiction (P16).
         motif_budget = {force_motif: budget}
     remaining_motif_budget = dict(motif_budget)
+    remaining_family_motif_budgets = {name: dict(counts) for name, counts in family_motif_budgets.items()}
     # Bounded adaptive mutation allocation (P9.2): mutate slots are budgeted across the
     # concrete structural edits from their corrected historical outcomes, so a successful
     # operation earns more budget while an untested one keeps an exploration floor.
@@ -1314,6 +1327,17 @@ def plan_campaign(
     # reordered around the reservation.
     cross_dataset_seated = False
     explore_seats = 0
+    # Campaign-level counters must not reset every slot: they enforce the quality share cap
+    # and back the Plan.operator_preference telemetry.
+    operator_evidence = _operator_evidence(prior) if prior is not None else {}
+    explore_slots = sum(1 for slot_mode in modes if slot_mode == "explore")
+    paid_seats = int(math.ceil(explore_slots * OPERATOR_PREFERENCE_SHARE)) if operator_evidence else 0
+    paid_floor = 0.0
+    if operator_evidence:
+        baseline = float(getattr(prior, "global_prior", 0.0) or 0.0)
+        paid_floor = (max(operator_evidence.values()) if baseline <= 0
+                      else OPERATOR_PREFERENCE_RATIO * baseline)
+    paid_used = 0
     for index, (slot_family, generation_mode) in enumerate(zip(family_slots, modes)):
         slot_rng = random.Random(recipe_seed(campaign_id, seed, (), generation_mode, index, ()))
         sources = _ordered_sources(db, catalog, slot_family, scope)
@@ -1428,19 +1452,6 @@ def plan_campaign(
                 return None  # a repeat: never spend the reachability seat on a known structure
             return "cross_dataset_composite"
 
-        operator_evidence = _operator_evidence(prior) if prior is not None else {}
-        explore_slots = sum(1 for mode in modes if mode == "explore")
-        paid_seats = int(math.ceil(explore_slots * OPERATOR_PREFERENCE_SHARE)) if operator_evidence else 0
-        paid_floor = 0.0
-        if operator_evidence:
-            baseline = float(getattr(prior, "global_prior", 0.0) or 0.0)
-            paid_floor = (
-                max(operator_evidence.values()) if baseline <= 0
-                else OPERATOR_PREFERENCE_RATIO * baseline
-            )
-
-        paid_used = 0
-
         def _explore_key(name: str) -> tuple:
             """Explore ordering: novelty first, then the shape the ledger has paid for (P4.2/P21.1).
 
@@ -1499,12 +1510,16 @@ def plan_campaign(
             local = [m.id for m in eligible if m.id in proven.get(slot_family, set())]
             transferred = [m.id for m in eligible if m.id in proven_anywhere]
             pool = local or transferred or [m.id for m in eligible]
+            slot_budget = remaining_family_motif_budgets.get(slot_family, remaining_motif_budget)
             motif_id = max(
                 pool,
-                key=lambda name: (remaining_motif_budget.get(name, 0), -used_motifs.get(name, 0), name),
+                key=lambda name: (slot_budget.get(name, 0), -used_motifs.get(name, 0), name),
             )
         used_motifs[motif_id] = used_motifs.get(motif_id, 0) + 1
         remaining_motif_budget[motif_id] = max(0, remaining_motif_budget.get(motif_id, 0) - 1)
+        if slot_family in remaining_family_motif_budgets:
+            remaining = remaining_family_motif_budgets[slot_family]
+            remaining[motif_id] = max(0, remaining.get(motif_id, 0) - 1)
         field_nodes = [primary, partner] if len(grammar.motif_by_id(motif_id).input_roles) == 2 and partner else [primary]
         hashes = hashes_for(motif_id, motif_fields(motif_id))
         planned_grammar_hash = planned_semantic_hash = ""
