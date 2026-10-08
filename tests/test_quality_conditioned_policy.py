@@ -376,6 +376,24 @@ def test_the_paid_shape_is_preferred_inside_a_bounded_share_of_explore_seats(db,
     assert report["seats"] <= math.ceil(report["explore_seats"] * policy.OPERATOR_PREFERENCE_SHARE)
     assert report["used"] <= report["seats"]
 
+    # P16A regression: the reported number of paid seats is the total claimed across
+    # the campaign, not just the last slot (the counter used to reset inside the loop).
+    planned, materialized = gen.generate(
+        campaign_id="paid-seats", count=40, seed=31, strategy="mixed",
+        prior=gen.quality_prior(), screen=False,
+    )
+    assert len(planned.slots) == len(materialized) == 40
+    explore_roots = [
+        p.expression.split("(", 1)[0]
+        for slot, p in zip(planned.slots, materialized)
+        if slot.generation_mode == "explore"
+    ]
+    expected_claims = sum(
+        report["evidence"].get(root, 0.0) >= report["earning_bar"]
+        for root in explore_roots[:report["seats"]]
+    )
+    assert report["used"] == expected_claims
+
 
 def test_a_conditioned_plan_still_materializes_its_whole_budget(db, catalog):
     for index in range(4):

@@ -1251,8 +1251,17 @@ class CandidateGenerator:
         explicit ``prior`` overrides that; ``quality_conditioned=False`` keeps the previous
         unconditioned distribution, which is what a control arm needs.
         """
+        # A historical quality prior alone does not make a historical generation plan safe:
+        # archive parents, family coverage and generation statistics still reflect today's DB.
+        # Reject this replay mode rather than silently using future evidence. Selection-policy
+        # replay is separately implemented and event-clock-safe in policy_replay.py.
+        if as_of is not None:
+            raise ValueError(
+                "historical V3 generation requires point-in-time archive/coverage/stat snapshots; "
+                "use scripts/policy_replay.py for selection replay until that support exists"
+            )
         if prior is None and quality_conditioned:
-            prior = self.quality_prior(as_of=as_of)
+            prior = self.quality_prior()
         plan = self.plan(
             campaign_id=campaign_id, budget=count, seed=seed, mode=strategy,
             family=family, max_family_share=max_family_share, force_motif=motif, prior=prior,
