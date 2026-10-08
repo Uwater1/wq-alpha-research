@@ -1294,7 +1294,18 @@ def plan_campaign(
             motif: sum(counts.get(motif, 0) for counts in family_motif_budgets.values())
             for motif in sorted(grammar.MOTIF_BY_ID)
         }
-        quality_report = {"by_family": family_reports}
+        # Preserve the previous public report keys. Context keys now include their source
+        # family because one motif can have different evidence and weight in different data.
+        flattened_contexts = {
+            f"{name}:{motif}": context
+            for name, report in family_reports.items()
+            for motif, context in report.get("contexts", {}).items()
+        }
+        quality_report = {
+            "version": quality_prior.QUALITY_PRIOR_VERSION,
+            "by_family": family_reports,
+            "contexts": flattened_contexts,
+        }
     else:
         quality_report = {}
         motif_budget = allocate_motifs(list(grammar.MOTIF_BY_ID), budget, motif_stats,
