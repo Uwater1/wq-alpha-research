@@ -5,12 +5,12 @@
 
 ## Current status
 
-Generator V3's engineering core is complete and auditable. The offline suite is green, point-in-time replay exists, and the known P0–P15 correctness gaps are closed.
+Generator V3's P0–P15 engineering core is implemented and historically CI-covered. **Selection-policy** replay (`policy_replay.py`) is event-clock-safe, but historical **candidate-generation** replay remains incomplete: current archive/coverage/statistics cannot be used with a past prior. Explicit `generate(as_of=...)` calls now fail closed pending [#12](https://github.com/Uwater1/wq-alpha-research/issues/12). Verify CI against the new head; do not infer status from older green runs.
 
 The remaining problem is **research quality, not generator plumbing**:
 
 - [x] P0–P15 implementation complete.
-- [x] Equal-budget replay infrastructure complete.
+- [x] Point-in-time selection replay infrastructure complete (distinct from generator counterfactual replay).
 - [x] Small live V3 campaigns executed.
 - [ ] V3 promotion **not justified**.
 - [x] V2 remains the default.
@@ -40,7 +40,7 @@ The completed implementation is intentionally compressed here; regressions remai
 - [x] Adaptive motif/mutation allocation with corrected source→target and skip statistics.
 - [x] Full queued/skipped lineage and permanent trial provenance.
 - [x] V2/V3 versioning and V2-safe default CLI behavior.
-- [x] Diversity reporting and point-in-time policy replay.
+- [x] Diversity reporting and point-in-time **selection** policy replay.
 - [x] Reproducible CI regression suite.
 
 Core dataflow:
@@ -72,6 +72,15 @@ These did not reopen P0–P15 and are now closed (P16).
 
 - [x] **Forced `--motif` planning consistency.** The pin is planned, not patched: `plan_campaign(force_motif=...)` pins the slot motif and computes planned skeleton hashes from the pinned motif, its resolved sources and the exact recipe materialization samples. Out-of-band `materialize(force_motif=...)` replaces the planned structure instead of mislabelling it; proposals carry `planned_motif_id` / `planned_grammar_hash` / `planned_structure_matched`, dry plans report `structure_mismatch`.
 - [x] **Archive refresh failure visibility.** `refresh_archive()` returns `False` only for an absent archive and raises `ArchiveRefreshError` (persisting an `archive_refresh_failed` diagnostic to `meta` and the event log) for real schema/locking failures. `Plan.archive_refresh` reports whether derived state actually rebuilt, and `refresh_archive_state=False` is the explicit opt-out.
+
+## 2026-10-07 audit: corrected code versus open empirical gates
+
+- **Fixed:** source-family-specific motif allocation rather than best-dataset/global consumption; per-campaign quality-preference accounting; explicit error on unsafe historical generation plans.
+- **Privacy mitigation:** tracked operational alpha-ID exports removed and ignored. Public history may still expose them; owner-approved remediation and CI scanning remain open in [#14](https://github.com/Uwater1/wq-alpha-research/issues/14).
+- **Still open:** replayable point-in-time generator snapshots ([#12](https://github.com/Uwater1/wq-alpha-research/issues/12)), joint structure×recipe quality and measured operator/crossover value ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13)), replicated matched live V2/V3 campaigns and BRAIN correlation outcomes ([#11](https://github.com/Uwater1/wq-alpha-research/issues/11)).
+- **Status correction:** P20 and P21 are *mechanism-complete but not empirically closed*; P22 has unchecked live mutation/crossover tests. Do not mark P17 promotion complete.
+
+Recommended sequencing: finish the bounded correctness/CI fixes → **P25** matched live ablation → P24 advisory calibration → P23 collection-aware work when enough genuine survivors exist. V2 stays the default.
 
 ## New objective
 
