@@ -25,3 +25,8 @@ legacy/wq_brain/data/*.csv
 legacy/wq_brain/data/*.log
 legacy/wq_brain/data/*.json
 legacy/wq_brain/data/input.csv
+
+# Local operational dumps contain account-linked BRAIN alpha IDs: never commit them.
+/scripts/*_dump.json
+/scripts/ready_list.csv
+/scripts/*submission*_dump.csv
