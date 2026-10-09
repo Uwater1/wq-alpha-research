@@ -96,7 +96,7 @@ IS_PASS per 100 BRAIN simulations
 - [x] **Promotion-gate honesty:** version-level pooled history is labeled **unmatched**; full generation point-in-time safety and matched live validation return `unknown`, never unconditional `pass`.
 - [ ] **Re-run promotion report on private ledger** and publish sanitized corrected V2/V3 diversity and uncertainty metrics.
 - [ ] **Resolve settled BRAIN CORR/robustness, fresh matched-budget experiments and exact regeneration** before calling V3 scientifically validated ([#11](https://github.com/Uwater1/wq-alpha-research/issues/11), [#12](https://github.com/Uwater1/wq-alpha-research/issues/12)).
-- [ ] **Reduce late-mutation turnover failures**, validate against equal-budget controls before policy changes, and quantify parent/child turnover and Sharpe tradeoffs (see new turnover follow-up issue).
+- [ ] **Reduce late-mutation turnover failures**, validate against equal-budget controls before policy changes, and quantify parent/child turnover and Sharpe tradeoffs ([#16](https://github.com/Uwater1/wq-alpha-research/issues/16)).
 - [ ] **Validate PR CI** and preserve an explicit tagged V2 fallback until P25 gates pass.
 
 ---
@@ -704,7 +704,7 @@ P24       surrogate ordering/calibration       [targets + calibration + fixed-bu
 P23       collection-aware contribution        [defer until credible CORR survivor pool]
 P17/P17A  operational default & hardening         [V3 on; gate not satisfied; audit fixes tested]
 P25       real controlled promotion gate       [open #11/#12; CORR/robustness and config replay unverified]
-P22       turnover-aware edits                 [open; late-mutation turnover > 20%]
+P22       turnover-aware edits                 [open #16; late-mutation turnover > 20%]
 ```
 
 Do not start P23 merely because its code can be written; settle P25's downstream survivor outcomes first. P24 can be developed in parallel only as advisory and time-sliced, then evaluated against the simple conditional prior before consuming live capacity.
