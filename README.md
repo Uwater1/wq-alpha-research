@@ -73,6 +73,9 @@ and tagged `catalog-generator-v2`.
 # Plan a campaign across explore/exploit/mutate/crossover (no BRAIN calls, no queue writes)
 ./.venv/bin/python -m wq generate --campaign dry-plan --count 100 --strategy mixed --dry-plan
 
+# The V2 control also has a no-queue dry plan
+./.venv/bin/python -m wq generate --campaign v2-preview --legacy-v2 --count 40 --dry-plan
+
 # Generate + queue a V3 campaign, or pin one motif for a targeted probe
 ./.venv/bin/python -m wq generate --campaign v3-1 --count 50 --strategy mixed --seed 7
 ./.venv/bin/python -m wq generate --campaign motif-1 --count 25 --motif normalized_difference
@@ -88,10 +91,12 @@ produced. `diversity-report` separates exact, current-skeleton, grammar and sema
 and prints `exp(Shannon entropy)` effective counts, so 20 motifs used once each cannot look like
 20 motifs used evenly.
 
-The promotion decision is reproducible from the ledger. The gate compares the two generator
-versions on settled simulations (efficiency with Wilson intervals, survivor diversity, and an
-explicit checklist that reports an unmeasured item as `unknown` rather than a pass), while the
-selection-policy replay benchmarks both on the same corpus at equal simulation budget:
+V3 is currently the **provisional operational default**. The promotion report compares pooled
+historical versions (efficiency with Wilson intervals and reconstructed survivor diversity);
+it is **not** a matched, equal-budget generation experiment. The report intentionally marks
+unknown correlation, historical-generation causality, matched-arm evidence, and config replay as
+blocking the final promotion gate. Selection-policy replay measures ranking against a shared
+candidate corpus; it does not reconstruct historical candidate generation:
 
 ```bash
 ./.venv/bin/python scripts/promotion_gate.py --out promotion_gate.json
