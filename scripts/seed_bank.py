@@ -648,6 +648,116 @@ def bank_summary(seeds: Sequence[Seed]) -> dict[str, Any]:
     }
 
 
+def _latest_settled(db: research_db.ResearchDB) -> dict[int, dict[str, Any]]:
+    """Latest simulation row per candidate (later rows win), for outcome measurement."""
+    latest: dict[int, dict[str, Any]] = {}
+    for simulation in db.query("SELECT * FROM simulations ORDER BY id"):
+        if simulation.get("candidate_id") is not None:
+            latest[int(simulation["candidate_id"])] = dict(simulation)
+    return latest
+
+
+def _arm_rates(rows: Sequence[Mapping[str, Any]], latest: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
+    """Simulated/passed counts for one arm over already-selected child rows."""
+    simulated = 0
+    passes = 0
+    for row in rows:
+        simulation = latest.get(int(row["id"]))
+        if not simulation or str(simulation.get("status") or "") != "DONE":
+            continue
+        simulated += 1
+        if simulation.get("is_pass"):
+            passes += 1
+    return {
+        "children": len(rows),
+        "simulated": simulated,
+        "is_pass": passes,
+        "is_pass_rate": round(passes / simulated, 6) if simulated else None,
+    }
+
+
+def mutation_vs_crossover(
+    db: research_db.ResearchDB,
+    *,
+    child_versions: Sequence[str] | None = None,
+    min_sample: int = 3,
+) -> dict[str, Any]:
+    """Head-to-head crossover vs one-edit mutation *from the same parent pool* (P22.3).
+
+    Crossover keeps budget only while it shows positive marginal value, but a raw per-mode
+    pass rate cannot say whether it does: the two modes draw different parents, so a mode can
+    look good merely by having been handed better parents. This holds the parent pool fixed by
+    measuring only parents that produced **both** a crossover child and a mutate child, over
+    the settled ledger. A shared pool too thin to compare is reported as ``low_confidence``
+    rather than as a verdict, and each arm's unrestricted rate is reported alongside so the
+    selection effect is visible instead of hidden.
+    """
+    wanted = {str(value) for value in child_versions} if child_versions else None
+    latest = _latest_settled(db)
+    crossover_rows: list[dict[str, Any]] = []
+    mutate_rows: list[dict[str, Any]] = []
+    crossover_parents: set[int] = set()
+    mutate_parents: set[int] = set()
+    for row in db.query("SELECT * FROM candidates"):
+        if wanted is not None and str(row.get("generator_version") or "") not in wanted:
+            continue
+        mode = str(row.get("generation_mode") or "")
+        if mode not in ("crossover", "mutate"):
+            continue
+        try:
+            parent_ids = [int(value) for value in json.loads(str(row.get("parent_ids_json") or "[]"))]
+        except (TypeError, ValueError):
+            parent_ids = []
+        if not parent_ids:
+            continue
+        parent = parent_ids[0]
+        if mode == "crossover":
+            crossover_rows.append(dict(row))
+            crossover_parents.add(parent)
+        else:
+            mutate_rows.append(dict(row))
+            mutate_parents.add(parent)
+    shared = crossover_parents & mutate_parents
+
+    def pool_filter(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        selected = []
+        for row in rows:
+            try:
+                parent_ids = [int(value) for value in json.loads(str(row.get("parent_ids_json") or "[]"))]
+            except (TypeError, ValueError):
+                continue
+            if parent_ids and parent_ids[0] in shared:
+                selected.append(row)
+        return selected
+
+    crossover_pool = pool_filter(crossover_rows)
+    mutate_pool = pool_filter(mutate_rows)
+    crossover_shared = _arm_rates(crossover_pool, latest)
+    mutate_shared = _arm_rates(mutate_pool, latest)
+    thin = min(crossover_shared["simulated"], mutate_shared["simulated"]) < int(min_sample)
+    return {
+        "parent_pool": len(shared),
+        "crossover_parents": len(crossover_parents),
+        "mutate_parents": len(mutate_parents),
+        "shared_pool": {
+            "crossover": crossover_shared,
+            "mutate": mutate_shared,
+            "marginal_value": (
+                None if crossover_shared["is_pass_rate"] is None or mutate_shared["is_pass_rate"] is None
+                else round(crossover_shared["is_pass_rate"] - mutate_shared["is_pass_rate"], 6)
+            ),
+        },
+        "all_parents": {
+            "crossover": _arm_rates(crossover_rows, latest),
+            "mutate": _arm_rates(mutate_rows, latest),
+        },
+        "low_confidence": bool(thin),
+        "min_sample": int(min_sample),
+        "child_versions": sorted(wanted) if wanted else "all",
+        "version": SEED_BANK_VERSION,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Point-in-time seed bank and distance ladder (P19)")
     parser.add_argument("--db", type=Path)
@@ -655,6 +765,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--corr-only", action="store_true", help="restrict to seeds that reached correlation")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--ladder", action="store_true", help="also measure pass rate by distance band")
+    parser.add_argument("--crossover", action="store_true",
+                        help="also compare crossover against one-edit mutation on a shared parent pool (P22.3)")
     parser.add_argument("--child-version", action="append", dest="child_versions",
                         help="restrict the ladder's children to this generator (repeatable)")
     parser.add_argument("--min-sample", type=int, default=5)
@@ -669,6 +781,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             report["distance_ladder"] = distance_outcomes(
                 db, as_of=args.as_of, min_sample=args.min_sample,
                 child_versions=args.child_versions,
+            )
+        if args.crossover:
+            report["crossover_vs_mutation"] = mutation_vs_crossover(
+                db, min_sample=args.min_sample, child_versions=args.child_versions,
             )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

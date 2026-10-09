@@ -550,6 +550,67 @@ def test_the_plan_reports_the_retention_it_used(db, catalog):
     assert "add_component" in plan.mutation_quality
 
 
+def _set_failure_reason(db, candidate_id, reason):
+    """Write the submission-gate verdict a real SUBMISSION_READY parent carries."""
+    import sqlite3
+
+    with sqlite3.connect(str(db.path)) as conn:
+        conn.execute("UPDATE candidates SET failure_reason=? WHERE id=?", (reason, candidate_id))
+
+
+def test_a_submission_gate_failure_does_not_hijack_the_budgeted_edit(db, catalog):
+    # Every SUBMISSION_READY parent stores a *submission* gate verdict (correlation), not an IS
+    # metric failure. The old `if operation and not diagnosed` test treated that as a repair
+    # case and silently replaced the allocated edit with the legacy `field_swap`, so a mutate
+    # campaign kept spending capacity on the one edit the allocator had refused.
+    parent = _settle(db, "add(group_rank(ts_rank(ebit,126),industry),"
+                            "group_rank(ts_rank(sales,126),industry))",
+                     version="catalog-generator-v3", generation_mode="mutate")
+    _set_failure_reason(db, parent,
+                        "gates failed: self-correlation 0.87 >= 0.7 and sharpe 2.30 is below "
+                        "1.10x the correlated alpha's 2.10")
+    gen = generator.CandidateGenerator(db, catalog, seed=3)
+    row = db.get_candidate(parent)
+    assert gen.diagnose(row) == ["SELF_CORRELATION"]  # the diagnoser itself is unchanged
+    child = gen._mutate_child(row, campaign_id="p22-4", operation="group_change")
+    assert child is not None
+    realized = child.parameters.get("realized_operation") or child.parameters.get("operation")
+    assert realized == "group_change"
+    assert realized != "field_swap"
+    assert child.parameters.get("operation_alternative_for") is None
+
+
+def test_a_failed_pinned_edit_retries_a_budgeted_alternative(db, catalog):
+    # A group-less parent cannot realize `group_change`. The slot must retry the campaign's own
+    # budgeted edits before any unbudgeted fallback, and say which edit it substituted for.
+    parent = _settle(db, "add(rank(close),rank(ebit))",
+                     version="catalog-generator-v3", generation_mode="mutate")
+    gen = generator.CandidateGenerator(db, catalog, seed=7)
+    row = db.get_candidate(parent)
+    assert gen.structural_mutation(row, operation="group_change", campaign_id="probe") is None
+    child = gen._mutate_child(row, campaign_id="p22-4b", operation="group_change",
+                              alternatives=("dataset_swap", "subtree_replace"))
+    assert child is not None
+    assert child.parameters.get("operation_alternative_for") == "group_change"
+    realized = child.parameters.get("realized_operation") or child.parameters.get("operation")
+    assert realized in policy.V3_MUTATION_OPERATIONS
+    assert realized != "field_swap"
+
+
+def test_a_repairable_metric_failure_still_gets_its_repair_first(db, catalog):
+    # The repairable-failure precedence is preserved: a HIGH_TURNOVER parent is repaired rather
+    # than structurally edited, so the P22.1 repair path is not disabled by the fix above.
+    parent = _settle(db, "rank(close)", version="catalog-generator-v3", generation_mode="mutate",
+                     sharpe=0.4, is_pass=False)
+    _set_failure_reason(db, parent, "HIGH_TURNOVER")
+    gen = generator.CandidateGenerator(db, catalog, seed=5)
+    row = db.get_candidate(parent)
+    assert "HIGH_TURNOVER" in gen.diagnose(row)
+    child = gen._mutate_child(row, campaign_id="p22-4c", operation="group_change")
+    assert child is not None
+    assert child.mutation_type == "turnover_repair"
+
+
 def test_seed_context_includes_the_proven_recipe_and_source(db, catalog):
     _settle(db, "group_rank(ts_rank(ebit,126),industry)",
             settings={"decay": 8, "truncation": 0.08, "neutralization": "SUBINDUSTRY"})

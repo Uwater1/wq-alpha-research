@@ -262,3 +262,69 @@ def test_seed_bank_cli_reports_the_bank_and_the_ladder(db, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["bank"]["seeds"] == 1
     assert {cell["band"] for cell in report["distance_ladder"]["bands"]} == set(seed_bank.BANDS)
+
+
+# ---------------------------------------------------------------------------
+# P22.3: crossover vs one-edit mutation on a shared parent pool
+# ---------------------------------------------------------------------------
+
+
+def _lineage_child(db, expression, parent_id, mode, *, passed):
+    outcome = db.queue_candidate(
+        expression, {"decay": 6}, signal_family="pv1",
+        generator_version="catalog-generator-v3", parent_ids=[parent_id],
+        generation_mode=mode, campaign_id="p22-3",
+    )
+    claimed = db.claim_simulation("t", candidate_id=outcome.candidate_id)
+    db.record_simulation_result(
+        candidate_id=claimed["id"], status="DONE",
+        metrics={"sharpe": 2.0 if passed else 0.3, "fitness": 1.5 if passed else 0.2,
+                 "turnover": 0.1},
+        checks=[{"name": "IS", "result": "PASS" if passed else "FAIL"}],
+        brain_alpha_id=f"B{outcome.candidate_id}",
+    )
+    return outcome.candidate_id
+
+
+def test_crossover_is_compared_against_mutation_on_a_shared_parent_pool(db):
+    parent_a = _settle(db, "rank(close)")
+    parent_b = _settle(db, "rank(open)")
+    parent_c = _settle(db, "rank(high)")  # mutation only: must not join the shared pool
+    _lineage_child(db, "rank(ebit)", parent_a, "crossover", passed=True)
+    _lineage_child(db, "rank(sales)", parent_b, "crossover", passed=False)
+    _lineage_child(db, "rank(assets)", parent_a, "mutate", passed=True)
+    _lineage_child(db, "rank(cash)", parent_b, "mutate", passed=False)
+    _lineage_child(db, "rank(capex)", parent_c, "mutate", passed=True)
+
+    report = seed_bank.mutation_vs_crossover(db, min_sample=1)
+    assert report["parent_pool"] == 2
+    assert report["shared_pool"]["crossover"]["simulated"] == 2
+    assert report["shared_pool"]["crossover"]["is_pass"] == 1
+    assert report["shared_pool"]["mutate"]["simulated"] == 2
+    assert report["shared_pool"]["mutate"]["is_pass"] == 1
+    assert report["shared_pool"]["marginal_value"] == pytest.approx(0.0)
+    assert report["low_confidence"] is False
+    # The unrestricted arm rate includes the mutation-only parent, so the selection effect
+    # is visible: the shared pool is the only fair comparison.
+    assert report["all_parents"]["mutate"]["simulated"] == 3
+
+
+def test_a_thin_shared_pool_is_reported_as_low_confidence_not_a_verdict(db):
+    parent_a = _settle(db, "rank(close)")
+    parent_b = _settle(db, "rank(open)")
+    _lineage_child(db, "rank(ebit)", parent_a, "crossover", passed=True)
+    _lineage_child(db, "rank(sales)", parent_b, "mutate", passed=False)
+    report = seed_bank.mutation_vs_crossover(db, min_sample=2)
+    assert report["parent_pool"] == 0
+    assert report["shared_pool"]["crossover"]["simulated"] == 0
+    assert report["low_confidence"] is True
+
+
+def test_crossover_vs_mutation_can_be_restricted_to_one_generator(db):
+    parent = _settle(db, "rank(close)")
+    _lineage_child(db, "rank(ebit)", parent, "crossover", passed=True)
+    _lineage_child(db, "rank(sales)", parent, "mutate", passed=True)
+    report = seed_bank.mutation_vs_crossover(db, child_versions=["catalog-generator-v2"], min_sample=1)
+    assert report["parent_pool"] == 0 and report["low_confidence"] is True
+    report = seed_bank.mutation_vs_crossover(db, child_versions=["catalog-generator-v3"], min_sample=1)
+    assert report["parent_pool"] == 1 and report["low_confidence"] is False

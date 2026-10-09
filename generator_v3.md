@@ -67,6 +67,30 @@ trial ledger + archive + empirical statistics
     ↺
 ```
 
+## 2026-10-09 follow-up: realized vs planned lineage edits (P22.4)
+
+The parent-relative budget fix (P22.2) made structural edits possible on proven parents; a
+fixed-seed probe of a `--strategy mutate` plan showed they were still not reliably *spent*. Two
+leaks, measured with no simulation spent:
+
+- a `SUBMISSION_READY` parent stores a **submission-gate** `failure_reason`, and `_mutate_child`
+  treated any diagnosed mode as a repair case — including `SELF_CORRELATION`, which a
+  generation-time repair cannot address — so the allocated edit was replaced by the legacy
+  `field_swap` (1 pass in 24 simulations);
+- a pinned edit that failed on a particular parent fell straight through to that same legacy
+  edit instead of retrying the campaign's other budgeted edits.
+
+Realized operation mix went from `18/30 planned + 12 field_swap` to **`30/30` planned,
+`0 field_swap`**. `REPAIRABLE_FAILURE_MODES` now separates IS metrics from portfolio gates, and
+`materialize` passes the allocated operations to `_mutate_child` as ordered alternatives.
+
+**Still open (diagnosed, not shipped):** the default `mixed` plan's `exploit` slot materializes as
+fresh `motif_generation` (0/96 settled simulations) while the `exploit` **mode** statistic is
+inflated by the separate warm-started arm (`recipe_perturbation`, 29/34). Routing the default
+exploit slot to the warm-start ladder is a plan-contract change (the planner must select
+`(seed, rung)` so planned skeleton hashes still describe the emitted tree) and is the next work
+item rather than a half-planned patch.
+
 ## Small engineering carryovers
 
 These did not reopen P0–P15 and are now closed (P16).

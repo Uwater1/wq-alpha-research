@@ -169,6 +169,16 @@ FAILURE_MUTATION_TYPES: dict[str, str] = {
     "CORR_FAIL": "correlation_repair",
 }
 
+#: Failure modes a *generation-time* repair can actually address. ``SELF_CORRELATION`` /
+#: ``CORR_FAIL`` are deliberately absent: they are submission/portfolio gates, not IS metrics.
+#: A gate-reaching parent whose only recorded failure is correlation is an economically strong
+#: alpha the local book merely already resembles, and rewriting its structure to "repair"
+#: correlation destroys exactly the quality the campaign is exploiting. Correlation is the
+#: operation mix's and the novelty screen's job, so those parents take their budgeted edit.
+REPAIRABLE_FAILURE_MODES = tuple(
+    mode for mode in FAILURE_MUTATION_TYPES if mode not in ("SELF_CORRELATION", "CORR_FAIL")
+)
+
 _WINDOW_RE = re.compile(r"(?<![\w.])(\d{2,4})(?![\w.])")
 _HUMP_RE = re.compile(r"hump\s*\(", re.IGNORECASE)
 _FIRST_CALL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*\(")
@@ -610,6 +620,7 @@ class CandidateGenerator:
         limits: grammar.ComplexityLimits = V3_LIMITS,
         force_motif: str | None = None,
         recipe_prior: Mapping[str, Mapping[str, int]] | None = None,
+        mutation_alternatives: Sequence[str] = (),
     ) -> Proposal | None:
         """Turn one planned slot into a validated, provenance-complete proposal.
 
@@ -638,6 +649,7 @@ class CandidateGenerator:
                 child = mutator._mutate_child(
                     parent, campaign_id=campaign_id,
                     operation=slot.mutation_operation or None,
+                    alternatives=mutation_alternatives,
                 )
                 if child is not None:
                     operation = str(child.parameters.get("operation") or child.mutation_type)
@@ -1268,10 +1280,18 @@ class CandidateGenerator:
             campaign_id=campaign_id, budget=count, seed=seed, mode=strategy,
             family=family, max_family_share=max_family_share, force_motif=motif, prior=prior,
         )
+        # P22.4: the campaign's budgeted mutation edits, most-evidenced (highest quota) first.
+        # A slot whose pinned edit cannot be realized retries these before an unbudgeted edit.
+        mutation_alternatives = tuple(
+            name for name, quota in sorted(
+                plan.mutation_allocation.items(), key=lambda item: (-item[1], item[0])
+            ) if quota > 0
+        )
         proposals: list[Proposal] = []
         for slot in plan.slots:
             proposal = self.materialize(slot, campaign_id=campaign_id, seed=seed,
-                                        limits=limits, recipe_prior=plan.recipe_prior)
+                                        limits=limits, recipe_prior=plan.recipe_prior,
+                                        mutation_alternatives=mutation_alternatives)
             if proposal is not None:
                 proposals.append(proposal)
         if screen:
@@ -1359,6 +1379,7 @@ class CandidateGenerator:
         *,
         campaign_id: str,
         operation: str | None = None,
+        alternatives: Sequence[str] = (),
     ) -> Proposal | None:
         """One V3 mutation child: failure-directed repair when a failure is diagnosed,
         otherwise a concrete structural edit (P4.4), and finally the structural field swap.
@@ -1366,13 +1387,36 @@ class CandidateGenerator:
         ``operation`` pins the edit the adaptive mutation allocation budgeted (P9.2); a
         diagnosed failure still gets its repair first, because repair answers an observed
         problem while the allocation governs exploratory edits.
+
+        ``alternatives`` is the campaign's own budgeted edit set, most-evidenced first. When
+        the pinned edit cannot be realized on *this* parent, the slot retries those before any
+        unbudgeted fallback (P22.4): otherwise a failed pin silently degraded to the legacy
+        ``field_swap`` edit, which the allocator had already refused on evidence and which is
+        the ledger's weakest operation (1 pass in 24 simulations). Retrying a budgeted edit
+        keeps the realized operation mix equal to the planned, evidenced one.
         """
+        # Only a failure a generation-time repair can address may preempt the budgeted edit. A
+        # submission/portfolio gate failure (``SELF_CORRELATION``) is not one; the parent keeps
+        # its allocated structural edit. This matters in practice: every ``SUBMISSION_READY``
+        # parent stores a submission-gate ``failure_reason``, so the old ``not diagnosed`` test
+        # treated the archive's best alphas as repair cases and silently replaced their
+        # budgeted edit with the legacy ``field_swap`` (the ledger's weakest operation, 1 pass
+        # in 24 simulations) -- which is why a "mutate" arm kept spending on a refused edit.
         diagnosed = self.diagnose(parent)
-        if operation and not diagnosed:
+        repairable = [mode for mode in diagnosed if mode in REPAIRABLE_FAILURE_MODES]
+        if operation and not repairable:
             child = self.structural_mutation(parent, operation=operation, campaign_id=campaign_id)
             if child is not None:
                 return child
-        repairs = self.mutate(parent, count=1, campaign_id=campaign_id) if diagnosed else []
+            for name in alternatives:
+                if name == operation:
+                    continue
+                child = self.structural_mutation(parent, operation=name, campaign_id=campaign_id)
+                if child is not None:
+                    parameters = dict(child.parameters)
+                    parameters["operation_alternative_for"] = operation
+                    return replace(child, parameters=parameters)
+        repairs = self.mutate(parent, count=1, campaign_id=campaign_id) if repairable else []
         child = repairs[0] if repairs else self.structural_mutation(parent, campaign_id=campaign_id)
         if child is None:
             fallback = self.mutate(parent, count=1, campaign_id=campaign_id)

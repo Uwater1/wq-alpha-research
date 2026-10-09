@@ -2,7 +2,7 @@
 
 **Goal:** turn the now-correct Generator V3 engine into a generator that spends scarce simulations on economically plausible, diverse hypotheses.
 
-**Current state:** P0–P15 are implementation-complete and CI-covered, and **V3 is now the default generator** (P17). The original 0/138 collapse is resolved: after the P21.3 recipe conditioning and the P22.2 parent-relative edit-budget fix, the live ledger reads as follows (settled simulations, `scripts/promotion_gate.py`):
+**Current state (2026-10-09):** P0–P15 are implementation-complete and CI-covered, and **V3 is now the default generator** (P17). The 2026-10-09 session added **P22.4** (budgeted lineage edits are realized instead of leaking to the legacy `field_swap`; live `dig3-mutate` arm: **21/24 IS passes, 88%**) and closed the P22.3 crossover-vs-one-edit head-to-head measurement. The binding constraint on *submitted* alphas is now portfolio correlation, not generation quality: 30 of 33 gate-eligible candidates were held at `|corr| = 0.70–0.99` against an ACTIVE alpha of Sharpe 2.34. The original 0/138 collapse is resolved: after the P21.3 recipe conditioning and the P22.2 parent-relative edit-budget fix, the live ledger reads as follows (settled simulations, `scripts/promotion_gate.py`):
 
 ```text
 catalog-generator-v2    123 sims    9 IS pass    7.3%   ci95 [3.9%, 13.3%]
@@ -96,7 +96,7 @@ IS_PASS per 100 BRAIN simulations
 - [x] **Promotion-gate honesty:** version-level pooled history is labeled **unmatched**; full generation point-in-time safety and matched live validation return `unknown`, never unconditional `pass`.
 - [ ] **Re-run promotion report on private ledger** and publish sanitized corrected V2/V3 diversity and uncertainty metrics.
 - [ ] **Resolve settled BRAIN CORR/robustness, fresh matched-budget experiments and exact regeneration** before calling V3 scientifically validated ([#11](https://github.com/Uwater1/wq-alpha-research/issues/11), [#12](https://github.com/Uwater1/wq-alpha-research/issues/12)).
-- [ ] **Reduce late-mutation turnover failures**, validate against equal-budget controls before policy changes, and quantify parent/child turnover and Sharpe tradeoffs ([#16](https://github.com/Uwater1/wq-alpha-research/issues/16)).
+- [x] **Stop losing budgeted lineage edits to a refused fallback.** The recorded symptom was "late-mutation turnover failures"; the measured cause was different, and was found by comparing a fixed-seed mutation plan's *realized* operation mix with its allocation rather than trusting either. Every `SUBMISSION_READY` parent stores a **submission-gate** `failure_reason` (`self-correlation 0.9 >= 0.7`), and `_mutate_child` treated *any* diagnosed mode - including `SELF_CORRELATION`, which a generation-time repair cannot address - as a reason to replace the allocated edit with the legacy `field_swap` repair. 12 of 30 mutate slots realized `field_swap` (1 pass in 24 simulations) instead of the evidenced edit the allocator had chosen. Fixed in P22.4; parent/child turnover-vs-Sharpe tradeoffs remain *measured, not assumed* ([#16](https://github.com/Uwater1/wq-alpha-research/issues/16)).
 - [ ] **Validate PR CI** and preserve an explicit tagged V2 fallback until P25 gates pass.
 
 ---
@@ -445,7 +445,7 @@ campaign (P25.1).
 
 # P22 — Warm-started exploit and structure-preserving mutation
 
-**Status: parent-relative editing fixed; mutation-quality suppression and crossover ablation remain OPEN** ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13)).
+**Status: parent-relative editing fixed (P22.2), pinned-edit realization fixed (P22.4); the default `mixed` exploit slot still emits fresh `motif_generation` and remains OPEN** ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13)).
 
 **Question:** can exploitation produce useful novelty by changing one justified component at a time?
 
@@ -498,8 +498,70 @@ generator before the parent-relative budget fix.
 ## P22.3 Crossover budget
 
 - [x] Keep crossover share low until it demonstrates positive marginal value. `generation_policy.quality_conditioned_weights` conditions every mode share on measured outcomes, and a mode without positive marginal value is shrunk toward the floor (`test_crossover_is_reduced_when_it_has_no_marginal_value`).
-- [ ] Compare crossover children against one-edit mutations from the same parent pool. `seed_bank.distance_outcomes(child_versions=[...])` measures the rung rates, but the head-to-head crossover-vs-one-edit comparison from an identical parent pool is not yet automated.
+- [x] Compare crossover children against one-edit mutations from the same parent pool. `seed_bank.mutation_vs_crossover` measures both arms over the parents that produced **both** kinds of child, reports each arm's unrestricted rate beside the shared-pool rate so the parent-selection effect is visible, and flags a thin pool as `low_confidence` instead of a verdict (`seed_bank.py --crossover`).  
+  **Live evidence:** crossover `0/8` versus mutation `49/107` (45.8%) over all parents, but only **2 parents** produced both arms, so the matched comparison is `low_confidence` - the honest reading is "crossover has not demonstrated marginal value", not "crossover is proven worse".  
+  **Regression:** `test_crossover_is_compared_against_mutation_on_a_shared_parent_pool`, `test_a_thin_shared_pool_is_reported_as_low_confidence_not_a_verdict`, `test_crossover_vs_mutation_can_be_restricted_to_one_generator`.
 - [x] If crossover remains weak, allow adaptive allocation to shrink it close to the exploration floor (`DEFAULT_MODE_FLOOR`, bounded by the ratio band and re-projected via `_project_onto_bounds`).
+
+## P22.4 Budgeted lineage edits are realized, or explicitly substituted
+
+The parent-relative budget fix (P22.2) made structural edits *possible* on proven parents; they
+were still not reliably *spent*. Both leaks below were found by measuring the realized operation
+mix of a fixed-seed `--strategy mutate` plan against its allocation, with no simulation spent:
+
+1. **A portfolio gate is not a repairable IS failure.** Archive elites are `SUBMISSION_READY`,
+   so their `failure_reason` records the *submission* gate. `_mutate_child` skipped the budgeted
+   edit for any diagnosed mode and ran the legacy repair, whose `SELF_CORRELATION` repair is a
+   `field_swap` - the vocabulary's weakest edit. A campaign therefore *planned* proven edits and
+   *emitted* the refused one on exactly the parents worth exploiting.
+   `REPAIRABLE_FAILURE_MODES` now separates the IS metrics a generation-time repair can act on
+   from the portfolio gates it cannot; a correlation failure keeps the allocated edit, because
+   correlation is the operation mix's and the novelty screen's job.
+2. **A failed pin retried an unbudgeted edit.** When the pinned edit could not be realized on
+   that particular parent, the slot fell straight through to the same legacy edit. `materialize`
+   now passes the campaign's allocated operations (highest quota first) to `_mutate_child`, which
+   retries those before any unbudgeted fallback and records `operation_alternative_for`.
+
+**Measured effect** (fixed-seed `--strategy mutate`, 30 slots): the plan allocated
+`dataset_swap 12 / group_change 12 / subtree_replace 6`; realized went from
+`18/30 planned + 12 field_swap` to **`30/30` planned, `0 field_swap`**.
+
+**Live confirmation** (`dig3-mutate`, 30 slots, settled on the live ledger): **21/24 IS passes
+(88%)**, realizing `dataset_swap 12 / group_change 6 / subtree_replace 6` with **zero
+`field_swap`** children. For comparison, the same mode previously spent 24 simulations on
+`field_swap` for 1 pass, and the last post-fix campaign before this one reported ~48% reach of the
+submission gate. The children are high-quality composites (Sharpe 1.9-2.4, turnover 0.10-0.15),
+so the remaining brake on *submitted* alphas is portfolio correlation, not generation:
+30 of 33 gate-eligible candidates were held at `|corr| = 0.70-0.99` against an ACTIVE alpha with
+Sharpe 2.34, below the 1.10x exception (2.57). That is P23's territory, not a generation bug.
+
+**Regression:** `test_a_submission_gate_failure_does_not_hijack_the_budgeted_edit`,
+`test_a_failed_pinned_edit_retries_a_budgeted_alternative`,
+`test_a_repairable_metric_failure_still_gets_its_repair_first`.
+
+**Remaining, larger leak (diagnosed, not yet fixed):** the default `mixed` plan's `exploit`
+slots still materialize as fresh `motif_generation`. Per-generator-version ledger measurement
+(`research.db`, settled simulations) separates the two code paths that share the `exploit` label:
+
+```text
+mode       operation               n   pass   rate    meanTO  TO>20%
+explore    motif_generation      225      0   0.0%    0.469     124
+exploit    motif_generation       96      0   0.0%    0.279      27
+exploit    recipe_perturbation    34     29  85.3%    0.136       2
+mutate     group_change           18     18 100.0%    0.116       0
+mutate     dataset_swap           17     16  94.1%    0.113       0
+mutate     subtree_replace        15      9  60.0%    0.109       2
+mutate     field_swap             24      1   4.2%    0.126       3
+mutate     window_change          20      1   5.0%    0.279       7
+```
+
+The `exploit` **mode** statistic is inflated by the warm-started arm (`recipe_perturbation`,
+29/34) while the default `mixed` plan's `exploit` slot is `motif_generation` (0/96), so
+`quality_conditioned_weights` grants `exploit` ~31% of a budget it spends on a path with no live
+pass. The fix is to make the default `exploit` slot a warm-started ladder child, which also
+requires the planner to select `(seed, rung)` so the plan's skeleton hashes still describe the
+emitted tree (P16). That is a plan-contract change and is tracked as the next work item rather
+than shipped half-planned.
 
 **Research:** warm-start GP and AutoAlpha directly motivate promising-region initialization and controlled evolution.
 
