@@ -1,4 +1,4 @@
-"""P25 promotion gate — matched live evidence for promoting V3 over V2 (P17/P25.3).
+"""P25 promotion gate — descriptive settled-ledger evidence for V3 (P17/P25.3).
 
 The roadmap forbids promoting V3 because its architecture is cleaner or its archive more
 diverse. It requires *measured* simulation efficiency: a materially better IS_PASS per
@@ -16,8 +16,8 @@ This module turns that prose into a computable checklist over the settled trial 
 * :func:`main` prints the JSON artifact.
 
 Every read is filtered to simulations that had *completed* at or before ``as_of`` (default:
-the newest completed simulation), so a past promotion decision can be reproduced from the
-ledger instead of re-derived from today's state.
+the newest completed simulation), for a retrospective *outcome* snapshot. This does not
+reconstruct the historical generation policy, parent states, or matched research arms.
 """
 from __future__ import annotations
 
@@ -33,10 +33,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import diversity  # noqa: E402
+import expression_grammar as grammar  # noqa: E402
 import quality_diagnostics as diagnostics  # noqa: E402
 import research_db  # noqa: E402
 
-PROMOTION_VERSION = "promotion-gate-v1"
+PROMOTION_VERSION = "promotion-gate-v2"
 #: The shipped generator V3 must beat, and the candidate default.
 DEFAULT_BASELINE = "catalog-generator-v2"
 DEFAULT_TARGET = "catalog-generator-v3"
@@ -51,7 +52,7 @@ DIVERSITY_FLOOR_RATIO = 0.5
 #: The settled simulation ledger columns a promotion metric is computed from.
 _LEDGER_SQL = """
     SELECT c.id AS candidate_id, c.campaign_id, c.generator_version, c.status,
-           c.grammar_skeleton_hash, c.semantic_skeleton_hash, c.motif_id,
+           c.normalized_expression, c.grammar_skeleton_hash, c.semantic_skeleton_hash, c.motif_id,
            c.source_profile_json, c.corr_status, c.failure_reason,
            s.is_pass AS sim_is_pass, s.sharpe, s.fitness, s.turnover, s.drawdown,
            s.checks_json, s.completed_at
@@ -149,14 +150,45 @@ def survivor_diversity(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             table[str(value or "unknown")] = table.get(str(value or "unknown"), 0) + 1
         return table
 
-    grammar = counts([str(row.get("grammar_skeleton_hash") or "unknown") for row in survivors])
-    semantic = counts([str(row.get("semantic_skeleton_hash") or "unknown") for row in survivors])
+    metadata = diversity.load_field_metadata()
+    grammar_keys: list[str] = []
+    semantic_keys: list[str] = []
+    missing_grammar = missing_semantic = reconstructed_grammar = reconstructed_semantic = 0
+    for row in survivors:
+        expression = str(row.get("normalized_expression") or "")
+        grammar_hash = str(row.get("grammar_skeleton_hash") or "")
+        semantic_hash = str(row.get("semantic_skeleton_hash") or "")
+        # V2 does not persist the V3-only hash columns; counting all its missing hashes
+        # as a single "unknown" made historical V2 diversity appear exactly 1.0.
+        if not grammar_hash and expression:
+            grammar_hash = grammar.grammar_skeleton_hash(expression, metadata)
+            reconstructed_grammar += 1
+        if not semantic_hash and expression:
+            semantic_hash = grammar.semantic_skeleton_hash(expression, metadata)
+            reconstructed_semantic += 1
+        if grammar_hash:
+            grammar_keys.append(grammar_hash)
+        else:
+            missing_grammar += 1
+        if semantic_hash:
+            semantic_keys.append(semantic_hash)
+        else:
+            missing_semantic += 1
     motif = counts([str(row.get("motif_id") or "none") for row in survivors])
     dataset = counts([value for row in survivors for value in _datasets(row)])
     return {
         "survivors": len(survivors),
-        "effective_grammar": round(diversity.effective_count(grammar), 4),
-        "effective_semantic": round(diversity.effective_count(semantic), 4),
+        # Missing identity is explicitly unmeasurable, never a synthetic structure.
+        "effective_grammar": (
+            round(diversity.effective_count(counts(grammar_keys)), 4) if not missing_grammar else None
+        ),
+        "effective_semantic": (
+            round(diversity.effective_count(counts(semantic_keys)), 4) if not missing_semantic else None
+        ),
+        "missing_grammar": missing_grammar,
+        "missing_semantic": missing_semantic,
+        "reconstructed_grammar": reconstructed_grammar,
+        "reconstructed_semantic": reconstructed_semantic,
         "effective_motif": round(diversity.effective_count(motif), 4),
         "effective_dataset": round(diversity.effective_count(dataset), 4),
     }
@@ -234,8 +266,18 @@ def evaluate_gate(
         target_corr_status=_corr_status_present(target),
     )
     checklist["no_point_in_time_leakage"] = _item(
-        "pass",
-        reason="every row is filtered by its own completed_at against the report clock",
+        "unknown",
+        reason=(
+            "retrospective simulation-completion filtering is not an event-clock proof that "
+            "generation inputs, archive elites, parent states, and recipes were available then"
+        ),
+    )
+    checklist["matched_live_comparison"] = _item(
+        "unknown",
+        reason=(
+            "version-wide pooled simulations are descriptive, not equal-budget prospective arms "
+            "matched by date/scope/parent lineage and frozen campaign configuration"
+        ),
     )
     checklist["reproducible_from_config"] = _item(
         "unknown",
@@ -265,7 +307,7 @@ def report(
     campaign_limit: int = 12,
     min_sample: int = MIN_ARM_SIMULATIONS,
 ) -> dict[str, Any]:
-    """Build the complete promotion report for one ledger snapshot."""
+    """Describe observed outcomes; do not treat cross-version pooled history as a causal A/B test."""
     rows, clock = _ledger(db, as_of=as_of)
     baseline_rows = [row for row in rows if str(row.get("generator_version") or "") == baseline]
     target_rows = [row for row in rows if str(row.get("generator_version") or "") == target]
@@ -295,6 +337,7 @@ def report(
 
     return {
         "version": PROMOTION_VERSION,
+        "comparison_design": "pooled_historical_by_generator_version_unmatched",
         "as_of": clock,
         "baseline": baseline,
         "target": target,

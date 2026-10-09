@@ -5,12 +5,12 @@
 **Current state:** P0–P15 are implementation-complete and CI-covered, and **V3 is now the default generator** (P17). The original 0/138 collapse is resolved: after the P21.3 recipe conditioning and the P22.2 parent-relative edit-budget fix, the live ledger reads as follows (settled simulations, `scripts/promotion_gate.py`):
 
 ```text
-catalog-generator-v2    123 sims    9 IS pass    7.3%   ci95 [3.9%, 13.3%]   survivor eff. grammar 1.0
-catalog-generator-v3    540 sims   96 IS pass   17.8%   ci95 [14.8%, 21.2%]  survivor eff. grammar 40.6
+catalog-generator-v2    123 sims    9 IS pass    7.3%   ci95 [3.9%, 13.3%]
+catalog-generator-v3    540 sims   96 IS pass   17.8%   ci95 [14.8%, 21.2%]
 efficiency ratio       2.43x   (material bar 1.25x)
 ```
 
-The V2 survivors all collapse to a single grammar skeleton, so "V2 looks competitive" was never a diversity story; V3 is both more efficient and structurally more diverse among its survivors. The promotion gate still reports two items as `unknown` (downstream BRAIN correlation/robustness, and configuration-replay reproducibility) rather than pretending they passed — see P25.3.
+**These figures are descriptive pooled historical data, not matched-budget causal evidence.** The formerly reported V2 effective grammar count 1.0 was invalid: V2 did not persist V3-specific skeleton hashes; `promotion_gate` now reconstructs the missing identities from expressions. Re-run on the private ledger to establish revised diversity. No final promotion gate is satisfied while matched live arms, event-clock inputs, settled CORR/robustness and exact config replay remain unknown. V3 remains the *operational* default provisionally; see P17A and P25.
 
 ---
 
@@ -22,7 +22,7 @@ The old checklist is intentionally compressed. Detailed regressions remain in th
 - [x] **P4–P7 — search mechanics:** explore/exploit/mutate/crossover, real structural mutations, exact plan→materialization hashes, archive loop, metadata-aware crossover, multi-parent novelty.
 - [x] **P8–P11 — evidence/provenance:** archive-aware ranking, corrected adaptive statistics, complete queued/skipped lineage, explicit V2/V3 subsystem versions.
 - [x] **P12–P15 — operation/evaluation:** V3 CLI, dry plan, diversity report, point-in-time replay, archive-V2 baseline, full regression suite and GitHub Actions execution.
-- [x] V2 remains the live default.
+- [x] V2 remains accessible as the explicit `--legacy-v2` control; V3 is the operational default (not evidence of completed promotion gates).
 
 No new feature should reopen P0–P15 unless it breaks one of these contracts.
 
@@ -54,7 +54,7 @@ This section supersedes any broad "P20/P21/P22 done" claim below. Implemented co
 - [x] **Operational privacy hygiene:** remove three tracked alpha-ID dump files and ignore future copies. Public git history is **not** scrubbed; follow [#14](https://github.com/Uwater1/wq-alpha-research/issues/14).
 - [ ] **Reconstruct end-to-end point-in-time V3 generation** instead of silently time-traveling through archived elites and coverage ([#12](https://github.com/Uwater1/wq-alpha-research/issues/12)).
 - [ ] **Joint emitted-shape × recipe learning** with failure denominators, lineage/near-clone awareness and calibration. Separate observed correlations from demonstrated causal improvements ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13)).
-- [ ] **Run/verify CI on this exact head**, not infer it from earlier green runs. *(Local `pytest -q` is green on this head: 627 passed. The remote GitHub Actions run has not been observed from this workspace.)*
+- [ ] **Run/verify CI for each promotion/fix head**; the older 627-pass local result does not cover subsequent edits. Inspect the matching Actions SHA before merging.
 - [ ] **Live ablations and downstream BRAIN checks** before closing P20/P21/P22 or promoting V3 ([#11](https://github.com/Uwater1/wq-alpha-research/issues/11)).
 
 ---
@@ -64,7 +64,7 @@ This section supersedes any broad "P20/P21/P22 done" claim below. Implemented co
 - [x] P0–P15 implementation complete.
 - [x] Equal-budget replay machinery executed.
 - [x] Small live V3 campaigns executed.
-- [x] **Promote V3 to default.** `python -m wq generate` now runs quality-conditioned V3; the template generator is the explicit `--legacy-v2` control arm. The gate is computed by `scripts/promotion_gate.py` (`--out promotion_gate.json`, git-ignored).
+- [x] **Operational CLI switch to V3.** `python -m wq generate` runs quality-conditioned V3 and `--legacy-v2` selects the control arm. **This is not completion of the P25 promotion gate**; the independent empirical validation below remains open. `scripts/promotion_gate.py` (`--out promotion_gate.json`, git-ignored) reports uncertainty instead of authorizing promotion.
 
 Original 2026-09-28 evidence (now explained, not a permanent failure):
 
@@ -85,6 +85,19 @@ IS_PASS per 100 BRAIN simulations
 → robustness-adjusted quality
 → survivor diversity
 ```
+
+---
+
+# P17A — Post-default audit hardening (2026-10-09)
+
+- [x] **CLI dry-plan:** both default V3 and `--legacy-v2` (including implicit V2-only flags) must generate a summary without enqueueing candidates/trials; regression tests cover the legacy path.
+- [x] **Unsupported historical flag:** `--seed-as-of` must fail explicitly on ordinary V3/V2 generation; only the separate warm-start path accepts the flag, with the historical stage/event weakness tracked under #12.
+- [x] **P25 measurement hygiene:** backfill absent V2 grammar and semantic identities from expressions using the catalog snapshot; unknown missing expressions remain unmeasurable, not one synthetic grammar family. Do not reuse the old V2 diversity = 1.0 claim.
+- [x] **Promotion-gate honesty:** version-level pooled history is labeled **unmatched**; full generation point-in-time safety and matched live validation return `unknown`, never unconditional `pass`.
+- [ ] **Re-run promotion report on private ledger** and publish sanitized corrected V2/V3 diversity and uncertainty metrics.
+- [ ] **Resolve settled BRAIN CORR/robustness, fresh matched-budget experiments and exact regeneration** before calling V3 scientifically validated ([#11](https://github.com/Uwater1/wq-alpha-research/issues/11), [#12](https://github.com/Uwater1/wq-alpha-research/issues/12)).
+- [ ] **Reduce late-mutation turnover failures**, validate against equal-budget controls before policy changes, and quantify parent/child turnover and Sharpe tradeoffs ([#16](https://github.com/Uwater1/wq-alpha-research/issues/16)).
+- [ ] **Validate PR CI** and preserve an explicit tagged V2 fallback until P25 gates pass.
 
 ---
 
@@ -622,7 +635,7 @@ G  full quality-aware V3
 
 Where budget allows, separately test mutation and crossover contribution.
 
-**Harness:** `scripts/promotion_gate.py` computes the arm metrics for any baseline/target pair (`--baseline`, `--target`) plus a per-campaign breakdown of the target, so the arms above are comparable without a new script per arm. Arm A (V2) and arm B/G (the shipped conditioned V3) are the pair the gate reports; C–F remain unrun as separate arms.
+**Report, not a matched-experiment harness:** `scripts/promotion_gate.py` summarizes pooled version/campaign outcomes; it cannot freeze configs, allocate equal actual simulation budgets, ensure matching periods/scopes/lineages or establish independence. Arm A (V2) and B/G (shipped V3) have descriptive ledger metrics only; C–F and matched comparisons remain unrun. See [#11](https://github.com/Uwater1/wq-alpha-research/issues/11).
 
 ## P25.2 Required metrics
 
@@ -648,14 +661,14 @@ Secondary:
 
 Promote V3 only after multiple independent matched-budget live campaigns show:
 
-- [x] materially better simulation efficiency than V2 — **2.43x** (V3 17.8% vs V2 7.3%, non-overlapping ci95)
-- [x] competitive performance versus V2 — same comparison; V2 is the baseline arm
-- [x] no material collapse in survivor diversity — V3 survivors span 44.4 effective grammar skeletons vs V2's 1.0
-- [ ] acceptable correlation and robustness — **unknown**: requires settled BRAIN `SELF_CORRELATION`/robustness outcomes
-- [x] no point-in-time leakage — every row is filtered by its own `completed_at`; `leakage_check` re-verified
-- [ ] reproducibility from stored campaign configuration — the winning campaigns have not been replayed byte-for-byte
+- [ ] **Matched** higher IS_PASS/actual simulation versus V2 — historical pooled rate ratio **2.43x** is descriptive, not independent equal-budget evidence; requires prospective frozen cohorts.
+- [ ] **Matched** competitive downstream performance versus V2 — controlled campaign windows, universe/delay and parent availability not yet ensured.
+- [ ] **Measured** survivor diversity preserved — previously claimed V2 effective grammar 1.0 came from missing stored hashes, not a reconstructed comparison; recalculate and validate.
+- [ ] acceptable correlation and robustness — **unknown**: requires settled BRAIN `SELF_CORRELATION`/robustness outcomes.
+- [ ] no point-in-time leakage — filtering outcomes by `completed_at` alone cannot establish contemporaneous archive/recipe/parent state (#12).
+- [ ] reproducibility from stored campaign configuration — the winning campaigns have not been replayed byte-for-byte.
 
-The gate returns `promoted: false` while the two `unknown` items are unresolved. That is deliberate: the efficiency half of the gate is met, and the gate must not report the unmeasured half as a pass. A single strong campaign is still evidence, not promotion — but the efficiency signal now comes from **five** independent post-fix campaigns (`sweep1` 22.6%, `sweep2` 45.8%, `sweep4` 45.8%, `v3-proven-mutate` 59.0%, `v3-promote-20261008` 33.3%), not one.
+The gate returns `promoted: false` while **at least four** independent validation dimensions are unresolved: matched arms, historical generation causality, downstream correlation/robustness, and config replay. The CLI was switched to V3 *provisionally* based on descriptive IS outcomes; this is not scientific promotion. The positive signal has been observed in five **separately named but not necessarily statistically independent** post-fix campaigns (`sweep1` 22.6%, `sweep2` 45.8%, `sweep4` 45.8%, `v3-proven-mutate` 59.0%, `v3-promote-20261008` 33.3%), not one.
 
 **Live confirmation campaign (2026-10-08, `v3-promote-20261008`, 40 slots).** Generated by the now-default CLI: 39 queued, 1 skipped as redundant. The opening batch reached 11/13 IS passes at mean Sharpe `2.0`; the campaign finished at **12/36 IS passes (33.3%)** with 11 candidates at the submission gate. That taper is a real, reproducible finding, not noise: the cold-archive `mixed` plan front-loads explore/exploit over the strongest sources, and once lineage modes take over, mutation children show a mean turnover of `~0.5` — i.e. the failure mode moves from `LOW_SHARPE` to `HIGH_TURNOVER` as the campaign shifts from discovery to exploitation. Candidate structure (composites, truncation `0.08`) is right; the lineage edits need turnover-aware conditioning.
 
@@ -689,7 +702,9 @@ P22       proven-parent mutations              [operation penalty done; crossove
 P25       matched live ablation                [gate harness done; efficiency met; correlation half open #11]
 P24       surrogate ordering/calibration       [targets + calibration + fixed-budget capture done]
 P23       collection-aware contribution        [defer until credible CORR survivor pool]
-P17       promotion                            [V3 is the default; gate has two `unknown` items]
+P17/P17A  operational default & hardening         [V3 on; gate not satisfied; audit fixes tested]
+P25       real controlled promotion gate       [open #11/#12; CORR/robustness and config replay unverified]
+P22       turnover-aware edits                 [open #16; late-mutation turnover > 20%]
 ```
 
 Do not start P23 merely because its code can be written; settle P25's downstream survivor outcomes first. P24 can be developed in parallel only as advisory and time-sliced, then evaluated against the simple conditional prior before consuming live capacity.

@@ -2258,7 +2258,7 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--max-family-share", type=float,
                           default=generation_policy.DEFAULT_MAX_FAMILY_SHARE)
     generate.add_argument("--dry-plan", action="store_true",
-                          help="materialize and print the V3 plan distribution without queueing")
+                          help="print a proposal/plan summary without queueing (both V2 and V3)")
     generate.add_argument("--warm-start", action="store_true",
                           help="P19.2: exploit the point-in-time seed bank across the distance ladder")
     generate.add_argument("--seed-as-of", dest="seed_as_of",
@@ -2338,7 +2338,11 @@ def _v3_distribution(plan: generation_policy.Plan, proposals: Sequence[Proposal]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "generate" and args.seed_as_of and not args.warm_start:
+        parser.error("--seed-as-of is supported only with --warm-start; ordinary V3/V2 "
+                     "generation does not have point-in-time archive/coverage snapshots")
     with research_db.ResearchDB.open(args.db) as db:
         if args.command == "diversity-report":
             import diversity
@@ -2377,6 +2381,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             proposals = generator.proposals(count=args.count, family=args.family, dataset=args.dataset,
                                             all_fields=args.all_fields, template=args.template,
                                             truncation=args.truncation)
+            if args.dry_plan:
+                # The legacy control arm must honor the exact same no-queue dry-run contract.
+                # Never expose private expressions in a planning summary.
+                print(json.dumps({
+                    "generator_version": LEGACY_GENERATOR_VERSION,
+                    "campaign_id": args.campaign,
+                    "planned_budget": len(proposals),
+                    "family": _counts(proposal.family for proposal in proposals),
+                    "template": _counts(str(proposal.parameters.get("template") or "") for proposal in proposals),
+                    "dataset": _counts(str(proposal.parameters.get("dataset") or "") for proposal in proposals),
+                    "queued": 0,
+                }, indent=2, sort_keys=True))
+                return 0
             print(json.dumps(generator.queue(args.campaign, proposals), indent=2, sort_keys=True))
         elif args.command == "crossover":
             for parent_id in (args.parent_a, args.parent_b):

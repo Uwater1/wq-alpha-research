@@ -155,7 +155,13 @@ def test_efficiency_passes_only_above_the_material_ratio(db):
     assert checklist["correlation_and_robustness"]["status"] == "unknown"
     assert checklist["reproducible_from_config"]["status"] == "unknown"
     assert payload["gate"]["promoted"] is False
-    assert set(payload["gate"]["blocking"]) == {"correlation_and_robustness", "reproducible_from_config"}
+    assert set(payload["gate"]["blocking"]) == {
+        "correlation_and_robustness", "reproducible_from_config",
+        "no_point_in_time_leakage", "matched_live_comparison",
+    }
+    assert checklist["no_point_in_time_leakage"]["status"] == "unknown"
+    assert checklist["matched_live_comparison"]["status"] == "unknown"
+    assert payload["comparison_design"] == "pooled_historical_by_generator_version_unmatched"
 
 
 def test_a_thin_arm_cannot_claim_a_promotion(db):
@@ -187,3 +193,66 @@ def test_report_is_point_in_time_bounded(db):
     assert payload["target_metrics"]["simulations"] == 3
     cold = promotion_gate.report(db, as_of="2000-01-01T00:00:00", min_sample=1)
     assert cold["target_metrics"]["simulations"] == 0
+
+
+def test_legacy_v2_dry_plan_never_queues_candidates_or_research_trials(tmp_path, capsys):
+    path = tmp_path / "dry-v2.db"
+    assert generator.main([
+        "generate", "--campaign", "dry-v2", "--legacy-v2",
+        "--dry-plan", "--count", "6", "--seed", "3", "--db", str(path),
+    ]) == 0
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert payload["generator_version"] == generator.LEGACY_GENERATOR_VERSION
+    assert payload["queued"] == 0
+    assert payload["planned_budget"] > 0
+    assert "expression" not in str(payload)
+    with research_db.ResearchDB.open(path) as store:
+        assert store.query("SELECT COUNT(*) AS n FROM candidates")[0]["n"] == 0
+        assert store.query("SELECT COUNT(*) AS n FROM research_trials")[0]["n"] == 0
+
+
+def test_v2_only_dry_plan_flags_route_implicitly_without_queue_writes(tmp_path, capsys):
+    path = tmp_path / "dry-v2-implied.db"
+    assert generator.main([
+        "generate", "--campaign", "dry-v2-implied", "--template", generator.SIGNAL_TEMPLATES[0].id,
+        "--dry-plan", "--count", "4", "--seed", "1", "--db", str(path),
+    ]) == 0
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert payload["generator_version"] == generator.LEGACY_GENERATOR_VERSION
+    with research_db.ResearchDB.open(path) as store:
+        assert store.query("SELECT COUNT(*) AS n FROM candidates")[0]["n"] == 0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_seed_as_of_does_not_silently_time_travel_for_non_warm_start(tmp_path, legacy):
+    argv = ["generate", "--campaign", "bad-clock", "--dry-plan",
+            "--seed-as-of", "2026-01-01T00:00:00", "--db", str(tmp_path / "bad.db")]
+    if legacy:
+        argv.append("--legacy-v2")
+    with pytest.raises(SystemExit) as exc:
+        generator.main(argv)
+    assert exc.value.code == 2
+
+
+def test_v2_legacy_skeleton_diversity_is_rebuilt_from_stored_expressions(db):
+    _settle(db, "rank(close)", version="catalog-generator-v2",
+            is_pass=True, campaign="v2-one")
+    _settle(db, "ts_rank(close,22)", version="catalog-generator-v2",
+            is_pass=True, campaign="v2-two")
+    rows = [dict(row) for row in db.query(promotion_gate._LEDGER_SQL)]
+    assert all(not row["grammar_skeleton_hash"] for row in rows)
+    result = promotion_gate.survivor_diversity(rows)
+    assert result["survivors"] == 2
+    assert result["reconstructed_grammar"] == 2
+    assert result["reconstructed_semantic"] == 2
+    assert result["missing_grammar"] == result["missing_semantic"] == 0
+    assert result["effective_grammar"] == pytest.approx(2.0)
+
+
+def test_unknown_structure_is_not_counted_as_a_diverse_skeleton():
+    report = promotion_gate.survivor_diversity([
+        {"sim_is_pass": True, "normalized_expression": ""},
+    ])
+    assert report["effective_grammar"] is None
+    assert report["effective_semantic"] is None
+    assert report["missing_grammar"] == 1
