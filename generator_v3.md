@@ -13,17 +13,19 @@ The remaining problem is **research quality, not generator plumbing**:
 - [x] Point-in-time selection replay infrastructure complete (distinct from generator counterfactual replay).
 - [x] Small live V3 campaigns executed.
 - [x] **V3 promoted to default** (`python -m wq generate`; V2 is `--legacy-v2`).
-- [x] V2 remains reachable as the explicit control arm.
+- [x] V2 remains reachable as the explicit control arm. `--legacy-v2 --dry-plan` must not queue candidates; `--seed-as-of` is rejected outside warm-start.
 
-Promotion evidence (`scripts/promotion_gate.py`, settled ledger):
+**Descriptive historical ledger only**, not a matched prospective experiment (`scripts/promotion_gate.py`):
 
 ```text
-catalog-generator-v2    123 sims    9 IS pass    7.3%   ci95 [3.9%, 13.3%]   survivor eff. grammar 1.0
-catalog-generator-v3    540 sims   96 IS pass   17.8%   ci95 [14.8%, 21.2%]  survivor eff. grammar 40.6
-efficiency ratio       2.43x (material bar 1.25x)
+catalog-generator-v2    123 sims    9 IS pass    7.3%   ci95 [3.9%, 13.3%]
+catalog-generator-v3    540 sims   96 IS pass   17.8%   ci95 [14.8%, 21.2%]
+pooled observed ratio   2.43x (not causal or matched)
 ```
 
-The original 0/138 result was a search-distribution failure, and it was localized to two fixes rather than more grammar: the recipe grid could not express the truncation `0.08` the platform was actually paying for (P21.3), and a child's edit budget was capped below the size of the proven parents it was editing, so every derivation of them silently degraded to fresh exploration (P22.2). Two gate items remain `unknown` (downstream BRAIN correlation/robustness, and configuration-replay reproducibility) and the gate therefore still reports `promoted: false`; the efficiency and survivor-diversity halves are met.
+The former "V2 effective grammar 1.0" was an artifact of null V3-only skeleton-hash columns. The corrected gate reconstructs hashes for legacy records; the true ledger-wide V2/V3 diversity comparison needs a rerun on the private database.
+
+The original 0/138 result was a search-distribution failure, and it was localized to two fixes rather than more grammar: the recipe grid could not express the truncation `0.08` the platform was actually paying for (P21.3), and a child's edit budget was capped below the size of the proven parents it was editing, so every derivation of them silently degraded to fresh exploration (P22.2). The final gate still reports `promoted: false`: matched prospective arms, historical generator causality, correlation/robustness and configuration replay remain unverified. V3 is an **operational/provisional** default, not a fully validated winner. Existing historical IS-pass evidence is useful for prioritizing live tests, not for claiming downstream submission value.
 
 ## Implemented core — P0–P15
 
