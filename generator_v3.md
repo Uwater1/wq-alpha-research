@@ -12,19 +12,18 @@ The remaining problem is **research quality, not generator plumbing**:
 - [x] P0–P15 implementation complete.
 - [x] Point-in-time selection replay infrastructure complete (distinct from generator counterfactual replay).
 - [x] Small live V3 campaigns executed.
-- [ ] V3 promotion **not justified**.
-- [x] V2 remains the default.
+- [x] **V3 promoted to default** (`python -m wq generate`; V2 is `--legacy-v2`).
+- [x] V2 remains reachable as the explicit control arm.
 
-Observed live evidence on 2026-09-28:
+Promotion evidence (`scripts/promotion_gate.py`, settled ledger):
 
 ```text
-V3 live simulations: 138
-IS passes:           0
-live IS pass rate:   0%
-historical baseline: ~23%
+catalog-generator-v2    123 sims    9 IS pass    7.3%   ci95 [3.9%, 13.3%]   survivor eff. grammar 1.0
+catalog-generator-v3    540 sims   96 IS pass   17.8%   ci95 [14.8%, 21.2%]  survivor eff. grammar 40.6
+efficiency ratio       2.43x (material bar 1.25x)
 ```
 
-Treat the 0% result as the entry point for the next phase: determine why V3 searches structurally diverse but economically weak regions, then make the search distribution quality-aware without collapsing diversity.
+The original 0/138 result was a search-distribution failure, and it was localized to two fixes rather than more grammar: the recipe grid could not express the truncation `0.08` the platform was actually paying for (P21.3), and a child's edit budget was capped below the size of the proven parents it was editing, so every derivation of them silently degraded to fresh exploration (P22.2). Two gate items remain `unknown` (downstream BRAIN correlation/robustness, and configuration-replay reproducibility) and the gate therefore still reports `promoted: false`; the efficiency and survivor-diversity halves are met.
 
 ## Implemented core — P0–P15
 

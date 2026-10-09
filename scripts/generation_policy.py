@@ -185,6 +185,8 @@ class Plan:
     operator_preference: Mapping[str, Any] = dataclass_field(default_factory=dict)
     #: Mode weights before and after quality conditioning (P22.3).
     mode_weights: Mapping[str, float] = dataclass_field(default_factory=dict)
+    #: Measured parent-quality retention per mutation operation (P22.1).
+    mutation_quality: Mapping[str, Any] = dataclass_field(default_factory=dict)
 
     @property
     def planned_budget(self) -> int:
@@ -228,6 +230,7 @@ class Plan:
                              for dimension, counts in self.recipe_prior.items()},
             "recipe_prior_dimensions": sorted(str(name) for name in self.recipe_prior),
             "operator_preference": dict(self.operator_preference),
+            "mutation_quality": dict(self.mutation_quality),
             "slots": [slot.as_dict() for slot in self.slots],
         }
 
@@ -635,6 +638,40 @@ def mutation_operation_outcome_stats(db: Any, *, generator_version: str | None =
         return {}
 
 
+#: Weight of the P22.1 destruction penalty: a destructive operation gives up this fraction of
+#: its observed passes before the Thompson draw. Bounded below by the exploration floor, so a
+#: penalized edit is retested rather than deleted.
+DESTRUCTION_PENALTY = 0.5
+
+
+def penalized_operation_stats(
+    stats: Mapping[str, tuple[int, int]] | None,
+    destruction: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    penalty: float = DESTRUCTION_PENALTY,
+) -> dict[str, tuple[int, int]]:
+    """Discount an operation's observed passes by how often it dismantled its parent (P22.1).
+
+    ``allocate_mutation_operations`` ranks edits by raw pass count, which cannot tell a real
+    discovery from an edit that spends slots while destroying the parent's quality. The
+    retention measured in :func:`seed_bank.operation_quality_retention` is spent here: an
+    operation whose children drop below their parent loses ``destruction x penalty`` of its
+    passes. The result never goes negative, an unmeasured or thin operation is left untouched,
+    and the exploration floor in :func:`allocate_motifs` still guarantees it is retested.
+    """
+    base = {str(name): (int(value[0]), int(value[1])) for name, value in (stats or {}).items()}
+    table = destruction or {}
+    adjusted: dict[str, tuple[int, int]] = {}
+    for name, (attempts, passes) in base.items():
+        info = table.get(name) if isinstance(table, Mapping) else None
+        if not info or info.get("destruction") is None or info.get("low_confidence"):
+            adjusted[name] = (attempts, passes)
+            continue
+        cut = int(round(float(info["destruction"]) * attempts * max(0.0, float(penalty))))
+        adjusted[name] = (attempts, max(0, passes - cut))
+    return adjusted
+
+
 def allocate_mutation_operations(
     operations: Sequence[str],
     budget: int,
@@ -643,16 +680,20 @@ def allocate_mutation_operations(
     seed: int = 0,
     exploration_floor: float = DEFAULT_MOTIF_EXPLORATION_FLOOR,
     max_share: float = DEFAULT_MOTIF_MAX_SHARE,
+    destruction: Mapping[str, Mapping[str, Any]] | None = None,
+    penalty: float = DESTRUCTION_PENALTY,
 ) -> dict[str, int]:
-    """Bounded adaptive allocation of mutate slots across concrete operations (P9.2).
+    """Bounded adaptive allocation of mutate slots across concrete operations (P9.2/P22.1).
 
     Same guarantees as :func:`allocate_motifs`, for the structural mutation vocabulary:
     slots sum to exactly ``budget``, untested operations keep an exploration floor so a new
     edit can still be discovered, and a successful operation earns more budget without ever
-    monopolizing the campaign.
+    monopolizing the campaign. ``destruction`` (the P22.1 retention table, keyed by operation)
+    discounts edits whose live children repeatedly destroy their parent's quality.
     """
+    adjusted = penalized_operation_stats(stats, destruction, penalty=penalty)
     return allocate_motifs(
-        operations, budget, stats,
+        operations, budget, adjusted,
         seed=seed, exploration_floor=exploration_floor, max_share=max_share,
     )
 
@@ -1332,9 +1373,22 @@ def plan_campaign(
     # concrete structural edits from their corrected historical outcomes, so a successful
     # operation earns more budget while an untested one keeps an exploration floor.
     mutation_stats = mutation_operation_outcome_stats(db, generator_version=generator_version or None)
+    # P22.1: measure how often each edit keeps its parent's quality, so the allocation can price
+    # a destroyer below a discoverer with the same raw pass count.
+    destruction: dict[str, Any] = {}
+    if db is not None:
+        try:
+            import seed_bank  # local: keeps the module import graph acyclic
+
+            destruction = seed_bank.operation_quality_retention(
+                db, child_versions=[generator_version] if generator_version else None,
+            )
+        except Exception:  # pragma: no cover - advisory only
+            destruction = {}
     mutation_budget = allocate_mutation_operations(
         list(V3_MUTATION_OPERATIONS), sum(1 for mode in modes if mode == "mutate"), mutation_stats,
         seed=seed, exploration_floor=exploration_floor, max_share=motif_max_share,
+        destruction=destruction,
     )
     remaining_mutation_budget = dict(mutation_budget)
 
@@ -1625,6 +1679,7 @@ def plan_campaign(
         max_family_share=float(max_family_share),
         motif_allocation=dict(motif_budget),
         mutation_allocation=dict(mutation_budget),
+        mutation_quality=dict(destruction),
         archive_refresh=archive_refreshed,
         forced_motif=force_motif or "",
         quality_allocation=quality_report,

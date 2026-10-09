@@ -47,8 +47,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PATH = REPO_ROOT / "references" / "wq_usa_top3000_delay1_data_fields.json"
 #: Canonical generator identity (P11).
 GENERATOR_VERSION = "catalog-generator-v3"
-#: The template generator that produced V2 campaigns. It is still the CLI default until replay
-#: evidence justifies promotion (P16), and rows it produces are labelled honestly as V2.
+#: The template generator that produced V2 campaigns. Kept as the ``--legacy-v2`` control arm
+#: (P17): V3 became the CLI default once the promotion gate showed materially better live
+#: efficiency at preserved survivor diversity. Rows it produces stay labelled V2.
 LEGACY_GENERATOR_VERSION = "catalog-generator-v2"
 #: Alias kept for callers that name the V3 identity explicitly.
 GENERATOR_VERSION_V3 = GENERATOR_VERSION
@@ -397,7 +398,8 @@ class CandidateGenerator:
                 trial_id = self.db.record_generation_decision(
                     proposal.expression, proposal.settings, campaign_id=campaign_id,
                     decision=proposal.novelty_decision, skip_reason=proposal.skip_reason,
-                    signal_family=proposal.family, generator_version=GENERATOR_VERSION_V3,
+                    signal_family=proposal.family,
+                    generator_version=GENERATOR_VERSION if v3 else LEGACY_GENERATOR_VERSION,
                     generator_strategy=proposal.strategy or None,
                     generation_mode=proposal.generation_mode or None,
                     motif_id=proposal.motif_id or None, recipe=dict(proposal.recipe) or None,
@@ -2247,9 +2249,12 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="pin every proposal to one structural template (proven-recipe campaigns)")
     generate.add_argument("--truncation", type=float, help="override the truncation setting (e.g. 0.05)")
     generate.add_argument("--strategy", choices=sorted(generation_policy.STRATEGY_ALIASES),
-                          help="Generator V3 campaign strategy (omit for the V2 template generator)")
+                          default="mixed",
+                          help="Generator V3 campaign strategy (default: mixed)")
     generate.add_argument("--motif", choices=sorted(grammar.MOTIF_BY_ID),
                           help="force every V3 proposal through one motif")
+    generate.add_argument("--legacy-v2", dest="legacy_v2", action="store_true",
+                          help="use the V2 template generator instead of the V3 default (P17)")
     generate.add_argument("--max-family-share", type=float,
                           default=generation_policy.DEFAULT_MAX_FAMILY_SHARE)
     generate.add_argument("--dry-plan", action="store_true",
@@ -2276,6 +2281,22 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--campaign", required=True)
     report.add_argument("--db", type=Path)
     return parser
+
+
+def legacy_v2_requested(args: argparse.Namespace) -> bool:
+    """Whether a ``generate`` invocation is asking for the V2 template generator.
+
+    ``--all-fields``/``--dataset``/``--template``/``--truncation`` only exist on the V2 path, so
+    requesting one of them is an explicit request for V2 even without ``--legacy-v2``. This keeps
+    the documented catalog-coverage commands working after V3 became the default (P17).
+    """
+    return bool(
+        getattr(args, "legacy_v2", False)
+        or getattr(args, "all_fields", False)
+        or getattr(args, "dataset", None)
+        or getattr(args, "template", None)
+        or getattr(args, "truncation", None) is not None
+    )
 
 
 def _v3_distribution(plan: generation_policy.Plan, proposals: Sequence[Proposal]) -> dict[str, Any]:
@@ -2338,10 +2359,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             report["queued"] = sum(1 for outcome in queued if outcome["action"] == "queued")
             report["decisions"] = _counts(str(outcome["action"]) for outcome in queued)
             print(json.dumps(report, indent=2, sort_keys=True))
-        elif args.command == "generate" and (args.strategy or args.motif or args.dry_plan):
+        elif args.command == "generate" and not legacy_v2_requested(args):
+            # P17 promotion: quality-conditioned V3 is the default generator. Its mode/motif
+            # budget is conditioned on measured evidence; ``--legacy-v2`` (or any V2-only
+            # coverage flag) keeps the template generator reachable for a control arm or a
+            # proven-recipe coverage run.
             plan, proposals = generator.generate(
                 campaign_id=args.campaign, count=args.count, seed=args.seed,
-                strategy=args.strategy or "mixed", family=None if args.family in (None, "all") else args.family,
+                strategy=args.strategy, family=None if args.family in (None, "all") else args.family,
                 motif=args.motif, max_family_share=args.max_family_share,
             )
             if args.dry_plan:

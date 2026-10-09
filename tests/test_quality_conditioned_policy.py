@@ -464,6 +464,92 @@ def test_conditioned_exploitation_does_not_depend_on_the_catalog_shape(db, catal
     assert prior.lookup(qp.Context(motif_id="ratio")).backed_off is True
 
 
+# ---------------------------------------------------------------------------
+# P22.1: penalize edits whose children destroy parent quality
+# ---------------------------------------------------------------------------
+
+
+def _settle_child(db, expression, *, parent_ids, operation, sharpe,
+                  version="catalog-generator-v3"):
+    outcome = db.queue_candidate(
+        expression, {"decay": 8}, signal_family="pv1", generator_version=version,
+        parent_ids=tuple(parent_ids), mutation_type=operation,
+        mutation_parameters={"operation": operation, "realized_operation": operation},
+    )
+    claimed = db.claim_simulation("t", candidate_id=outcome.candidate_id)
+    passed = sharpe >= 1.25
+    db.record_simulation_result(
+        candidate_id=claimed["id"], status="DONE",
+        metrics={"sharpe": sharpe, "fitness": 1.0, "turnover": 0.1},
+        checks=[{"name": "IS", "result": "PASS" if passed else "FAIL"}],
+        brain_alpha_id=f"A{outcome.candidate_id}",
+    )
+    return outcome.candidate_id
+
+
+def test_operation_retention_measures_children_that_drop_below_their_parent(db):
+    parent = _settle(db, "rank(close)", version="catalog-generator-v3", is_pass=True, sharpe=2.0)
+    # Two add_component children dismantle the parent; one group_change child improves it.
+    _settle_child(db, "rank(open)", parent_ids=[parent], operation="add_component", sharpe=0.3)
+    _settle_child(db, "rank(high)", parent_ids=[parent], operation="add_component", sharpe=0.4)
+    _settle_child(db, "group_rank(ts_rank(ebit,126),industry)", parent_ids=[parent],
+                  operation="group_change", sharpe=2.5)
+    report = seed_bank.operation_quality_retention(db, min_sample=1)
+    assert report["add_component"]["destruction"] == pytest.approx(1.0)
+    assert report["group_change"]["retention"] == pytest.approx(1.0)
+
+
+def test_destruction_penalty_discounts_passes_without_going_negative():
+    stats = {"add_component": (20, 10), "group_change": (20, 10)}
+    destruction = {
+        "add_component": {"destruction": 0.9, "low_confidence": False},
+        "group_change": {"destruction": 0.0, "low_confidence": False},
+    }
+    adjusted = policy.penalized_operation_stats(stats, destruction, penalty=0.5)
+    assert adjusted["add_component"][0] == 20
+    assert adjusted["add_component"][1] < adjusted["group_change"][1]
+    assert adjusted["add_component"][1] >= 0
+    # An extra-strong penalty still cannot drive the count below zero.
+    clamped = policy.penalized_operation_stats(stats, {
+        "add_component": {"destruction": 1.0, "low_confidence": False},
+    }, penalty=10.0)
+    assert clamped["add_component"] == (20, 0)
+    # A thin or unmeasured operation is not judged.
+    assert policy.penalized_operation_stats(stats, {
+        "add_component": {"destruction": 1.0, "low_confidence": True},
+    })["add_component"] == (20, 10)
+    assert policy.penalized_operation_stats(stats, {}) == {name: tuple(value) for name, value in stats.items()}
+
+
+def test_the_allocator_spends_fewer_slots_on_a_destructive_operation():
+    # The allocator's share cap floors at an even split, so the effect is only visible with
+    # more operations than a 50/50 pair (which is pinned to an equal split by construction).
+    operations = list(policy.V3_MUTATION_OPERATIONS)
+    stats = {name: (40, 20) for name in operations}
+    base = policy.allocate_mutation_operations(operations, 30, stats, seed=1)
+    destruction = {
+        name: {"destruction": 1.0 if name == "add_component" else 0.0,
+               "low_confidence": False}
+        for name in operations
+    }
+    adjusted = policy.allocate_mutation_operations(
+        operations, 30, stats, seed=1, destruction=destruction,
+    )
+    assert sum(adjusted.values()) == 30
+    assert adjusted["add_component"] < adjusted["group_change"]
+    assert adjusted["add_component"] <= base["add_component"]
+
+
+def test_the_plan_reports_the_retention_it_used(db, catalog):
+    parent = _settle(db, "rank(close)", version="catalog-generator-v3", is_pass=True, sharpe=2.0)
+    _settle_child(db, "rank(open)", parent_ids=[parent], operation="add_component", sharpe=0.2)
+    plan = generator.CandidateGenerator(db, catalog, seed=5).plan(
+        campaign_id="p22", budget=8, seed=5, mode="mutate",
+    )
+    assert plan.as_dict()["mutation_quality"] == plan.mutation_quality
+    assert "add_component" in plan.mutation_quality
+
+
 def test_seed_context_includes_the_proven_recipe_and_source(db, catalog):
     _settle(db, "group_rank(ts_rank(ebit,126),industry)",
             settings={"decay": 8, "truncation": 0.08, "neutralization": "SUBINDUSTRY"})

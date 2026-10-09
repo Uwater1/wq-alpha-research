@@ -421,6 +421,83 @@ def distance_outcomes(
     }
 
 
+#: How much a child's measured quality has to fall below its parent's before the edit is
+#: counted as destroying parent quality (P22.1). Zero means "any drop counts".
+DESTRUCTION_TOLERANCE = 0.0
+
+
+def _pair_quality(simulation: Mapping[str, Any] | None) -> tuple[int, float] | None:
+    """A comparable quality for parent/child: gate stage first, then Sharpe as the tiebreak."""
+    if not simulation or str(simulation.get("status") or "") != "DONE":
+        return None
+    sharpe = simulation.get("sharpe")
+    if not isinstance(sharpe, (int, float)) or isinstance(sharpe, bool):
+        return None
+    return (1 if simulation.get("is_pass") else 0, float(sharpe))
+
+
+def operation_quality_retention(
+    db: research_db.ResearchDB,
+    *,
+    child_versions: Sequence[str] | None = None,
+    min_sample: int = 3,
+) -> dict[str, dict[str, Any]]:
+    """Per mutation operation: how often a live child kept its parent's quality (P22.1).
+
+    ``allocate_mutation_operations`` ranks edits by raw pass count, which cannot see the
+    difference between an edit that discovers a *new* good region and one that keeps spending
+    slots while dismantling whatever the parent had. This measures the second directly, from
+    settled lineage pairs only: a child's quality is the (gate stage, Sharpe) pair, and the
+    operation is charged with a destruction whenever the child drops below its parent.
+    """
+    wanted = {str(value) for value in child_versions} if child_versions else None
+    rows = db.query("SELECT * FROM candidates")
+    by_id = {int(row["id"]): row for row in rows}
+    latest: dict[int, dict[str, Any]] = {}
+    for simulation in db.query("SELECT * FROM simulations ORDER BY id"):
+        if simulation.get("candidate_id") is not None:
+            latest[int(simulation["candidate_id"])] = dict(simulation)  # later rows win
+    tally: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # operation -> [children, retained]
+    for row in rows:
+        if wanted is not None and str(row.get("generator_version") or "") not in wanted:
+            continue
+        parameters = _json_map(row.get("mutation_parameters_json"))
+        operation = canonical.normalize_mutation_operation(
+            parameters.get("realized_operation") or parameters.get("operation")
+            or row.get("mutation_type")
+        )
+        if not operation:
+            continue
+        try:
+            parent_ids = [int(value) for value in json.loads(str(row.get("parent_ids_json") or "[]"))]
+        except (TypeError, ValueError):
+            parent_ids = []
+        if not parent_ids:
+            continue
+        child_quality = _pair_quality(latest.get(int(row["id"])))
+        parent_quality = _pair_quality(latest.get(parent_ids[0]))
+        if child_quality is None or parent_quality is None:
+            continue
+        entry = tally[operation]
+        entry[0] += 1
+        if child_quality[0] > parent_quality[0] or (
+            child_quality[0] == parent_quality[0]
+            and child_quality[1] >= parent_quality[1] - DESTRUCTION_TOLERANCE
+        ):
+            entry[1] += 1
+    report: dict[str, dict[str, Any]] = {}
+    for operation, (children, retained) in sorted(tally.items()):
+        rate = retained / children if children else None
+        report[operation] = {
+            "children": children,
+            "retained": retained,
+            "retention": rate,
+            "destruction": (1.0 - rate) if rate is not None else None,
+            "low_confidence": children < int(min_sample),
+        }
+    return report
+
+
 def proven_recipe_prior(seeds: Sequence[Seed]) -> dict[str, dict[str, int]]:
     """Value counts per recipe dimension among proven seeds (P21.3 / P22.1).
 

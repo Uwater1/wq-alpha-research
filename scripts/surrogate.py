@@ -24,7 +24,12 @@ if str(SCRIPT_DIR) not in sys.path:
 import research_db
 
 MODEL_META_KEY = "surrogate_model_v1"
-TARGETS = ("is_pass", "sharpe", "fitness", "turnover")
+#: Binary gate-failure targets (P24.2): a refused candidate usually fails one specific check,
+#: and "will BRAIN refuse this for LOW_SHARPE" is a more learnable question than "will it pass".
+FAILURE_TARGET_CHECKS = {"low_sharpe": "LOW_SHARPE", "low_fitness": "LOW_FITNESS"}
+#: Targets that are probabilities and must be bounded like one wherever they are consumed.
+BINARY_TARGETS = ("is_pass", "low_sharpe", "low_fitness")
+TARGETS = ("is_pass", "low_sharpe", "low_fitness", "sharpe", "fitness", "turnover")
 
 
 def _token_features(row: Mapping[str, Any]) -> dict[str, float]:
@@ -158,7 +163,7 @@ def _enrich_with_parents(db: Any, rows: list[dict[str, Any]]) -> list[dict[str, 
 def _rows(db: Any, *, training: bool) -> list[dict[str, Any]]:
     if training:
         query = """
-            SELECT c.*, s.completed_at AS outcome_at,
+            SELECT c.*, s.completed_at AS outcome_at, s.checks_json AS checks_json,
                    (
                        SELECT MIN(e.id) FROM events e
                        WHERE e.entity='simulation'
@@ -207,7 +212,30 @@ def _ridge_fit(x: np.ndarray, y: np.ndarray, penalty: float,
     return [float(value) for value in weights]
 
 
+def _checks_rows(row: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """The settled BRAIN checks of one row, or ``None`` when there are none to read."""
+    raw = row.get("checks_json")
+    if raw is None:
+        return None
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else None
+
+
 def _target(row: Mapping[str, Any], target: str) -> float | None:
+    if target in FAILURE_TARGET_CHECKS:
+        checks = _checks_rows(row)
+        if checks is None:
+            return None
+        wanted = FAILURE_TARGET_CHECKS[target]
+        refused = any(
+            str(check.get("name") or "").upper() == wanted
+            and str(check.get("result") or "").upper() not in ("", "PASS")
+            for check in checks
+        )
+        return 1.0 if refused else 0.0
     if target == "is_pass":
         value = row.get("is_pass")
     else:
@@ -261,7 +289,7 @@ def train_model(rows: list[Mapping[str, Any]], *, penalty: float = 1.0, min_samp
         y = np.asarray([value for _, value in usable], dtype=float)
         weights = _ridge_fit(x[indexes], y, penalty, feature_names)
         predictions = x[indexes] @ np.asarray(weights)
-        if target == "is_pass":
+        if target in BINARY_TARGETS:
             predictions = np.clip(predictions, 0.0, 1.0)
         models[target] = {"weights": weights, "samples": len(y)}
         diagnostics[target] = {
@@ -303,8 +331,147 @@ def predict(model: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, float
         if len(weights) != matrix.shape[1]:
             continue
         value = float(matrix[0] @ weights)
-        result[target] = max(0.0, min(1.0, value)) if target == "is_pass" else value
+        result[target] = max(0.0, min(1.0, value)) if target in BINARY_TARGETS else value
     return result
+
+
+# ---------------------------------------------------------------------------
+# P24.3: calibration and fixed-budget capture
+# ---------------------------------------------------------------------------
+
+
+def brier_score(actual: Iterable[float], predicted: Iterable[float]) -> float:
+    """Mean squared error of a probability forecast (lower is better)."""
+    pairs = [(float(a), float(p)) for a, p in zip(actual, predicted)]
+    if not pairs:
+        return 0.0
+    return float(np.mean([(p - a) ** 2 for a, p in pairs]))
+
+
+def log_loss(actual: Iterable[float], predicted: Iterable[float], *, epsilon: float = 1e-6) -> float:
+    """Binary cross-entropy with the prediction clipped away from 0/1 (lower is better)."""
+    pairs = [(float(a), float(p)) for a, p in zip(actual, predicted)]
+    if not pairs:
+        return 0.0
+    total = 0.0
+    for a, p in pairs:
+        q = max(epsilon, min(1.0 - epsilon, p))
+        total += a * math.log(q) + (1.0 - a) * math.log(1.0 - q)
+    return float(-total / len(pairs))
+
+
+def reliability_table(actual: Iterable[float], predicted: Iterable[float], *,
+                      bins: int = 10) -> list[dict[str, Any]]:
+    """Prediction bins with their observed frequency, so calibration is inspectable."""
+    pairs = [(float(a), float(p)) for a, p in zip(actual, predicted)]
+    if not pairs:
+        return []
+    width = 1.0 / max(1, int(bins))
+    buckets: list[list[tuple[float, float]]] = [[] for _ in range(max(1, int(bins)))]
+    for a, p in pairs:
+        index = min(len(buckets) - 1, max(0, int(p / width)))
+        buckets[index].append((a, p))
+    table: list[dict[str, Any]] = []
+    for index, members in enumerate(buckets):
+        if not members:
+            continue
+        table.append({
+            "bin": index,
+            "low": round(index * width, 4),
+            "high": round((index + 1) * width, 4),
+            "count": len(members),
+            "mean_predicted": round(float(np.mean([p for _, p in members])), 6),
+            "observed_rate": round(float(np.mean([a for a, _ in members])), 6),
+        })
+    return table
+
+
+def calibration_report(actual: Iterable[float], predicted: Iterable[float], *,
+                       bins: int = 10) -> dict[str, Any]:
+    """Brier / log loss / reliability plus the base rate the model must beat (P24.3)."""
+    actual_list = [float(value) for value in actual]
+    predicted_list = [float(value) for value in predicted]
+    if not actual_list:
+        return {"samples": 0}
+    base_rate = float(np.mean(actual_list))
+    return {
+        "samples": len(actual_list),
+        "base_rate": round(base_rate, 6),
+        # A constant base-rate forecast is the simple prior a complex model has to beat.
+        "base_rate_brier": round(base_rate * (1.0 - base_rate), 6),
+        "brier": round(brier_score(actual_list, predicted_list), 6),
+        "log_loss": round(log_loss(actual_list, predicted_list), 6),
+        "reliability": reliability_table(actual_list, predicted_list, bins=bins),
+    }
+
+
+def _capture(order: Sequence[int], actual: Sequence[bool], budget: int) -> int:
+    """Actual IS passes among the first ``budget`` rows of one ordering (P24.3)."""
+    return sum(1 for index in list(order)[: max(0, int(budget))] if actual[index])
+
+
+def walk_forward(db: Any, *, folds: int = 4, min_train: int = 5,
+                 penalty: float = 1.0, seed: int = 0) -> dict[str, Any]:
+    """Expanding-window out-of-sample evaluation of ``is_pass`` (P24.3).
+
+    The chronological 70/30 holdout in :func:`evaluate` is a single split. This refits on every
+    prefix and scores the next window, so a favourable split cannot masquerade as a calibrated
+    model, and reports the pooled Brier / log loss / reliability across the folds.
+    """
+    rows = sorted(
+        training_rows(db),
+        key=lambda row: (str(row.get("outcome_at") or ""), int(row.get("outcome_event_id") or 0),
+                         int(row.get("id") or 0)),
+    )
+    total = len(rows)
+    if total < int(min_train) + 1:
+        return {"available": False, "reason": "insufficient_history", "samples": total}
+    matrix, feature_names = _matrix(rows)
+    fold_count = max(1, min(int(folds), total - int(min_train)))
+    chunk = max(1, (total - int(min_train)) // fold_count)
+    actual: list[bool] = []
+    predicted: list[float] = []
+    per_fold: list[dict[str, Any]] = []
+    for fold in range(fold_count):
+        start = int(min_train) + fold * chunk
+        stop = total if fold == fold_count - 1 else min(start + chunk, total)
+        test_indexes = list(range(start, stop))
+        if not test_indexes:
+            continue
+        usable = [(index, _target(rows[index], "is_pass")) for index in range(0, start)]
+        usable = [(index, value) for index, value in usable
+                  if value is not None and math.isfinite(value)]
+        if len(usable) < int(min_train):
+            per_fold.append({"fold": fold, "skipped": True, "train": start})
+            continue
+        train_indexes = [index for index, _ in usable]
+        y_train = np.asarray([value for _, value in usable], dtype=float)
+        weights = np.asarray(_ridge_fit(matrix[train_indexes], y_train, penalty, feature_names),
+                             dtype=float)
+        if len(weights) == matrix.shape[1]:
+            fold_pred = np.clip(matrix[test_indexes] @ weights, 0.0, 1.0)
+        else:  # pragma: no cover - feature set is derived from the full matrix above
+            fold_pred = np.full(len(test_indexes), float(y_train.mean()))
+        fold_actual = [bool(rows[index].get("is_pass")) for index in test_indexes]
+        actual.extend(fold_actual)
+        predicted.extend(float(value) for value in fold_pred)
+        per_fold.append({
+            "fold": fold,
+            "train": len(train_indexes),
+            "test": len(test_indexes),
+            "pass_rate": round(sum(fold_actual) / len(fold_actual), 6),
+            "mean_prediction": round(float(np.mean(fold_pred)), 6),
+        })
+    if not actual:
+        return {"available": False, "reason": "insufficient_history", "samples": total,
+                "folds": per_fold}
+    return {
+        "available": True,
+        "samples": total,
+        "folds": per_fold,
+        "seed": int(seed),
+        "calibration": calibration_report(actual, predicted),
+    }
 
 
 def rank_advisory(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -362,6 +529,23 @@ def evaluate(db: Any, *, top_k: int = 10, penalty: float = 1.0) -> dict[str, Any
     test_pred = np.clip(test_x @ weights, 0.0, 1.0) if len(weights) == test_x.shape[1] else np.zeros(len(test_rows))
     order = sorted(range(len(test_rows)), key=lambda i: test_pred[i], reverse=True)
     top = order[:min(top_k, len(test_rows))]
+    # P24.3: calibration of the held-out probability, and the passes a fixed simulation budget
+    # captures under this ordering versus the naive alternatives a complex model must beat.
+    actual = [bool(value) for value in test_actual]
+    predicted = [float(value) for value in test_pred]
+    budget = min(20, len(test_rows))
+    shuffled = np.random.default_rng(0).permutation(len(test_rows)).tolist()
+    capture = {
+        "budget": budget,
+        "test_size": len(test_rows),
+        "available_passes": sum(1 for value in actual if value),
+        "surrogate": _capture(order, actual, budget),
+        "fifo": _capture(list(range(len(test_rows))), actual, budget),
+        "random": _capture(shuffled, actual, budget),
+    }
+    capture["lift_over_fifo"] = (
+        round(capture["surrogate"] / capture["fifo"], 6) if capture["fifo"] else None
+    )
     return {
         "available": True, "oos": True, "samples": total,
         "train_samples": len(train_rows), "test_samples": len(test_rows),
@@ -378,6 +562,8 @@ def evaluate(db: Any, *, top_k: int = 10, penalty: float = 1.0) -> dict[str, Any
         "top_k": len(top),
         "top_pass_recall": round(sum(1 for i in top if test_actual[i]) / max(sum(1 for v in test_actual if v), 1), 6),
         "top_pass_rate": round(sum(1 for i in top if test_actual[i]) / max(len(top), 1), 6),
+        "calibration": calibration_report(actual, predicted),
+        "passes_per_budget": capture,
         "model": (load(db) or {}).get("diagnostics", {}),
     }
 
@@ -391,6 +577,9 @@ def main(argv: list[str] | None = None) -> int:
     train.add_argument("--min-samples", type=int, default=5)
     sub.add_parser("status")
     sub.add_parser("evaluate")
+    walk = sub.add_parser("walk-forward")
+    walk.add_argument("--folds", type=int, default=4)
+    walk.add_argument("--min-train", dest="min_train", type=int, default=5)
     rank = sub.add_parser("rank")
     rank.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
@@ -402,6 +591,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(model or {"available": False}, indent=2, sort_keys=True))
         elif args.command == "evaluate":
             print(json.dumps(evaluate(db), indent=2, sort_keys=True))
+        elif args.command == "walk-forward":
+            print(json.dumps(walk_forward(db, folds=args.folds, min_train=args.min_train),
+                             indent=2, sort_keys=True))
         else:
             print(json.dumps(rank_advisory(db, limit=args.limit), indent=2, sort_keys=True))
     return 0

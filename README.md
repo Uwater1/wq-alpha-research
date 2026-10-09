@@ -59,12 +59,15 @@ Research events are recorded in `research.db`, materialized as scoped observatio
 
 `scripts/evolve_skill.py` remains a legacy preview/reporting utility. It is not the normal learning path; do not use `--apply` or `--raw` for autonomous updates. Reviewed sanitized rules may be rendered through `scripts/skill_manager.py` after evidence and privacy checks.
 
-## Generator V3 (opt-in)
+## Generator V3 (default)
 
-The diversity-first generator is **not** the default: the template path above still runs unless
-`--strategy` (or `--motif` / `--dry-plan`) is supplied, and V3 rows are tagged
-`catalog-generator-v3`. It searches over motifs, AST structures, datasets and multi-field
-combinations instead of only field names.
+The quality-conditioned V3 generator **is** the default: `python -m wq generate` plans a campaign
+across explore/exploit/mutate/crossover, conditions the motif/recipe/mode budget on measured
+point-in-time evidence, and tags its rows `catalog-generator-v3`. It searches over motifs, AST
+structures, datasets and multi-field combinations instead of only field names. The template
+generator described above is now the explicit control arm, selected with `--legacy-v2` (or
+implicitly by a V2-only flag such as `--all-fields`, `--dataset`, `--template` or `--truncation`)
+and tagged `catalog-generator-v2`.
 
 ```bash
 # Plan a campaign across explore/exploit/mutate/crossover (no BRAIN calls, no queue writes)
@@ -85,10 +88,13 @@ produced. `diversity-report` separates exact, current-skeleton, grammar and sema
 and prints `exp(Shannon entropy)` effective counts, so 20 motifs used once each cannot look like
 20 motifs used evenly.
 
-Before promoting V3 over V2, benchmark both on the same corpus at equal simulation budget with
-point-in-time-safe replay:
+The promotion decision is reproducible from the ledger. The gate compares the two generator
+versions on settled simulations (efficiency with Wilson intervals, survivor diversity, and an
+explicit checklist that reports an unmeasured item as `unknown` rather than a pass), while the
+selection-policy replay benchmarks both on the same corpus at equal simulation budget:
 
 ```bash
+./.venv/bin/python scripts/promotion_gate.py --out promotion_gate.json
 ./.venv/bin/python scripts/policy_replay.py --compare --budget 20
 ```
 

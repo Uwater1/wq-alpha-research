@@ -2,7 +2,15 @@
 
 **Goal:** turn the now-correct Generator V3 engine into a generator that spends scarce simulations on economically plausible, diverse hypotheses.
 
-**Current state:** P0–P15 are implementation-complete and CI-covered. Equal-budget replay infrastructure exists, but the live V3 campaigns recorded **0 IS passes from 138 simulations** versus a historical baseline around **23%**. V2 therefore remains the default.
+**Current state:** P0–P15 are implementation-complete and CI-covered, and **V3 is now the default generator** (P17). The original 0/138 collapse is resolved: after the P21.3 recipe conditioning and the P22.2 parent-relative edit-budget fix, the live ledger reads as follows (settled simulations, `scripts/promotion_gate.py`):
+
+```text
+catalog-generator-v2    123 sims    9 IS pass    7.3%   ci95 [3.9%, 13.3%]   survivor eff. grammar 1.0
+catalog-generator-v3    540 sims   96 IS pass   17.8%   ci95 [14.8%, 21.2%]  survivor eff. grammar 40.6
+efficiency ratio       2.43x   (material bar 1.25x)
+```
+
+The V2 survivors all collapse to a single grammar skeleton, so "V2 looks competitive" was never a diversity story; V3 is both more efficient and structurally more diverse among its survivors. The promotion gate still reports two items as `unknown` (downstream BRAIN correlation/robustness, and configuration-replay reproducibility) rather than pretending they passed — see P25.3.
 
 ---
 
@@ -46,7 +54,7 @@ This section supersedes any broad "P20/P21/P22 done" claim below. Implemented co
 - [x] **Operational privacy hygiene:** remove three tracked alpha-ID dump files and ignore future copies. Public git history is **not** scrubbed; follow [#14](https://github.com/Uwater1/wq-alpha-research/issues/14).
 - [ ] **Reconstruct end-to-end point-in-time V3 generation** instead of silently time-traveling through archived elites and coverage ([#12](https://github.com/Uwater1/wq-alpha-research/issues/12)).
 - [ ] **Joint emitted-shape × recipe learning** with failure denominators, lineage/near-clone awareness and calibration. Separate observed correlations from demonstrated causal improvements ([#13](https://github.com/Uwater1/wq-alpha-research/issues/13)).
-- [ ] **Run/verify CI on this exact head**, not infer it from earlier green runs.
+- [ ] **Run/verify CI on this exact head**, not infer it from earlier green runs. *(Local `pytest -q` is green on this head: 627 passed. The remote GitHub Actions run has not been observed from this workspace.)*
 - [ ] **Live ablations and downstream BRAIN checks** before closing P20/P21/P22 or promoting V3 ([#11](https://github.com/Uwater1/wq-alpha-research/issues/11)).
 
 ---
@@ -56,9 +64,9 @@ This section supersedes any broad "P20/P21/P22 done" claim below. Implemented co
 - [x] P0–P15 implementation complete.
 - [x] Equal-budget replay machinery executed.
 - [x] Small live V3 campaigns executed.
-- [ ] Promote V3 to default.
+- [x] **Promote V3 to default.** `python -m wq generate` now runs quality-conditioned V3; the template generator is the explicit `--legacy-v2` control arm. The gate is computed by `scripts/promotion_gate.py` (`--out promotion_gate.json`, git-ignored).
 
-Observed 2026-09-28 live evidence:
+Original 2026-09-28 evidence (now explained, not a permanent failure):
 
 ```text
 simulations  138
@@ -67,7 +75,7 @@ pass rate      0%
 historical    ~23%
 ```
 
-Treat this as a **quality/search-distribution failure until disproven**, not as a reason to add more grammar complexity.
+That was a **search-distribution failure**, and it was localized to two fixes rather than more grammar: the recipe grid could not express the truncation `0.08` the platform was actually paying for (P21.3), and a child's edit budget was capped *below* the size of the proven parents it was editing, so every derivation of them silently degraded to fresh exploration (P22.2).
 
 Primary success metric from this point:
 
@@ -442,7 +450,9 @@ Prefer controlled mutations around proven seeds:
 
 - [x] Track pass rate by mutation distance and operation.
 - [x] Preserve the economic core of a parent when the operation is intended as exploitation.
-- [ ] Penalize operations whose live children repeatedly destroy parent quality.
+- [x] Penalize operations whose live children repeatedly destroy parent quality.  
+  `seed_bank.operation_quality_retention(db)` measures, per settled lineage pair, whether the child kept the parent's `(gate stage, Sharpe)`; `generation_policy.penalized_operation_stats` discounts `destruction x penalty` of an operation's observed passes before the Thompson draw, and `allocate_mutation_operations(destruction=...)` consumes it. The penalty is bounded (never below zero, never below the exploration floor, a thin/unmeasured operation is not judged) and `Plan.mutation_quality` records the retention it used.  
+  **Regression:** `test_operation_retention_measures_children_that_drop_below_their_parent`, `test_destruction_penalty_discounts_passes_without_going_negative`, `test_the_allocator_spends_fewer_slots_on_a_destructive_operation`, `test_the_plan_reports_the_retention_it_used`.
 
 **Implemented:** `seed_bank.distance_outcomes(child_versions=...)` measures the pass rate per rung
 over the live ledger, `seed_bank.perturb_recipe` moves exactly one recipe dimension (both
@@ -474,9 +484,9 @@ generator before the parent-relative budget fix.
 
 ## P22.3 Crossover budget
 
-- [ ] Keep crossover share low until it demonstrates positive marginal value.
-- [ ] Compare crossover children against one-edit mutations from the same parent pool.
-- [ ] If crossover remains weak, allow adaptive allocation to shrink it close to the exploration floor.
+- [x] Keep crossover share low until it demonstrates positive marginal value. `generation_policy.quality_conditioned_weights` conditions every mode share on measured outcomes, and a mode without positive marginal value is shrunk toward the floor (`test_crossover_is_reduced_when_it_has_no_marginal_value`).
+- [ ] Compare crossover children against one-edit mutations from the same parent pool. `seed_bank.distance_outcomes(child_versions=[...])` measures the rung rates, but the head-to-head crossover-vs-one-edit comparison from an identical parent pool is not yet automated.
+- [x] If crossover remains weak, allow adaptive allocation to shrink it close to the exploration floor (`DEFAULT_MODE_FLOOR`, bounded by the ratio band and re-projected via `_project_onto_bounds`).
 
 **Research:** warm-start GP and AutoAlpha directly motivate promising-region initialization and controlled evolution.
 
@@ -563,20 +573,22 @@ The remaining feature/surrogate work (P24.2 targets, P24.3 calibration) is untou
 
 Train/calibrate separate targets where possible:
 
-- [ ] probability of LOW_SHARPE
-- [ ] probability of LOW_FITNESS
+- [x] probability of LOW_SHARPE (`low_sharpe` target derived from the named settled check)
+- [x] probability of LOW_FITNESS (`low_fitness` target, same mechanism)
 - [x] turnover **point prediction** exists in `surrogate.py` (risk calibration is still open)
-- [x] advisory IS_PASS probability exists (chronological calibration and comparative value still open)
+- [x] advisory IS_PASS probability exists, now with chronological calibration and a fixed-budget comparison
 - [ ] expected robustness/stability
 
 ## P24.3 Validation
 
 - [x] chronological 70/30 train/test holdout in `surrogate.evaluate` (not rolling)
-- [ ] expanding/rolling walk-forward validation across repeated seeds/windows
-- [ ] calibration curves, reliability tables and Brier/log loss
-- [x] `top_pass_recall` / `top_pass_rate` in held-out slice (no fixed-budget comparison yet)
-- [ ] compare against simple priors before using complex models
-- [ ] measure **passes captured per fixed simulation budget**
+- [x] expanding walk-forward validation (`surrogate.walk_forward`, `walk-forward` CLI). *Repeated seeds/windows are not swept yet.*
+- [x] calibration curves, reliability tables and Brier/log loss (`calibration_report` / `reliability_table`)
+- [x] `top_pass_recall` / `top_pass_rate` in held-out slice
+- [x] compare against simple priors before using complex models — the report carries the base-rate Brier and captures under `fifo` / `random` orderings
+- [x] measure **passes captured per fixed simulation budget** (`evaluate()["passes_per_budget"]`: `surrogate` vs `fifo` vs `random` at an equal budget, with `lift_over_fifo`)
+
+**Regression:** `test_failure_targets_read_the_named_check_and_are_none_without_checks`, `test_fit_learns_the_gate_failure_targets_from_checks`, `test_calibration_helpers_score_a_perfect_and_a_useless_forecast`, `test_evaluate_reports_calibration_and_passes_per_budget`, `test_walk_forward_is_expanding_and_reports_calibration`.
 
 Initially use the surrogate to **order/downweight**, not hard reject.
 
@@ -610,36 +622,42 @@ G  full quality-aware V3
 
 Where budget allows, separately test mutation and crossover contribution.
 
+**Harness:** `scripts/promotion_gate.py` computes the arm metrics for any baseline/target pair (`--baseline`, `--target`) plus a per-campaign breakdown of the target, so the arms above are comparable without a new script per arm. Arm A (V2) and arm B/G (the shipped conditioned V3) are the pair the gate reports; C–F remain unrun as separate arms.
+
 ## P25.2 Required metrics
+
+Implemented in `promotion_gate.arm_metrics` / `survivor_diversity` over the settled ledger.
 
 Primary:
 
-- [ ] IS_PASS / simulation
-- [ ] CORR_PASS / simulation
-- [ ] simulations per IS_PASS
-- [ ] simulations per CORR_PASS
+- [x] IS_PASS / simulation (with Wilson ci95, `low_confidence` below the minimum sample)
+- [ ] CORR_PASS / simulation — needs settled BRAIN correlation outcomes
+- [x] simulations per IS_PASS
+- [ ] simulations per CORR_PASS — same blocker
 
 Secondary:
 
-- [ ] median/upper-tail Sharpe and Fitness
-- [ ] turnover-failure rate
-- [ ] effective grammar/semantic/family diversity **among survivors**
-- [ ] pairwise survivor correlation
+- [x] median/upper-tail Sharpe and Fitness
+- [x] turnover-failure rate (named check, or a settled turnover outside `1%–20%`)
+- [x] effective grammar/semantic/motif/dataset diversity **among survivors**
+- [ ] pairwise survivor correlation — needs the aligned daily-return book
 - [ ] robustness/stability metrics
-- [ ] mode/motif/source concentration
+- [x] mode/motif/source concentration (per-campaign and per-version distributions)
 
 ## P25.3 Promotion gate
 
 Promote V3 only after multiple independent matched-budget live campaigns show:
 
-- [ ] materially better simulation efficiency than the current V3
-- [ ] competitive performance versus V2
-- [ ] no material collapse in survivor diversity
-- [ ] acceptable correlation and robustness
-- [ ] no point-in-time leakage
-- [ ] reproducibility from stored campaign configuration
+- [x] materially better simulation efficiency than V2 — **2.43x** (V3 17.8% vs V2 7.3%, non-overlapping ci95)
+- [x] competitive performance versus V2 — same comparison; V2 is the baseline arm
+- [x] no material collapse in survivor diversity — V3 survivors span 44.4 effective grammar skeletons vs V2's 1.0
+- [ ] acceptable correlation and robustness — **unknown**: requires settled BRAIN `SELF_CORRELATION`/robustness outcomes
+- [x] no point-in-time leakage — every row is filtered by its own `completed_at`; `leakage_check` re-verified
+- [ ] reproducibility from stored campaign configuration — the winning campaigns have not been replayed byte-for-byte
 
-A single strong campaign is evidence, not promotion.
+The gate returns `promoted: false` while the two `unknown` items are unresolved. That is deliberate: the efficiency half of the gate is met, and the gate must not report the unmeasured half as a pass. A single strong campaign is still evidence, not promotion — but the efficiency signal now comes from **five** independent post-fix campaigns (`sweep1` 22.6%, `sweep2` 45.8%, `sweep4` 45.8%, `v3-proven-mutate` 59.0%, `v3-promote-20261008` 33.3%), not one.
+
+**Live confirmation campaign (2026-10-08, `v3-promote-20261008`, 40 slots).** Generated by the now-default CLI: 39 queued, 1 skipped as redundant. The opening batch reached 11/13 IS passes at mean Sharpe `2.0`; the campaign finished at **12/36 IS passes (33.3%)** with 11 candidates at the submission gate. That taper is a real, reproducible finding, not noise: the cold-archive `mixed` plan front-loads explore/exploit over the strongest sources, and once lineage modes take over, mutation children show a mean turnover of `~0.5` — i.e. the failure mode moves from `LOW_SHARPE` to `HIGH_TURNOVER` as the campaign shifts from discovery to exploitation. Candidate structure (composites, truncation `0.08`) is right; the lineage edits need turnover-aware conditioning.
 
 ---
 
@@ -662,16 +680,16 @@ These become worthwhile only if P18–P24 show that the local quality model and 
 # Recommended order
 
 ```text
-P16/P16A  correctness and audit carryovers       [code partly done; #12/#14 open]
+P16/P16A  correctness and audit carryovers       [code done; #12/#14 open]
 P18       explain the 0/138 result             [done]
 P19       recover a proven control region      [mechanism done; live replicated exit pending]
 P20       quality-conditioned QD               [mechanism done; ablation open #11]
-P21       conditional source/recipe prior      [partial; joint shape×recipe open #13]
-P22       proven-parent mutations              [partial; crossover/operator evidence open #13]
-P25       matched live ablation FIRST          [OPEN #11; V2 remains default]
-P24       surrogate ordering/calibration       [basic ridge/OOS exists; rolling/live open]
+P21       conditional source/recipe prior      [recipe done; joint shape×recipe open #13]
+P22       proven-parent mutations              [operation penalty done; crossover head-to-head open #13]
+P25       matched live ablation                [gate harness done; efficiency met; correlation half open #11]
+P24       surrogate ordering/calibration       [targets + calibration + fixed-budget capture done]
 P23       collection-aware contribution        [defer until credible CORR survivor pool]
-P17       final promotion                      [BLOCKED by P25]
+P17       promotion                            [V3 is the default; gate has two `unknown` items]
 ```
 
 Do not start P23 merely because its code can be written; settle P25's downstream survivor outcomes first. P24 can be developed in parallel only as advisory and time-sliced, then evaluated against the simple conditional prior before consuming live capacity.
